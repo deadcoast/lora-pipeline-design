@@ -11,17 +11,23 @@ Usage (from repo root, with ComfyUI running):
 
 The LoRA file must be visible to ComfyUI (i.e. inside models/loras).
 """
+
 from __future__ import annotations
 
 import argparse
 import copy
+import io
 import json
+import math
+from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from PIL import Image, ImageDraw
 
 from . import config
 from .comfy_client import ComfyClient
+from .io_utils import atomic_write_bytes
 
 WORKFLOW = config.ROOT / "workflows" / "validate_sdxl_api.json"
 
@@ -35,7 +41,97 @@ DEFAULT_PROMPTS = [
 NEG = "lowres, bad anatomy, blurry, deformed, extra fingers, watermark, text"
 
 
-def _build_graph(base: dict, ckpt: str, lora: str, prompt: str, strength: float, seed: int) -> dict:
+def _validate_workflow(base: dict[str, Any]) -> None:
+    required = {
+        "4": ("CheckpointLoaderSimple", ("ckpt_name",)),
+        "10": (
+            "LoraLoader",
+            ("lora_name", "strength_model", "strength_clip", "model", "clip"),
+        ),
+        "6": ("CLIPTextEncode", ("text", "clip")),
+        "7": ("CLIPTextEncode", ("text", "clip")),
+        "5": ("EmptyLatentImage", ("width", "height", "batch_size")),
+        "3": (
+            "KSampler",
+            (
+                "seed",
+                "steps",
+                "cfg",
+                "sampler_name",
+                "scheduler",
+                "denoise",
+                "model",
+                "positive",
+                "negative",
+                "latent_image",
+            ),
+        ),
+        "8": ("VAEDecode", ("samples", "vae")),
+        "9": ("SaveImage", ("filename_prefix", "images")),
+    }
+    for node_id, (class_type, inputs) in required.items():
+        node = base.get(node_id)
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            raise TypeError(
+                f"Validation workflow is missing node {node_id} with an inputs mapping."
+            )
+        if node.get("class_type") != class_type:
+            raise ValueError(
+                f"Validation workflow node {node_id} must be {class_type}, "
+                f"got {node.get('class_type')!r}."
+            )
+        missing = [key for key in inputs if key not in node["inputs"]]
+        if missing:
+            raise ValueError(
+                f"Validation workflow node {node_id} is missing inputs: "
+                f"{', '.join(missing)}"
+            )
+
+    expected_links = {
+        ("10", "model"): ["4", 0],
+        ("10", "clip"): ["4", 1],
+        ("6", "clip"): ["10", 1],
+        ("7", "clip"): ["10", 1],
+        ("3", "model"): ["10", 0],
+        ("3", "positive"): ["6", 0],
+        ("3", "negative"): ["7", 0],
+        ("3", "latent_image"): ["5", 0],
+        ("8", "samples"): ["3", 0],
+        ("8", "vae"): ["4", 2],
+        ("9", "images"): ["8", 0],
+    }
+    for (node_id, input_name), expected in expected_links.items():
+        actual = base[node_id]["inputs"][input_name]
+        if actual != expected:
+            raise ValueError(
+                f"Validation workflow node {node_id} input {input_name!r} "
+                f"must connect to {expected}, got {actual!r}."
+            )
+    if base["5"]["inputs"]["batch_size"] != 1:
+        raise ValueError("Validation workflow batch_size must be 1.")
+
+
+def load_workflow(path: Path = WORKFLOW) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Validation workflow not found: {path}")
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid validation workflow JSON in {path}: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise TypeError(f"Validation workflow {path} must be a JSON object.")
+    _validate_workflow(loaded)
+    return loaded
+
+
+def _build_graph(
+    base: dict[str, Any],
+    ckpt: str,
+    lora: str,
+    prompt: str,
+    strength: float,
+    seed: int,
+) -> dict[str, Any]:
     g = copy.deepcopy(base)
     g["4"]["inputs"]["ckpt_name"] = ckpt
     g["10"]["inputs"]["lora_name"] = lora
@@ -48,7 +144,19 @@ def _build_graph(base: dict, ckpt: str, lora: str, prompt: str, strength: float,
     return g
 
 
-def _grid(images: list[Path], cols: int, cell: int, labels: list[str], out_path: Path):
+def _grid(
+    images: list[Path],
+    cols: int,
+    cell: int,
+    labels: list[str],
+    out_path: Path,
+) -> Path:
+    if not images:
+        raise ValueError("Cannot build a validation grid without images.")
+    if cols <= 0 or cell <= 0:
+        raise ValueError("Grid columns and cell size must be greater than zero.")
+    if len(labels) != len(images):
+        raise ValueError("Each validation image must have exactly one label.")
     rows = (len(images) + cols - 1) // cols
     pad, header = 8, 22
     W = cols * cell + (cols + 1) * pad
@@ -59,66 +167,118 @@ def _grid(images: list[Path], cols: int, cell: int, labels: list[str], out_path:
         r, c = divmod(i, cols)
         x = pad + c * (cell + pad)
         y = pad + r * (cell + header + pad)
-        try:
-            im = Image.open(img_path).convert("RGB")
+        with Image.open(img_path) as source:
+            im = source.convert("RGB")
             im.thumbnail((cell, cell))
-            canvas.paste(im, (x, y + header))
-        except Exception as e:
-            draw.text((x, y + header), f"(missing: {e})", fill=(200, 80, 80))
+        image_x = x + (cell - im.width) // 2
+        image_y = y + header + (cell - im.height) // 2
+        canvas.paste(im, (image_x, image_y))
         if i < len(labels):
             draw.text((x + 2, y + 4), labels[i][:48], fill=(220, 220, 220))
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(out_path)
+    encoded = io.BytesIO()
+    canvas.save(encoded, "PNG")
+    atomic_write_bytes(out_path, encoded.getvalue())
     return out_path
 
 
-def validate(lora: str, strengths, prompts, trigger: str, seed: int, run_name: str) -> Path:
-    base = json.loads(WORKFLOW.read_text())
+def validate(
+    lora: str,
+    strengths: Sequence[float],
+    prompts: Sequence[str],
+    trigger: str,
+    seed: int,
+    run_name: str,
+    workflow_path: Path = WORKFLOW,
+) -> Path:
+    run_name = config.validate_project_name(run_name)
+    if not lora.strip():
+        raise ValueError("LoRA filename cannot be empty.")
+    strengths = list(strengths)
+    if not strengths or any(not math.isfinite(value) for value in strengths):
+        raise ValueError("At least one finite LoRA strength is required.")
+    if not prompts or any(not prompt.strip() for prompt in prompts):
+        raise ValueError("At least one non-empty validation prompt is required.")
+    if not 0 <= seed <= 2**64 - 1:
+        raise ValueError("Validation seed must be between 0 and 2^64 - 1.")
+
+    if not trigger.strip():
+        raise ValueError("Validation trigger cannot be empty.")
+    trigger = trigger.strip()
+
+    base = load_workflow(workflow_path)
     client = ComfyClient()
     if not client.is_up():
-        raise SystemExit(
+        raise RuntimeError(
             f"ComfyUI is not reachable at {config.COMFY_HOST}.\n"
             f"Start Comfy Desktop (or `python main.py`) and confirm the API port."
         )
 
-    prompts = [p.format(trigger=trigger) for p in prompts]
+    formatted_prompts = [p.replace("{trigger}", trigger) for p in prompts]
     work_dir = config.GRIDS_DIR / run_name
     cells: list[Path] = []
     labels: list[str] = []
 
     for s in strengths:
-        for pi, prompt in enumerate(prompts):
+        for pi, prompt in enumerate(formatted_prompts):
             graph = _build_graph(base, config.COMFY_SDXL_CKPT, lora, prompt, s, seed)
             saved = client.run_and_save(graph, work_dir, prefix=f"s{s}_p{pi}_")
-            if saved:
+            if len(saved) == 1:
                 cells.append(saved[0])
                 labels.append(f"str {s} · p{pi}")
                 print(f"  [ok] strength={s} prompt#{pi} -> {saved[0].name}")
+            else:
+                raise RuntimeError(
+                    f"ComfyUI produced {len(saved)} images for strength={s}, "
+                    f"prompt#{pi}; expected exactly one."
+                )
 
+    expected = len(strengths) * len(formatted_prompts)
+    if len(cells) != expected:
+        raise RuntimeError(
+            f"Validation produced {len(cells)} of {expected} expected images."
+        )
     grid_path = config.GRIDS_DIR / f"{run_name}_grid.png"
-    _grid(cells, cols=len(prompts), cell=384, labels=labels, out_path=grid_path)
+    _grid(
+        cells,
+        cols=len(formatted_prompts),
+        cell=384,
+        labels=labels,
+        out_path=grid_path,
+    )
     print(f"\n[validate] Grid written: {grid_path}")
     return grid_path
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser(description="Generate a LoRA validation grid via ComfyUI.")
-    ap.add_argument("--lora", required=True, help="LoRA filename as seen by ComfyUI (in models/loras).")
+def main(argv: Sequence[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(
+        description="Generate a LoRA validation grid via ComfyUI."
+    )
+    ap.add_argument(
+        "--lora",
+        required=True,
+        help="LoRA filename as seen by ComfyUI (in models/loras).",
+    )
     ap.add_argument("--strengths", type=float, nargs="+", default=[0.6, 0.8, 1.0])
-    ap.add_argument("--trigger", default="ohwx person")
+    ap.add_argument("--trigger", default=config.DEFAULT_TRIGGER)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--name", default=None, help="Run name for output folder (default: lora stem).")
+    ap.add_argument(
+        "--name", default=None, help="Run name for output folder (default: lora stem)."
+    )
     args = ap.parse_args(argv)
 
     run_name = args.name or Path(args.lora).stem
-    validate(
-        lora=args.lora,
-        strengths=args.strengths,
-        prompts=DEFAULT_PROMPTS,
-        trigger=args.trigger,
-        seed=args.seed,
-        run_name=run_name,
-    )
+    try:
+        validate(
+            lora=args.lora,
+            strengths=args.strengths,
+            prompts=DEFAULT_PROMPTS,
+            trigger=args.trigger,
+            seed=args.seed,
+            run_name=run_name,
+        )
+    except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
+        ap.error(str(exc))
 
 
 if __name__ == "__main__":

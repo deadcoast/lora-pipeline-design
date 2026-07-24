@@ -37,21 +37,25 @@ So the pipeline has two engines that talk to each other:
 
 ---
 
-## 2. Environment setup — the Blackwell (RTX 5090) gotcha
+## 2. Environment setup — the Blackwell (RTX 5090) check
 
-This is the #1 thing that trips people up on 50-series cards, so do it first. Stable PyTorch (2.5–2.7) has **no `sm_120` kernels**, so anything CUDA will fail with *"no kernel image is available for execution on the device."* ([details](https://lilting.ch/en/articles/comfyui-blackwell-gpu-compatibility))
+RTX 5090 support requires a PyTorch wheel built with CUDA 12.8 or newer.
+Stable PyTorch has supported `sm_120` since 2.7, so use the current stable
+command from PyTorch's install selector rather than pinning this project to an
+old nightly URL.
 
-**Fixes that matter for you:**
+**Checks that matter for you:**
 
-1. **Use PyTorch nightly built for CUDA 12.8+/13.0.** In each virtual environment:
-
-   ```bash
-   pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu130
-   ```
-
-2. **Remove/avoid `xformers`** — prebuilt wheels only go up to Ada (sm_89) and pip may silently downgrade your good PyTorch. Use PyTorch's built-in attention (SDPA) or SageAttention instead.
-3. **Update NVIDIA drivers** to a recent production branch (R580+).
-4. **Keep training and ComfyUI in separate Python venvs.** They have conflicting dependencies; isolating them prevents one from breaking the other. The Comfy Desktop app manages its own runtime — leave it alone and run ai-toolkit in its own venv.
+1. Install a current CUDA 12.8+ PyTorch build in every environment that touches
+   CUDA.
+2. Confirm `torch.cuda.get_arch_list()` contains `sm_120`.
+3. Avoid optional compiled attention packages unless their wheels explicitly
+   match the installed PyTorch/CUDA versions; PyTorch SDPA is the safe default.
+4. Keep NVIDIA drivers current.
+5. Keep training and ComfyUI in separate Python venvs. They have conflicting
+   dependencies; isolating them prevents one from breaking the other. The Comfy
+   Desktop app manages its own runtime — leave it alone and run ai-toolkit in
+   its own venv.
 
 > Windows note: everything below runs natively on Windows 11. If you ever hit a dependency that's Linux-only, **WSL2** is the fallback — but you shouldn't need it for SDXL/Flux/Wan LoRA training.
 
@@ -63,10 +67,10 @@ One project folder in VSCode, trainer and ComfyUI referenced (not copied) from i
 
 ```text
 lora-pipeline/
-├─ pyproject.toml / requirements.txt   # your orchestrator's deps (requests, websocket-client, pillow)
+├─ pyproject.toml / requirements.txt   # orchestrator + self-test dependencies
 ├─ .env                                # paths to ComfyUI, ai-toolkit, model dirs
 ├─ configs/
-│  └─ subject_sdxl.yaml                # one training config per LoRA project
+│  └─ person_sdxl.yaml                 # reusable SDXL training template
 ├─ datasets/
 │  └─ subject_v1/
 │     ├─ 01.png   01.txt               # image + caption pairs
@@ -79,7 +83,7 @@ lora-pipeline/
 │  ├─ validate.py                      # generate a validation grid from a trained LoRA
 │  └─ pipeline.py                      # ties it all together: prep → train → validate
 ├─ workflows/
-│  └─ validate_sdxl.json               # a ComfyUI workflow exported in "API format"
+│  └─ validate_sdxl_api.json           # ComfyUI workflow in "API format"
 └─ outputs/
    ├─ checkpoints/                     # LoRA .safetensors land here
    └─ grids/                           # validation images per epoch
@@ -105,7 +109,7 @@ LoRA quality is ~80% dataset, ~20% settings. For a **person/identity** LoRA aim 
 Copy an example from `ai-toolkit/config/examples/` and adapt. A sensible SDXL starting point:
 
 ```yaml
-# configs/subject_sdxl.yaml  (abridged — real file has more comments)
+# configs/person_sdxl.yaml  (abridged — real file has more comments)
 job: extension
 config:
   name: "subject_v1"
@@ -113,6 +117,7 @@ config:
     - type: sd_trainer
       training_folder: "outputs/checkpoints"
       device: cuda:0
+      trigger_word: "{trigger}"
       network:
         type: lora
         linear: 16          # rank — 16 is a solid default; 8 for style, 32 for hard subjects
@@ -127,17 +132,18 @@ config:
       train:
         batch_size: 1
         steps: 2000         # ~1500–2500 for a person; watch for overfitting
-        lr: 1e-4
+        lr: 1.0e-4
         optimizer: adamw8bit
         dtype: bf16
       model:
         name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
-        is_sdxl: true
+        arch: "sdxl"
+        is_xl: true
       sample:
         sample_every: 250   # ai-toolkit renders preview images DURING training
-        prompts:
-          - "ohwx person, cinematic portrait, soft light"
-          - "ohwx person, standing in a city street, 35mm"
+        samples:
+          - prompt: "{trigger}, cinematic portrait, soft light"
+          - prompt: "{trigger}, standing in a city street, 35mm"
 ```
 
 Two habits that save you: **save checkpoints often** (`save_every`) so you can pick the epoch *before* it overfit, and use ai-toolkit's built-in **sampling during training** to watch it learn in real time. On a 5090 an SDXL run like this is roughly 20–40 minutes.
@@ -146,35 +152,43 @@ You can drive training either from the **ai-toolkit web UI** (`http://localhost:
 
 ```python
 # src/train.py
-subprocess.run(["python", "run.py", "configs/subject_sdxl.yaml"], cwd=AI_TOOLKIT_DIR, check=True)
+subprocess.run(
+    ["python", "run.py", "configs/person_sdxl.yaml"], cwd=AI_TOOLKIT_DIR, check=True
+)
 ```
 
 ### Step 3: Validation via ComfyUI's API (this is the "application" part)
 
-Build a validation workflow **once** in the ComfyUI Desktop UI: `Load Checkpoint → Load LoRA → CLIP Text Encode (pos/neg) → KSampler → VAE Decode → Save Image`. Then **Save (API Format)** to `workflows/validate_sdxl.json`. That JSON is a template your code fills in and submits.
+Build a validation workflow **once** in the ComfyUI Desktop UI: `Load Checkpoint → Load LoRA → CLIP Text Encode (pos/neg) → KSampler → VAE Decode → Save Image`. Then **Save (API Format)** to `workflows/validate_sdxl_api.json`. That JSON is a template your code fills in and submits.
 
 Minimal client:
 
 ```python
-# src/comfy_client.py  (skeleton)
-import json, uuid, urllib.request, websocket   # websocket-client
+# src/comfy_client.py  (implemented client)
+import json, uuid, urllib.request, websocket  # websocket-client
 
-COMFY = "127.0.0.1:8188"   # ComfyUI server (enable API / run server mode)
+COMFY = "127.0.0.1:8188"  # ComfyUI server (enable API / run server mode)
+
 
 def queue_prompt(graph: dict) -> str:
     body = json.dumps({"prompt": graph, "client_id": CLIENT_ID}).encode()
     req = urllib.request.Request(f"http://{COMFY}/prompt", data=body)
     return json.load(urllib.request.urlopen(req))["prompt_id"]
 
+
 def run_and_wait(graph: dict):
-    ws = websocket.WebSocket(); ws.connect(f"ws://{COMFY}/ws?clientId={CLIENT_ID}")
+    ws = websocket.WebSocket()
+    ws.connect(f"ws://{COMFY}/ws?clientId={CLIENT_ID}")
     pid = queue_prompt(graph)
-    while True:                                   # block until this prompt finishes
+    while True:  # block until this prompt finishes
         msg = ws.recv()
         if isinstance(msg, str):
             m = json.loads(msg)
-            if m.get("type") == "executing" and m["data"]["node"] is None \
-               and m["data"]["prompt_id"] == pid:
+            if (
+                m.get("type") == "executing"
+                and m["data"]["node"] is None
+                and m["data"]["prompt_id"] == pid
+            ):
                 break
     # then fetch images from /history/<pid>
 ```
@@ -183,36 +197,42 @@ def run_and_wait(graph: dict):
 
 ### Step 4: The orchestrator
 
-```python
-# src/pipeline.py
-prepare_dataset("datasets/subject_v1")     # resize + caption + report
-train("configs/subject_sdxl.yaml")         # ai-toolkit
-for ckpt in newest_checkpoints():          # e.g. steps 1500/1750/2000
-    validate(ckpt, "workflows/validate_sdxl.json")
-# review outputs/grids/, pick the winner, adjust config, repeat
+```bash
+python -m src.pipeline \
+  --src "C:/photos/me_raw" \
+  --name person_v1 \
+  --config configs/person_sdxl.yaml
 ```
 
-That's the whole photo pipeline. Everything after this is tuning knobs (rank, LR, steps, dataset) against the grids.
+The orchestrator prepares the named dataset, materializes a concrete ai-toolkit
+config, launches training, accepts only a checkpoint created or changed by that
+run, copies it into ComfyUI's LoRA folder, and renders the comparison grid.
+Everything after this is tuning knobs (rank, LR, steps, dataset) against the
+grids.
 
 ---
 
 ## 5. Phase 2 — Video (the payoff of choosing ai-toolkit)
 
-Because ai-toolkit already trains **Wan 2.2** (and LTX-2) video LoRAs, going from photos to video reuses ~90% of your pipeline. What changes:
+Because ai-toolkit already trains **Wan 2.2** (and LTX-2) video LoRAs, the
+orchestration structure can be reused. What changes:
 
 - **Dataset**: short clips (or image→video pairs) instead of stills; captions describe motion. `prepare_dataset.py` grows a video branch (frame extraction, clip length, fps normalization).
 - **Config**: point ai-toolkit at a Wan 2.2 config template instead of SDXL; expect longer runs and heavier VRAM use (your 32GB handles Wan 2.2 14B LoRA with offload settings).
-- **Validation**: build a second ComfyUI workflow for Wan 2.2 video generation, export it as API JSON, and your existing `comfy_client.py` drives it unchanged — it just returns a video instead of a PNG.
+- **Validation**: build a second ComfyUI workflow for Wan 2.2 video generation,
+  export it as API JSON, generalize `comfy_client.py` to collect video artifacts,
+  and add video-specific validation output instead of a PNG contact sheet.
 
-The orchestrator, client, and folder structure stay identical. That reuse is the entire reason for the architecture choices above.
+The orchestrator and folder structure stay stable, while artifact collection
+and validation become media-aware.
 
 ---
 
 ## 6. Suggested learning roadmap (milestones)
 
-1. **Prove the hardware.** Get ComfyUI Desktop generating a plain SDXL image with the nightly-PyTorch/`sm_120` fix in place. No LoRA yet — just confirm the 5090 renders without kernel errors.
+1. **Prove the hardware.** Get ComfyUI Desktop generating a plain SDXL image with a CUDA 12.8+ PyTorch build whose architecture list includes `sm_120`. No LoRA yet — just confirm the 5090 renders without kernel errors.
 2. **Train one LoRA the easy way.** Install `comfyUI-Realtime-Lora` and train a tiny SDXL LoRA *inside* ComfyUI on ~10 photos. Goal: see training happen and understand the knobs, not quality.
-3. **Stand up ai-toolkit.** Separate venv, nightly PyTorch, web UI reachable at :8675. Retrain the same 10 photos via a YAML config. Compare.
+3. **Stand up ai-toolkit.** Separate venv, Blackwell-compatible stable PyTorch, web UI reachable at :8675. Retrain the same 10 photos via a YAML config. Compare.
 4. **Automate validation.** Export an API-format workflow, write `comfy_client.py`, auto-generate a validation grid from a trained LoRA.
 5. **Close the loop.** Wire `pipeline.py` so one command does prep → train → validate. This is your v1 application.
 6. **Then, and only then, video.** Swap in a Wan 2.2 config and a video validation workflow.
@@ -233,10 +253,11 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 
 ---
 
-## Open questions for you
+## Current scope decisions
 
-- **LoRA subject** — person style, or object? It changes dataset size, captioning strategy, and rank. (I assumed "general/learning" and used a person example.)
-- **Base model preference** — start on **SDXL** (fast, huge ecosystem, easiest to learn) or **Flux** (higher fidelity, slower)? I'd recommend SDXL for milestones 1–5, then revisit.
-- Want me to **scaffold the actual repo** next — real `prepare_dataset.py`, `comfy_client.py`, `validate.py`, and a starter config you can run — rather than the skeletons above?
+- Phase 1 is implemented for a single person/identity LoRA on SDXL.
+- Training configs are reusable templates; the orchestrator injects each run's
+  name, dataset path, and checkpoint path before launching ai-toolkit.
+- Video/Wan support remains an explicit Phase 2 roadmap item.
 
 ---

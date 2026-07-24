@@ -1,7 +1,7 @@
 # =====================================================================
 # ai-toolkit training config — SDXL person LoRA
-# Run with:  python run.py <path-to-this-file>   (from the ai-toolkit dir)
-# or via this repo:  python -m src.train --config configs/person_sdxl.yaml
+# Materialize and run via:
+#   python -m src.train --config configs/person_sdxl.yaml
 #
 # This is a sensible STARTING POINT for a single-person identity LoRA on an
 # RTX 5090. Read the inline notes; the values you'll tune most are marked (TUNE).
@@ -13,9 +13,10 @@ config:
 
   process:
     - type: sd_trainer
+      # The wrapper replaces this with the selected trigger token.
+      trigger_word: "{trigger}"
 
-      # Where checkpoints + samples are written (relative to ai-toolkit's CWD,
-      # so use an absolute path or copy outputs afterward).
+      # The wrapper replaces this with CHECKPOINTS_DIR for each run.
       training_folder: "output"
       device: cuda:0
 
@@ -33,7 +34,8 @@ config:
 
       # ---- Dataset(s) ----
       datasets:
-        - folder_path: "PUT_ABSOLUTE_PATH_TO/datasets/person_v1"  # (EDIT) image+txt pairs
+        # The wrapper replaces this with DATASETS_DIR/<run name> for each run.
+        - folder_path: "datasets/person_v1"
           caption_ext: "txt"
           caption_dropout_rate: 0.05   # occasionally drop caption -> better generalization
           shuffle_tokens: false
@@ -44,19 +46,20 @@ config:
       train:
         batch_size: 1        # (TUNE) 5090 can push higher; start at 1 for stability
         steps: 2000          # (TUNE) ~1500-2500 for a person. Watch samples for overfit.
-        gradient_accumulation_steps: 1
+        gradient_accumulation: 1
         train_unet: true
         train_text_encoder: false   # usually leave TE frozen for SDXL person LoRAs
         gradient_checkpointing: true
-        noise_scheduler: "flowmatch"
+        noise_scheduler: "ddpm"  # SDXL is a diffusion model, not a flow model
         optimizer: "adamw8bit"
-        lr: 1e-4             # (TUNE) 1e-4 default; 5e-5 if it overfits fast
+        lr: 1.0e-4           # (TUNE) 1e-4 default; 5e-5 if it overfits fast
         dtype: bf16
 
       # ---- Base model ----
       model:
         name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
-        is_sdxl: true
+        arch: "sdxl"       # current ai-toolkit model selector
+        is_xl: true        # compatibility with older ai-toolkit releases
 
       # ---- In-training preview samples (watch it learn!) ----
       sample:
@@ -68,12 +71,12 @@ config:
         sample_steps: 25
         seed: 42
         walk_seed: false
-        prompts:
-          # IMPORTANT: use your trigger token consistently. Default here: "ohwx person"
-          - "ohwx person, cinematic portrait, soft window light, 85mm, shallow depth of field"
-          - "ohwx person, standing on a city street at golden hour, 35mm, candid"
-          - "ohwx person, black and white studio headshot, dramatic lighting"
-          - "ohwx person, hiking on a mountain trail, wide shot, natural light"
+        samples:
+          # The wrapper substitutes {trigger} for each run.
+          - prompt: "{trigger}, cinematic portrait, soft window light, 85mm, shallow depth of field"
+          - prompt: "{trigger}, standing on a city street at golden hour, 35mm, candid"
+          - prompt: "{trigger}, black and white studio headshot, dramatic lighting"
+          - prompt: "{trigger}, hiking on a mountain trail, wide shot, natural light"
 
 # meta is optional but handy for tracking runs
 meta:

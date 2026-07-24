@@ -3,10 +3,19 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+.mypy_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+build/
+dist/
+*.egg-info/
 
 # Data + outputs (large / private — don't commit)
 datasets/*/
 outputs/checkpoints/*
+outputs/configs/*
 outputs/grids/*
 !**/.gitkeep
 
