@@ -4,19 +4,19 @@ A small, code-driven pipeline to train **person LoRAs on SDXL** and validate the
 automatically through ComfyUI. Built for Windows 11 + RTX 5090. Designed so the
 same structure extends to **video (Wan 2.2)** later with minimal changes.
 
-```
+```text
 raw photos ──prepare_dataset──▶ dataset (img+txt) ──train (ai-toolkit)──▶ LoRA
-                                                                            │
-   validation grid ◀──validate (ComfyUI API)◀───────────────────────────────┘
+                                                                              │
+   validation grid ◀──validate (ComfyUI API) ◀───────────────────────────────┘
 ```
 
 Three engines, one orchestrator:
 
-| Job | Tool |
-|---|---|
-| Train | **ai-toolkit** (its own venv) |
-| Inference / validation | **ComfyUI Desktop** (its own runtime) |
-| Glue (prep, launch, validate) | **this repo** (its own venv) |
+| Job                           | Tool                                  |
+|-------------------------------|---------------------------------------|
+| Train                         | **ai-toolkit** (its own venv)         |
+| Inference / validation        | **ComfyUI Desktop** (its own runtime) |
+| Glue (prep, launch, validate) | **this repo** (its own venv)          |
 
 ---
 
@@ -103,6 +103,7 @@ python -m src.validate --lora person_v1.safetensors
 ```
 
 Outputs:
+
 - `datasets/person_v1/` — processed `NNN.png` + `NNN.txt` caption pairs
 - ai-toolkit writes checkpoints (`person_v1_<step>.safetensors`) to its `output/`
 - `outputs/grids/person_v1_grid.png` — the validation contact sheet
@@ -125,7 +126,7 @@ Outputs:
 
 ## 4. Files
 
-```
+```text
 configs/person_sdxl.yaml     ai-toolkit training config (edit the dataset path)
 workflows/validate_sdxl_api.json  ComfyUI workflow in API format (the validation graph)
 src/config.py                loads .env, resolves paths
@@ -138,6 +139,7 @@ src/pipeline.py              prep -> train -> validate
 ```
 
 ### Regenerating the validation workflow
+
 `workflows/validate_sdxl_api.json` is a plain SDXL+LoRA text2img graph. To change
 it, rebuild it in ComfyUI and use **Save (API Format)** — the code fills in the
 checkpoint, LoRA, prompts, strength and seed at runtime, so keep those node IDs.
@@ -147,10 +149,12 @@ checkpoint, LoRA, prompts, strength and seed at runtime, so keep those node IDs.
 ## 5. Extending to video (later)
 
 ai-toolkit also trains **Wan 2.2** video LoRAs, so the jump is small:
+
 - `prepare_dataset.py` grows a clip/frame branch (motion-focused captions).
 - Add a `configs/person_wan22.yaml` pointing at a Wan template.
 - Export a Wan video-generation workflow from ComfyUI as API JSON; `comfy_client.py`
   drives it unchanged (it just returns a video instead of a PNG).
 
 The orchestrator, client, and folder layout stay the same.
-```
+
+---
