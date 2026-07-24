@@ -1,0 +1,14 @@
+[project]
+name = "lora-pipeline-design"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pillow>=10.3",
+    "python-dotenv>=1.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    "tqdm>=4.66",
+    "websocket-client>=1.7",
+]
