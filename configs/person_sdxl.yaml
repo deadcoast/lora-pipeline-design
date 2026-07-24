@@ -3,8 +3,8 @@
 # Materialize and run via:
 #   python -m src.train --config configs/person_sdxl.yaml
 #
-# This is a sensible STARTING POINT for a single-person identity LoRA on an
-# RTX 5090. Read the inline notes; the values you'll tune most are marked (TUNE).
+# This is a conservative starting point for a single-person SDXL identity LoRA.
+# The desktop app verifies the selected trainer can see CUDA before using it.
 # =====================================================================
 job: extension
 config:
@@ -44,7 +44,7 @@ config:
 
       # ---- Training loop ----
       train:
-        batch_size: 1        # (TUNE) 5090 can push higher; start at 1 for stability
+        batch_size: 1        # broad compatibility and predictable memory use
         steps: 2000          # (TUNE) ~1500-2500 for a person. Watch samples for overfit.
         gradient_accumulation: 1
         train_unet: true

@@ -89,6 +89,9 @@ def test_materialize_config_wires_run_paths(tmp_path: Path) -> None:
     (dataset / "001.txt").write_text("ohwx person", encoding="utf-8")
     checkpoints = tmp_path / "checkpoints"
     destination = tmp_path / "configs" / "custom.yaml"
+    base_model = tmp_path / "models" / "portraitXL.safetensors"
+    base_model.parent.mkdir()
+    base_model.write_bytes(b"model")
 
     generated = train_module.materialize_config(
         config.ROOT / "configs" / "person_sdxl.yaml",
@@ -97,6 +100,7 @@ def test_materialize_config_wires_run_paths(tmp_path: Path) -> None:
         dataset_dir=dataset,
         output_dir=checkpoints,
         destination=destination,
+        base_model=base_model,
     )
 
     loaded = yaml.safe_load(generated.read_text(encoding="utf-8"))
@@ -109,11 +113,86 @@ def test_materialize_config_wires_run_paths(tmp_path: Path) -> None:
     assert process["train"]["noise_scheduler"] == "ddpm"
     assert process["sample"]["sampler"] == "ddpm"
     assert process["model"]["arch"] == "sdxl"
+    assert Path(process["model"]["name_or_path"]) == base_model.resolve()
     assert process["trigger_word"] == "custom person"
     assert all(
         sample["prompt"].startswith("custom person,")
         for sample in process["sample"]["samples"]
     )
+
+
+@pytest.mark.parametrize(
+    ("preset", "rank", "steps", "resolution", "sample_size"),
+    [
+        ("fast", 8, 900, [512, 768], 768),
+        ("balanced", 16, 2000, [768, 1024], 1024),
+        ("quality", 32, 3000, [768, 1024], 1024),
+    ],
+)
+def test_materialize_config_applies_real_training_preset(
+    tmp_path: Path,
+    preset: str,
+    rank: int,
+    steps: int,
+    resolution: list[int],
+    sample_size: int,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    Image.new("RGB", (32, 32), "white").save(dataset / "001.png")
+    (dataset / "001.txt").write_text("ohwx person", encoding="utf-8")
+
+    generated = train_module.materialize_config(
+        config.ROOT / "configs" / "person_sdxl.yaml",
+        run_name=f"{preset}_run",
+        dataset_dir=dataset,
+        output_dir=tmp_path / "checkpoints",
+        destination=tmp_path / f"{preset}.yaml",
+        preset=preset,
+    )
+
+    loaded = yaml.safe_load(generated.read_text(encoding="utf-8"))
+    process = loaded["config"]["process"][0]
+    assert process["network"]["linear"] == rank
+    assert process["network"]["linear_alpha"] == rank
+    assert process["train"]["steps"] == steps
+    assert process["datasets"][0]["resolution"] == resolution
+    assert process["sample"]["width"] == sample_size
+    assert loaded["meta"]["mivim_preset"] == preset
+
+
+def test_materialize_config_rejects_unknown_training_preset(tmp_path: Path) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    Image.new("RGB", (32, 32), "white").save(dataset / "001.png")
+    (dataset / "001.txt").write_text("ohwx person", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Unknown training preset"):
+        train_module.materialize_config(
+            config.ROOT / "configs" / "person_sdxl.yaml",
+            run_name="custom",
+            dataset_dir=dataset,
+            output_dir=tmp_path / "checkpoints",
+            destination=tmp_path / "custom.yaml",
+            preset="turbo",
+        )
+
+
+def test_materialize_config_rejects_missing_local_base_model(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    Image.new("RGB", (32, 32), "white").save(dataset / "001.png")
+    (dataset / "001.txt").write_text("ohwx person", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="Training base model not found"):
+        train_module.materialize_config(
+            config.ROOT / "configs" / "person_sdxl.yaml",
+            run_name="missing_model_v1",
+            dataset_dir=dataset,
+            base_model=tmp_path / "missing.safetensors",
+        )
 
 
 def test_doctor_rejects_flow_scheduler_for_sdxl(tmp_path: Path) -> None:
@@ -497,6 +576,32 @@ def test_project_name_rejects_windows_reserved_names(name: str) -> None:
         config.validate_project_name(name)
 
 
+def test_fast_pipeline_preset_defaults_photo_preparation_to_768(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_prepare(**kwargs: object) -> Path:
+        captured.update(kwargs)
+        return tmp_path / "dataset"
+
+    monkeypatch.setattr(pipeline_module.prep, "prepare", fake_prepare)
+
+    pipeline_module.run(
+        _pipeline_args(
+            src=str(tmp_path),
+            size=None,
+            preset="fast",
+            skip_prep=False,
+            skip_train=True,
+            skip_validate=True,
+        )
+    )
+
+    assert captured["size"] == 768
+
+
 def test_pipeline_uses_only_a_new_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -577,3 +682,23 @@ def test_checkpoint_discovery_does_not_cross_project_prefixes(
     monkeypatch.setattr(config, "CHECKPOINTS_DIR", checkpoints)
 
     assert pipeline_module._checkpoints("person") == [expected]
+
+
+def test_comfy_lora_replacement_keeps_a_recoverable_previous_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "outputs" / "portrait_v1.safetensors"
+    source.parent.mkdir()
+    source.write_bytes(b"new-model")
+    lora_dir = tmp_path / "ComfyUI" / "models" / "loras"
+    lora_dir.mkdir(parents=True)
+    destination = lora_dir / source.name
+    destination.write_bytes(b"old-model")
+    monkeypatch.setattr(config, "COMFY_LORA_DIR", lora_dir)
+
+    name = pipeline_module._copy_lora_to_comfy(source)
+
+    assert name == source.name
+    assert destination.read_bytes() == b"new-model"
+    assert (lora_dir / f"{source.name}.previous").read_bytes() == b"old-model"

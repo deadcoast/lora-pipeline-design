@@ -27,6 +27,40 @@ from PIL import Image, UnidentifiedImageError
 from . import config
 from .io_utils import atomic_write_text
 
+TRAINING_PRESETS = ("fast", "balanced", "quality")
+_PRESET_VALUES: dict[str, dict[str, Any]] = {
+    "fast": {
+        "rank": 8,
+        "steps": 900,
+        "learning_rate": 1.0e-4,
+        "save_every": 225,
+        "max_saves": 5,
+        "resolutions": [512, 768],
+        "sample_size": 768,
+        "sample_steps": 20,
+    },
+    "balanced": {
+        "rank": 16,
+        "steps": 2000,
+        "learning_rate": 1.0e-4,
+        "save_every": 250,
+        "max_saves": 8,
+        "resolutions": [768, 1024],
+        "sample_size": 1024,
+        "sample_steps": 25,
+    },
+    "quality": {
+        "rank": 32,
+        "steps": 3000,
+        "learning_rate": 7.5e-5,
+        "save_every": 300,
+        "max_saves": 10,
+        "resolutions": [768, 1024],
+        "sample_size": 1024,
+        "sample_steps": 30,
+    },
+}
+
 
 def _resolve_path(path: str | Path) -> Path:
     cfg = Path(path)
@@ -191,6 +225,54 @@ def validate_sdxl_process(process: dict[str, Any], template: Path) -> None:
             )
 
 
+def apply_training_preset(
+    process: dict[str, Any],
+    preset: str,
+    template: Path,
+) -> None:
+    """Apply one explicit casual-user preset to a validated SDXL process."""
+
+    try:
+        values = _PRESET_VALUES[preset]
+    except KeyError as exc:
+        choices = ", ".join(TRAINING_PRESETS)
+        raise ValueError(
+            f"Unknown training preset {preset!r}; choose one of: {choices}."
+        ) from exc
+
+    network = process.get("network")
+    train_config = process.get("train")
+    save = process.get("save")
+    sample = process.get("sample")
+    datasets = process.get("datasets")
+    if (
+        not isinstance(network, dict)
+        or not isinstance(train_config, dict)
+        or not isinstance(save, dict)
+        or not isinstance(sample, dict)
+        or not isinstance(datasets, list)
+        or len(datasets) != 1
+        or not isinstance(datasets[0], dict)
+    ):
+        raise TypeError(
+            f"Training config {template} cannot accept a MIVIM preset because "
+            "its network, train, save, sample, or dataset structure is invalid."
+        )
+
+    rank = values["rank"]
+    network["linear"] = rank
+    network["linear_alpha"] = rank
+    train_config["steps"] = values["steps"]
+    train_config["lr"] = values["learning_rate"]
+    save["save_every"] = values["save_every"]
+    save["max_step_saves_to_keep"] = values["max_saves"]
+    datasets[0]["resolution"] = list(values["resolutions"])
+    sample["sample_every"] = values["save_every"]
+    sample["width"] = values["sample_size"]
+    sample["height"] = values["sample_size"]
+    sample["sample_steps"] = values["sample_steps"]
+
+
 def materialize_config(
     template_path: str | Path,
     *,
@@ -199,6 +281,8 @@ def materialize_config(
     dataset_dir: Path | None = None,
     output_dir: Path | None = None,
     destination: Path | None = None,
+    preset: str | None = None,
+    base_model: Path | None = None,
 ) -> Path:
     """Create the concrete ai-toolkit config used for one pipeline run."""
     template, data = _load_template(template_path)
@@ -221,6 +305,10 @@ def materialize_config(
             f"Prepared dataset not found: {dataset_dir}. Run dataset preparation first."
         )
     pair_count = _validate_dataset_pairs(dataset_dir)
+    if base_model is not None:
+        base_model = base_model.resolve()
+        if not base_model.is_file():
+            raise FileNotFoundError(f"Training base model not found: {base_model}")
 
     processes = job_config.get("process")
     if not isinstance(processes, list) or not processes:
@@ -231,6 +319,11 @@ def materialize_config(
         if not isinstance(process, dict):
             raise TypeError(f"Training config {template} has an invalid process entry.")
         validate_sdxl_process(process, template)
+        if preset is not None:
+            apply_training_preset(process, preset, template)
+        if base_model is not None:
+            model = process["model"]
+            model["name_or_path"] = str(base_model)
         process["trigger_word"] = trigger
         sample = process.get("sample")
         if isinstance(sample, dict):
@@ -259,6 +352,8 @@ def materialize_config(
     meta = data.get("meta")
     if isinstance(meta, dict):
         meta["name"] = run_name
+        if preset is not None:
+            meta["mivim_preset"] = preset
 
     output_dir.mkdir(parents=True, exist_ok=True)
     destination = destination or (config.RUN_CONFIGS_DIR / f"{run_name}.yaml")
@@ -282,6 +377,8 @@ def train(
     trigger: str = config.DEFAULT_TRIGGER,
     dataset_dir: Path | None = None,
     output_dir: Path | None = None,
+    preset: str | None = None,
+    base_model: Path | None = None,
 ) -> int:
     if not config.AI_TOOLKIT_DIR:
         raise RuntimeError("AI_TOOLKIT_DIR is not set in .env")
@@ -298,6 +395,8 @@ def train(
         trigger=trigger,
         dataset_dir=dataset_dir,
         output_dir=output_dir,
+        preset=preset,
+        base_model=base_model,
     )
     cmd = [config.AI_TOOLKIT_PYTHON, str(run_py), str(cfg)]
     print(f"[train] {' '.join(cmd)}")
@@ -323,6 +422,16 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Trigger substituted into sample prompts.",
     )
     ap.add_argument(
+        "--preset",
+        choices=TRAINING_PRESETS,
+        help="Optional MIVIM training preset (fast, balanced, or quality).",
+    )
+    ap.add_argument(
+        "--base-model",
+        type=Path,
+        help="Local SDXL checkpoint used as ai-toolkit's model.name_or_path.",
+    )
+    ap.add_argument(
         "--dataset",
         type=Path,
         help="Prepared dataset directory (default: DATASETS_DIR/<name>).",
@@ -341,6 +450,8 @@ def main(argv: Sequence[str] | None = None) -> None:
             trigger=args.trigger,
             dataset_dir=args.dataset,
             output_dir=args.output_dir,
+            preset=args.preset,
+            base_model=args.base_model,
         )
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
         ap.error(str(exc))

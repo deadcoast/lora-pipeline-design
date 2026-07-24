@@ -1,0 +1,241 @@
+"""Versioned, defensive persistence for the desktop companion application."""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from .app_models import AppSettings, ProjectDraft, TrainingPreset
+from .io_utils import atomic_write_text
+
+SETTINGS_SCHEMA_VERSION = 2
+DATA_DIR_OVERRIDE = "MIVIM_LORA_PIPELINE_DATA_DIR"
+_APPLICATION_DIRECTORY = Path("MIVIM") / "LoRA Pipeline"
+
+
+def user_app_data_dir(
+    *,
+    environ: Mapping[str, str] | None = None,
+    platform: str | None = None,
+    home: Path | None = None,
+) -> Path:
+    """Return a per-user application-data directory on major desktop platforms."""
+    values = os.environ if environ is None else environ
+    override = values.get(DATA_DIR_OVERRIDE, "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    platform_name = sys.platform if platform is None else platform
+    user_home = Path.home() if home is None else home
+    if platform_name.startswith("win"):
+        base = values.get("LOCALAPPDATA") or values.get("APPDATA")
+        root = Path(base) if base else user_home / "AppData" / "Local"
+    elif platform_name == "darwin":
+        root = user_home / "Library" / "Application Support"
+    else:
+        xdg_config = values.get("XDG_CONFIG_HOME", "").strip()
+        root = Path(xdg_config).expanduser() if xdg_config else user_home / ".config"
+    return root / _APPLICATION_DIRECTORY
+
+
+def default_settings_path() -> Path:
+    return user_app_data_dir() / "settings.json"
+
+
+def with_user_storage_defaults(
+    settings: AppSettings,
+    settings_path: Path | None = None,
+) -> AppSettings:
+    """Move untouched GUI output defaults into a writable per-user workspace."""
+
+    defaults = AppSettings()
+    base = (settings_path or default_settings_path()).parent / "workspace"
+    return replace(
+        settings,
+        datasets_dir=(
+            base / "datasets"
+            if settings.datasets_dir == defaults.datasets_dir
+            else settings.datasets_dir
+        ),
+        checkpoints_dir=(
+            base / "checkpoints"
+            if settings.checkpoints_dir == defaults.checkpoints_dir
+            else settings.checkpoints_dir
+        ),
+        grids_dir=(
+            base / "grids"
+            if settings.grids_dir == defaults.grids_dir
+            else settings.grids_dir
+        ),
+        run_configs_dir=(
+            base / "configs"
+            if settings.run_configs_dir == defaults.run_configs_dir
+            else settings.run_configs_dir
+        ),
+    )
+
+
+def _text(value: object, default: str, *, allow_empty: bool = False) -> str:
+    if not isinstance(value, str):
+        return default
+    cleaned = value.strip()
+    return cleaned if cleaned or allow_empty else default
+
+
+def _path(value: object, default: Path | None) -> Path | None:
+    if not isinstance(value, str) or not value.strip():
+        return default
+    return Path(value.strip()).expanduser()
+
+
+def _boolean(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
+
+def _project_from_json(value: object, default: ProjectDraft) -> ProjectDraft:
+    if not isinstance(value, dict):
+        return default
+    raw_preset = value.get("preset")
+    try:
+        preset = (
+            TrainingPreset(raw_preset)
+            if isinstance(raw_preset, str)
+            else default.preset
+        )
+    except ValueError:
+        preset = default.preset
+    return ProjectDraft(
+        project_name=_text(
+            value.get("project_name"),
+            default.project_name,
+            allow_empty=True,
+        ),
+        source_dir=_path(value.get("source_dir"), default.source_dir),
+        trigger=_text(value.get("trigger"), default.trigger),
+        preset=preset,
+        use_vision_captions=_boolean(
+            value.get("use_vision_captions"),
+            default.use_vision_captions,
+        ),
+        overwrite_existing=_boolean(
+            value.get("overwrite_existing"),
+            default.overwrite_existing,
+        ),
+    )
+
+
+def _settings_from_json(value: object) -> AppSettings:
+    defaults = AppSettings()
+    if not isinstance(value, dict):
+        return defaults
+    version = value.get("schema_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version not in {1, SETTINGS_SCHEMA_VERSION}
+    ):
+        return defaults
+
+    return AppSettings(
+        schema_version=SETTINGS_SCHEMA_VERSION,
+        comfy_host=_text(value.get("comfy_host"), defaults.comfy_host),
+        comfy_lora_dir=_path(
+            value.get("comfy_lora_dir"),
+            defaults.comfy_lora_dir,
+        ),
+        comfy_checkpoint=_text(
+            value.get("comfy_checkpoint"),
+            defaults.comfy_checkpoint,
+        ),
+        training_base_model=_path(
+            value.get("training_base_model"),
+            defaults.training_base_model,
+        ),
+        ai_toolkit_dir=_path(
+            value.get("ai_toolkit_dir"),
+            defaults.ai_toolkit_dir,
+        ),
+        ai_toolkit_python=_path(
+            value.get("ai_toolkit_python"),
+            defaults.ai_toolkit_python,
+        ),
+        datasets_dir=_path(value.get("datasets_dir"), defaults.datasets_dir)
+        or defaults.datasets_dir,
+        checkpoints_dir=_path(
+            value.get("checkpoints_dir"),
+            defaults.checkpoints_dir,
+        )
+        or defaults.checkpoints_dir,
+        grids_dir=_path(value.get("grids_dir"), defaults.grids_dir)
+        or defaults.grids_dir,
+        run_configs_dir=_path(
+            value.get("run_configs_dir"),
+            defaults.run_configs_dir,
+        )
+        or defaults.run_configs_dir,
+        last_project=_project_from_json(
+            value.get("last_project"),
+            defaults.last_project,
+        ),
+    )
+
+
+def load_settings(path: Path | None = None) -> AppSettings:
+    """Load valid known fields, falling back safely for absent or damaged files."""
+    source = default_settings_path() if path is None else Path(path)
+    try:
+        parsed: Any = json.loads(source.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+        return AppSettings()
+    return _settings_from_json(parsed)
+
+
+def _path_for_json(value: Path | None) -> str | None:
+    return None if value is None else value.as_posix()
+
+
+def _project_to_json(project: ProjectDraft) -> dict[str, object]:
+    return {
+        "project_name": project.project_name,
+        "source_dir": _path_for_json(project.source_dir),
+        "trigger": project.trigger,
+        "preset": project.preset.value,
+        "use_vision_captions": project.use_vision_captions,
+        "overwrite_existing": project.overwrite_existing,
+    }
+
+
+def _settings_to_json(settings: AppSettings) -> dict[str, object]:
+    """Serialize an explicit allowlist so credentials can never leak into JSON."""
+    return {
+        "schema_version": SETTINGS_SCHEMA_VERSION,
+        "comfy_host": settings.comfy_host,
+        "comfy_lora_dir": _path_for_json(settings.comfy_lora_dir),
+        "comfy_checkpoint": settings.comfy_checkpoint,
+        "training_base_model": _path_for_json(settings.training_base_model),
+        "ai_toolkit_dir": _path_for_json(settings.ai_toolkit_dir),
+        "ai_toolkit_python": _path_for_json(settings.ai_toolkit_python),
+        "datasets_dir": _path_for_json(settings.datasets_dir),
+        "checkpoints_dir": _path_for_json(settings.checkpoints_dir),
+        "grids_dir": _path_for_json(settings.grids_dir),
+        "run_configs_dir": _path_for_json(settings.run_configs_dir),
+        "last_project": _project_to_json(settings.last_project),
+    }
+
+
+def save_settings(settings: AppSettings, path: Path | None = None) -> Path:
+    """Atomically save only the versioned, non-secret settings allowlist."""
+    destination = default_settings_path() if path is None else Path(path)
+    payload = json.dumps(
+        _settings_to_json(settings),
+        indent=2,
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    atomic_write_text(destination, f"{payload}\n")
+    return destination

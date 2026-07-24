@@ -1,8 +1,32 @@
 # LoRA Training Pipeline — Design Document
 
-**Goal:** Build a reusable, code-driven pipeline to train LoRAs on **photos** (Phase 1), then extend the same pipeline to **video** (Phase 2).
+**Goal:** Build a reusable, guided Windows application to train LoRAs on
+**photos** (Phase 1), then extend the same pipeline to **video** (Phase 2).
 **Hardware:** Ryzen 9800X3D · 64GB DDR5 · RTX 5090 (32GB VRAM, Blackwell) · Windows 11 — this is top-tier for local training; VRAM is not a constraint.
-**Assumptions used (tell me to change these):** you want to *learn the whole pipeline end-to-end*, and you want a *programmatic, code-driven* design rather than clicking nodes by hand.
+**Primary audience:** Casual users who need the application to discover,
+explain, validate, and recover the workflow for them. Technical controls remain
+available without defining the default experience.
+
+---
+
+## Product direction
+
+The supported product surface is **MIVIM LoRA Studio**, a PySide6 Windows
+companion for Comfy Desktop. CLI modules remain automation adapters and the
+domain implementation, but casual users are not expected to invoke them.
+
+The default journey is:
+
+1. Detect and connect a local Comfy Desktop instance.
+2. Choose and review source photos.
+3. Select a plain-language training plan.
+4. Resolve readiness failures through user-facing actions.
+5. Monitor or stop the real pipeline.
+6. Review the verified grid and continue in ComfyUI.
+
+Comfy Desktop state is read-only discovery input. The studio stores its own
+approved connection and workspace settings, validates the live local API, and
+never modifies Desktop's installation registry or managed application files.
 
 ---
 
@@ -23,7 +47,7 @@ So the pipeline has two engines that talk to each other:
 ### The flow
 
 ```text
-   photos/                     ai-toolkit                    ComfyUI (API)
+   photos/             shared local SDXL model              ComfyUI (API)
  ┌───────────┐   prep   ┌────────────────────┐  .safetensors ┌──────────────┐
  │ raw images│ ───────▶ │ dataset (img+txt)  │ ───────▶     │ load LoRA +  │
  │           │  caption │ + training config  │   train       │ generate     │
@@ -255,9 +279,25 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 
 ## Current scope decisions
 
-- Phase 1 is implemented for a single person/identity LoRA on SDXL.
+- Phase 1 is implemented as a guided desktop application for a single
+  person/identity LoRA on SDXL.
+- Current Comfy Desktop 2 multi-instance state, shared model roots, port locks,
+  and legacy Desktop layouts are discovered read-only.
+- The app owns versioned per-user settings and a writable project workspace.
+- Fast, Balanced, and High Quality plans change real rank, steps, resolution,
+  preview cadence, and validation breadth.
+- Setup checks, preparation-only operation, background logging, complete
+  Windows process-tree cancellation, result verification, and last-result
+  restoration are implemented in the user-facing application.
 - Training configs are reusable templates; the orchestrator injects each run's
-  name, dataset path, and checkpoint path before launching ai-toolkit.
+  name, dataset path, selected Comfy Desktop checkpoint file, output path, and
+  selected preset before launching ai-toolkit.
+- Readiness executes the selected trainer Python and verifies PyTorch/CUDA,
+  write-probes output locations, blocks output collisions, and invalidates
+  stale reviews whenever a user-facing choice changes.
 - Video/Wan support remains an explicit Phase 2 roadmap item.
+- Face/blur/near-duplicate QC, multi-checkpoint winner selection, remote model
+  upload, and resumable validation remain explicit future product work rather
+  than partially exposed controls.
 
 ---

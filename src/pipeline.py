@@ -44,6 +44,10 @@ def _copy_lora_to_comfy(lora_path: Path) -> str:
         )
     dest = config.COMFY_LORA_DIR / lora_path.name
     if lora_path.resolve() != dest.resolve():
+        if dest.exists():
+            backup = dest.with_name(f"{dest.name}.previous")
+            atomic_copy(dest, backup)
+            print(f"[pipeline] Preserved previous LoRA -> {backup}")
         atomic_copy(lora_path, dest)
         print(f"[pipeline] Copied LoRA -> {dest}")
     return lora_path.name
@@ -71,6 +75,8 @@ def _checkpoint_snapshot(name: str) -> dict[Path, tuple[int, int]]:
 
 def run(args: argparse.Namespace) -> Path | None:
     name = config.validate_project_name(args.name)
+    preset = getattr(args, "preset", "balanced")
+    size = args.size if args.size is not None else (768 if preset == "fast" else 1024)
     if args.skip_prep and args.skip_train and args.skip_validate:
         raise ValueError("All pipeline stages are skipped; there is nothing to run.")
     if args.lora and not args.skip_train:
@@ -87,7 +93,7 @@ def run(args: argparse.Namespace) -> Path | None:
         prep.prepare(
             src=Path(args.src),
             name=name,
-            size=args.size,
+            size=size,
             trigger=trigger,
             caption_mode="blip" if args.vision else "template",
             overwrite=args.overwrite,
@@ -101,6 +107,8 @@ def run(args: argparse.Namespace) -> Path | None:
             trigger=trigger,
             dataset_dir=dataset_dir,
             output_dir=config.CHECKPOINTS_DIR,
+            preset=preset,
+            base_model=getattr(args, "base_model", None),
         )
         if code != 0:
             raise RuntimeError(
@@ -155,7 +163,23 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--src", help="Raw photos folder (required unless --skip-prep).")
     ap.add_argument("--config", default="configs/person_sdxl.yaml")
     ap.add_argument("--trigger", default=config.DEFAULT_TRIGGER)
-    ap.add_argument("--size", type=int, default=1024)
+    ap.add_argument(
+        "--size",
+        type=int,
+        default=None,
+        help="Photo long-edge size (defaults to the selected preset).",
+    )
+    ap.add_argument(
+        "--preset",
+        choices=trainer.TRAINING_PRESETS,
+        default="balanced",
+        help="Training plan used to set rank, steps, previews, and resolution.",
+    )
+    ap.add_argument(
+        "--base-model",
+        type=Path,
+        help="Local SDXL checkpoint path passed to the trainer.",
+    )
     ap.add_argument("--strengths", type=float, nargs="+", default=[0.6, 0.8, 1.0])
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(

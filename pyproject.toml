@@ -1,16 +1,24 @@
 [project]
 name = "lora-pipeline-design"
-version = "0.1.0"
-description = "Code-driven SDXL person LoRA training and ComfyUI validation pipeline"
+version = "0.2.0"
+description = "MIVIM LoRA Studio: a guided SDXL training companion for Comfy Desktop"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.12",
     "pillow>=10.3",
+    "pyside6>=6.10.0",
     "python-dotenv>=1.0",
     "pyyaml>=6.0",
     "websocket-client>=1.7",
 ]
+
+[project.gui-scripts]
+mivim-lora-studio = "src.desktop:main"
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
 
 [project.optional-dependencies]
 vision = [
@@ -21,12 +29,19 @@ vision = [
 [dependency-groups]
 dev = [
     "mypy>=2.3.0",
+    "pyright>=1.1.400",
     "pytest>=8.4",
+    "pytest-qt>=4.5.0",
+    "ruff>=0.14.0",
     "types-pyyaml>=6.0.12",
 ]
 
-[tool.uv]
-package = false
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"configs" = "configs"
+"workflows" = "workflows"
 
 [tool.ruff.lint.per-file-ignores]
 "src/__init__.py" = ["TC004"]

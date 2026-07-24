@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 .venv/
+.venv-deploy/
 venv/
 .mypy_cache/
 .pytest_cache/
@@ -9,6 +10,7 @@ venv/
 .coverage.*
 htmlcov/
 build/
+deployment/
 dist/
 *.egg-info/
 
