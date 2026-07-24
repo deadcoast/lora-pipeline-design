@@ -73,6 +73,7 @@ def validate_project_name(name: str) -> str:
 COMFY_HOST: str = _get("COMFY_HOST", "127.0.0.1:8188")
 COMFY_LORA_DIR: Path | None = _optional_path("COMFY_LORA_DIR")
 COMFY_SDXL_CKPT: str = _get("COMFY_SDXL_CKPT", "sd_xl_base_1.0.safetensors")
+COMFY_INSTALLATION_ID: str = _get("MIVIM_COMFY_INSTALLATION_ID")
 
 # --- ai-toolkit ---
 AI_TOOLKIT_DIR: str = _get("AI_TOOLKIT_DIR", "")
@@ -91,6 +92,7 @@ def summary() -> str:
         f"COMFY_HOST        = {COMFY_HOST}\n"
         f"COMFY_LORA_DIR    = {COMFY_LORA_DIR}\n"
         f"COMFY_SDXL_CKPT   = {COMFY_SDXL_CKPT}\n"
+        f"COMFY_INSTALLATION_ID = {COMFY_INSTALLATION_ID}\n"
         f"AI_TOOLKIT_DIR    = {AI_TOOLKIT_DIR}\n"
         f"AI_TOOLKIT_PYTHON = {AI_TOOLKIT_PYTHON}\n"
         f"DATASETS_DIR      = {DATASETS_DIR}\n"

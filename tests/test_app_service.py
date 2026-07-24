@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from src import app_service, config, prepare_dataset
+from src import app_service, config, io_utils, prepare_dataset
 from src.app_models import AppSettings, ProjectDraft, TrainingPreset
 from src.app_service import ApplicationService, inspect_source, stage_from_log
 from src.comfy_desktop import (
@@ -413,6 +414,8 @@ def test_project_collision_covers_every_output_namespace(
     grid = grids / "taken_v2_grid.png"
     grid.parent.mkdir()
     grid.write_bytes(b"grid")
+    workflow = grids / "taken_v2_use_in_comfyui.json"
+    workflow.write_text("{}\n", encoding="utf-8")
     work_dir = grids / "taken_v2"
     work_dir.mkdir()
     (work_dir / "cell.png").write_bytes(b"cell")
@@ -447,6 +450,7 @@ def test_project_collision_covers_every_output_namespace(
 
     assert artifacts.checkpoints == (checkpoint,)
     assert artifacts.validation_grid == grid
+    assert artifacts.validation_workflow == workflow
     assert artifacts.validation_work_dir == work_dir
     assert artifacts.run_config == run_config
     assert artifacts.result_record == result_record
@@ -454,6 +458,7 @@ def test_project_collision_covers_every_output_namespace(
     assert collision.state == "error"
     assert "training checkpoint" in collision.detail
     assert "comparison grid" in collision.detail
+    assert "ready ComfyUI workflow" in collision.detail
     assert "validation work files" in collision.detail
     assert "trainer run config" in collision.detail
     assert "completed-run record" in collision.detail
@@ -641,6 +646,13 @@ def test_log_progress_comes_from_real_pipeline_markers() -> None:
         "Preparing the trainer",
     )
     assert stage_from_log("[pipeline] Complete.") == (100, "Complete")
+    assert stage_from_log("[validate] cell 3/8 reused strength=0.8 prompt#2") == (
+        85,
+        "Creating comparison images (3/8)",
+    )
+    assert stage_from_log(
+        "[validate] Ready workflow written: portrait_use_in_comfyui.json"
+    ) == (98, "Preparing the ComfyUI handoff")
     assert stage_from_log("ordinary trainer output") is None
 
 
@@ -784,7 +796,73 @@ def test_validation_recovery_requires_the_exact_installed_lora_and_grid(
     assert recovery.installed_lora_path == installed
     assert recovery.expected_grid_path == grids / "recovery_v1_grid.png"
     installed.unlink()
-    assert service.read_validation_recovery(settings, "recovery_v1") is None
+    stale = service.read_validation_recovery(settings, "recovery_v1")
+    assert stale is not None
+    assert "older version" in (service.validation_recovery_issue(settings, stale) or "")
+
+
+def test_validation_recovery_v2_rejects_changed_installation_or_model_bytes(
+    tmp_path: Path,
+) -> None:
+    lora_dir = tmp_path / "ComfyUI" / "models" / "loras"
+    lora_dir.mkdir(parents=True)
+    installed = lora_dir / "recovery_v2.safetensors"
+    installed.write_bytes(b"trained weights")
+    checkpoint = tmp_path / "ComfyUI" / "models" / "checkpoints" / "sdxl.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"original checkpoint")
+    grids = tmp_path / "grids"
+    configs = tmp_path / "configs"
+    configs.mkdir()
+    (configs / "recovery_v2-recovery.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "project_name": "recovery_v2",
+                "state": "validation_pending",
+                "lora_name": installed.name,
+                "installed_lora_path": str(installed.resolve()),
+                "expected_grid_path": str((grids / "recovery_v2_grid.png").resolve()),
+                "trigger": "ohwx person",
+                "preset": "balanced",
+                "checkpoint": "sdxl.safetensors",
+                "updated_at": "2026-07-24T12:00:00+00:00",
+                "attempt_id": "448be6d3-e39d-40a8-bd31-4767adaec0aa",
+                "comfy_installation_id": "desktop-a",
+                "comfy_host": "127.0.0.1:8188",
+                "lora_fingerprint": io_utils.artifact_fingerprint(installed),
+                "checkpoint_path": str(checkpoint.resolve()),
+                "checkpoint_fingerprint": io_utils.artifact_fingerprint(checkpoint),
+                "validation_signature": "a" * 64,
+                "strengths": [0.0, 0.8],
+                "seed": 42,
+            }
+        ),
+        encoding="utf-8",
+    )
+    settings = AppSettings(
+        comfy_host="127.0.0.1:8188",
+        comfy_installation_id="desktop-a",
+        comfy_lora_dir=lora_dir,
+        comfy_checkpoint="sdxl.safetensors",
+        training_base_model=checkpoint,
+        grids_dir=grids,
+        run_configs_dir=configs,
+    )
+    service = ApplicationService(root=tmp_path)
+
+    recovery = service.read_validation_recovery(settings, "recovery_v2")
+
+    assert recovery is not None
+    assert service.validation_recovery_issue(settings, recovery) is None
+    changed_installation = replace(settings, comfy_installation_id="desktop-b")
+    assert "different Comfy Desktop installation" in (
+        service.validation_recovery_issue(changed_installation, recovery) or ""
+    )
+    installed.write_bytes(b"substituted weights")
+    assert "changed after training" in (
+        service.validation_recovery_issue(settings, recovery) or ""
+    )
 
 
 def test_prepared_dataset_requires_the_identity_phrase_in_every_caption(
@@ -930,6 +1008,43 @@ def test_setup_uses_a_local_checkpoint_when_the_offline_default_is_missing(
 
     assert settings.comfy_checkpoint == "portraitXL.safetensors"
     assert settings.training_base_model == portrait
+
+
+def test_temporary_discovery_failure_preserves_known_installation_identity(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    checkpoint = tmp_path / "known-models" / "portraitXL.safetensors"
+    checkpoint.parent.mkdir()
+    checkpoint.write_bytes(b"model")
+    discovery = ComfyDesktopDiscovery(
+        config_dir=None,
+        legacy_config_dir=None,
+        installations=(),
+        selected_installation=None,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=(),
+        launcher=ComfyLauncher("", "", "", (), False),
+        warnings=("Desktop data was temporarily unavailable.",),
+    )
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(False, None, (), (), "offline"),
+    )
+
+    settings, _context, _status = ApplicationService(root=tmp_path).setup_snapshot(
+        AppSettings(
+            comfy_installation_id="known-desktop",
+            training_base_model=checkpoint,
+        ),
+        discovery,
+    )
+
+    assert settings.comfy_installation_id == "known-desktop"
+    assert settings.training_base_model == checkpoint
 
 
 def test_setup_never_borrows_python_from_a_different_selected_toolkit(

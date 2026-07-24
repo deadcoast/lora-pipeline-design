@@ -42,6 +42,20 @@ def test_settings_round_trip_is_versioned_and_keeps_path_semantics(
             preset=TrainingPreset.QUALITY,
             checkpoint="realistic.safetensors",
             lora_name="family_portrait.safetensors",
+            result_fingerprint="sha256:verified-result",
+            workflow_path=Path("D:/MIVIM/grids/family_portrait_use_in_comfyui.json"),
+            workflow_fingerprint="sha256:verified-workflow",
+            comfy_installation_id="portrait-desktop",
+            comfy_host="127.0.0.1:9000",
+            installed_lora_path=Path(
+                "D:/Comfy Shared/models/loras/family_portrait.safetensors"
+            ),
+            lora_fingerprint="sha256:verified-lora",
+            checkpoint_path=Path(
+                "D:/Comfy Shared/models/checkpoints/realistic.safetensors"
+            ),
+            checkpoint_fingerprint="sha256:verified-checkpoint",
+            starting_strength=0.8,
         ),
         last_project=ProjectDraft(
             project_name="family_portrait",
@@ -159,6 +173,7 @@ def test_settings_and_environment_use_explicit_non_secret_allowlists(
         "COMFY_HOST",
         "COMFY_LORA_DIR",
         "COMFY_SDXL_CKPT",
+        "MIVIM_COMFY_INSTALLATION_ID",
         "AI_TOOLKIT_DIR",
         "AI_TOOLKIT_PYTHON",
         "DATASETS_DIR",

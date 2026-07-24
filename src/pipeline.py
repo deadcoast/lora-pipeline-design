@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -29,9 +30,9 @@ from . import config
 from . import prepare_dataset as prep
 from . import train as trainer
 from . import validate as validator
-from .io_utils import atomic_copy, atomic_write_text
+from .io_utils import artifact_fingerprint, atomic_copy, atomic_write_text
 
-RECOVERY_SCHEMA_VERSION = 1
+RECOVERY_SCHEMA_VERSION = 2
 
 
 def _copy_lora_to_comfy(lora_path: Path) -> str:
@@ -89,23 +90,57 @@ def _write_validation_recovery(
     installed_lora_path: Path,
     trigger: str,
     preset: str,
+    attempt_id: str,
+    checkpoint_path: Path | None,
+    strengths: Sequence[float],
+    seed: int,
+    validation_signature: str,
+    known_lora_fingerprint: str | None = None,
+    known_checkpoint_fingerprint: str | None = None,
     updated_at: str | None = None,
 ) -> dict[str, object]:
     """Atomically record the installed handoff before ComfyUI validation starts."""
 
     if state not in {"validation_pending", "complete"}:
         raise ValueError(f"Unsupported validation recovery state: {state}")
+    installed_lora = installed_lora_path.resolve()
+    if not installed_lora.is_file():
+        raise FileNotFoundError(f"Installed LoRA not found: {installed_lora}")
+    resolved_checkpoint: Path | None = None
+    checkpoint_fingerprint = ""
+    if checkpoint_path is not None:
+        resolved_checkpoint = checkpoint_path.resolve()
+        if not resolved_checkpoint.is_file():
+            raise FileNotFoundError(
+                f"Training checkpoint not found: {resolved_checkpoint}"
+            )
+        checkpoint_fingerprint = known_checkpoint_fingerprint or artifact_fingerprint(
+            resolved_checkpoint
+        )
     timestamp = updated_at or datetime.now(UTC).isoformat()
     payload: dict[str, object] = {
         "schema_version": RECOVERY_SCHEMA_VERSION,
         "project_name": name,
         "state": state,
         "lora_name": lora_name,
-        "installed_lora_path": str(installed_lora_path.resolve()),
+        "installed_lora_path": str(installed_lora),
         "expected_grid_path": str((config.GRIDS_DIR / f"{name}_grid.png").resolve()),
         "trigger": trigger,
         "preset": preset,
         "checkpoint": config.COMFY_SDXL_CKPT,
+        "attempt_id": attempt_id,
+        "comfy_installation_id": config.COMFY_INSTALLATION_ID,
+        "comfy_host": config.COMFY_HOST,
+        "lora_fingerprint": (
+            known_lora_fingerprint or artifact_fingerprint(installed_lora)
+        ),
+        "checkpoint_path": (
+            str(resolved_checkpoint) if resolved_checkpoint is not None else ""
+        ),
+        "checkpoint_fingerprint": checkpoint_fingerprint,
+        "validation_signature": validation_signature,
+        "strengths": list(strengths),
+        "seed": seed,
         "updated_at": timestamp,
     }
     destination = _validation_recovery_path(name)
@@ -118,6 +153,11 @@ def _write_validation_recovery(
 
 def run(args: argparse.Namespace) -> Path | None:
     name = config.validate_project_name(args.name)
+    attempt_id = getattr(args, "attempt_id", "") or str(uuid.uuid4())
+    try:
+        attempt_id = str(uuid.UUID(attempt_id))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("The run attempt identifier is invalid.") from exc
     preset = getattr(args, "preset", "balanced")
     size = args.size if args.size is not None else (768 if preset == "fast" else 1024)
     if args.skip_prep and args.skip_train and args.skip_validate:
@@ -130,6 +170,10 @@ def run(args: argparse.Namespace) -> Path | None:
     dataset_dir = config.DATASETS_DIR / name
     before_training: dict[Path, tuple[int, int]] | None = None
     installed_lora_name = ""
+    installed_lora_result_path: Path | None = None
+    verified_lora_fingerprint = ""
+    verified_checkpoint_path: Path | None = None
+    verified_checkpoint_fingerprint = ""
 
     if not args.skip_prep:
         if not args.src:
@@ -191,6 +235,26 @@ def run(args: argparse.Namespace) -> Path | None:
             if config.COMFY_LORA_DIR is not None
             else Path(installed_lora_name)
         )
+        installed_lora_result_path = installed_lora_path.resolve()
+        verified_lora_fingerprint = artifact_fingerprint(installed_lora_path)
+        base_model = getattr(args, "base_model", None)
+        if base_model is not None:
+            verified_checkpoint_path = Path(base_model).resolve()
+            verified_checkpoint_fingerprint = artifact_fingerprint(
+                verified_checkpoint_path
+            )
+        checkpoint_content_identity = (
+            verified_checkpoint_fingerprint or f"unverified-attempt:{attempt_id}"
+        )
+        validation_signature = validator.validation_signature(
+            lora=installed_lora_name,
+            strengths=args.strengths,
+            prompts=validator.DEFAULT_PROMPTS,
+            trigger=trigger,
+            seed=args.seed,
+            lora_content_identity=verified_lora_fingerprint,
+            checkpoint_content_identity=checkpoint_content_identity,
+        )
         validation_recovery = _write_validation_recovery(
             name=name,
             state="validation_pending",
@@ -198,6 +262,13 @@ def run(args: argparse.Namespace) -> Path | None:
             installed_lora_path=installed_lora_path,
             trigger=trigger,
             preset=preset,
+            attempt_id=attempt_id,
+            checkpoint_path=verified_checkpoint_path,
+            strengths=args.strengths,
+            seed=args.seed,
+            validation_signature=validation_signature,
+            known_lora_fingerprint=verified_lora_fingerprint,
+            known_checkpoint_fingerprint=verified_checkpoint_fingerprint,
         )
         print(
             f"[pipeline] Validation recovery saved -> {_validation_recovery_path(name)}"
@@ -210,25 +281,71 @@ def run(args: argparse.Namespace) -> Path | None:
             trigger=trigger,
             seed=args.seed,
             run_name=name,
+            lora_content_identity=verified_lora_fingerprint,
+            checkpoint_content_identity=checkpoint_content_identity,
         )
+        post_validation_lora_fingerprint = artifact_fingerprint(
+            installed_lora_result_path
+        )
+        post_validation_checkpoint_fingerprint = (
+            artifact_fingerprint(verified_checkpoint_path)
+            if verified_checkpoint_path is not None
+            else ""
+        )
+        if (
+            post_validation_lora_fingerprint != verified_lora_fingerprint
+            or post_validation_checkpoint_fingerprint != verified_checkpoint_fingerprint
+        ):
+            raise RuntimeError(
+                "A LoRA or checkpoint changed while ComfyUI validation was "
+                "running. The grid was kept but was not approved; retry validation "
+                "with the stable model files."
+            )
+        verified_lora_fingerprint = post_validation_lora_fingerprint
+        verified_checkpoint_fingerprint = post_validation_checkpoint_fingerprint
 
     if grid_path is not None:
         print(f"\n[pipeline] Complete. Review the grid: {grid_path}")
         outcome_mode = "validate" if args.skip_train else "full"
         result_path = grid_path
+        workflow_path = validator.ready_workflow_path(name).resolve()
+        workflow_fingerprint = artifact_fingerprint(workflow_path)
+        starting_strength = validator.recommended_starting_strength(args.strengths)
     else:
         print("\n[pipeline] Complete.")
         outcome_mode = "prepare" if args.skip_train else "full"
         result_path = dataset_dir if args.skip_train else config.CHECKPOINTS_DIR
+        workflow_path = None
+        workflow_fingerprint = ""
+        starting_strength = 0.8
     outcome = {
-        "schema_version": 1,
+        "schema_version": 3,
         "project_name": name,
+        "attempt_id": attempt_id,
         "mode": outcome_mode,
         "result_path": str(result_path.resolve()),
+        "result_fingerprint": artifact_fingerprint(result_path),
         "trigger": trigger,
         "preset": preset,
         "checkpoint": config.COMFY_SDXL_CKPT,
         "lora_name": installed_lora_name,
+        "workflow_path": str(workflow_path) if workflow_path is not None else "",
+        "workflow_fingerprint": workflow_fingerprint,
+        "comfy_installation_id": config.COMFY_INSTALLATION_ID,
+        "comfy_host": config.COMFY_HOST,
+        "installed_lora_path": (
+            str(installed_lora_result_path)
+            if installed_lora_result_path is not None
+            else ""
+        ),
+        "lora_fingerprint": verified_lora_fingerprint,
+        "checkpoint_path": (
+            str(verified_checkpoint_path)
+            if verified_checkpoint_path is not None
+            else ""
+        ),
+        "checkpoint_fingerprint": verified_checkpoint_fingerprint,
+        "starting_strength": starting_strength,
         "completed_at": datetime.now(UTC).isoformat(),
     }
     atomic_write_text(
@@ -243,6 +360,13 @@ def run(args: argparse.Namespace) -> Path | None:
             installed_lora_path=Path(str(validation_recovery["installed_lora_path"])),
             trigger=trigger,
             preset=preset,
+            attempt_id=attempt_id,
+            checkpoint_path=verified_checkpoint_path,
+            strengths=args.strengths,
+            seed=args.seed,
+            validation_signature=str(validation_recovery["validation_signature"]),
+            known_lora_fingerprint=verified_lora_fingerprint,
+            known_checkpoint_fingerprint=verified_checkpoint_fingerprint,
         )
         print(
             "[pipeline] Validation recovery completed -> "
@@ -253,6 +377,11 @@ def run(args: argparse.Namespace) -> Path | None:
 
 def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="prep -> train -> validate a person LoRA.")
+    ap.add_argument(
+        "--attempt-id",
+        default="",
+        help=argparse.SUPPRESS,
+    )
     ap.add_argument("--name", required=True, help="Project/dataset name.")
     ap.add_argument("--src", help="Raw photos folder (required unless --skip-prep).")
     ap.add_argument("--config", default="configs/person_sdxl.yaml")

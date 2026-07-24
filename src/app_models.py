@@ -112,6 +112,16 @@ class RunResult:
     preset: TrainingPreset
     checkpoint: str = ""
     lora_name: str = ""
+    result_fingerprint: str = ""
+    workflow_path: Path | None = None
+    workflow_fingerprint: str = ""
+    comfy_installation_id: str = ""
+    comfy_host: str = ""
+    installed_lora_path: Path | None = None
+    lora_fingerprint: str = ""
+    checkpoint_path: Path | None = None
+    checkpoint_fingerprint: str = ""
+    starting_strength: float = 0.8
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,13 +137,22 @@ class ValidationRecovery:
     preset: TrainingPreset
     checkpoint: str
     updated_at: str
+    attempt_id: str = ""
+    comfy_installation_id: str = ""
+    comfy_host: str = ""
+    lora_fingerprint: str = ""
+    checkpoint_path: Path | None = None
+    checkpoint_fingerprint: str = ""
+    validation_signature: str = ""
+    strengths: tuple[float, ...] = ()
+    seed: int = 42
 
 
 @dataclass(slots=True)
 class AppSettings:
     """Non-secret application settings persisted between desktop sessions."""
 
-    schema_version: int = 3
+    schema_version: int = 4
     comfy_host: str = "127.0.0.1:8188"
     comfy_installation_id: str = ""
     comfy_lora_dir: Path | None = None
@@ -160,6 +179,7 @@ class AppSettings:
         environment = {
             "COMFY_HOST": comfy_host,
             "COMFY_SDXL_CKPT": self.comfy_checkpoint.strip(),
+            "MIVIM_COMFY_INSTALLATION_ID": self.comfy_installation_id.strip(),
             "DATASETS_DIR": str(self.datasets_dir),
             "CHECKPOINTS_DIR": str(self.checkpoints_dir),
             "GRIDS_DIR": str(self.grids_dir),

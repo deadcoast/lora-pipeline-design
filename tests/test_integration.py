@@ -111,7 +111,11 @@ def main() -> int:
             seed=42,
             run_name="itest",
         )
-        cells = list((config.GRIDS_DIR / "itest").glob("*.png"))
+        manifests = list(
+            (config.GRIDS_DIR / "itest" / "attempts").glob("*/manifest.json")
+        )
+        latest_manifest = max(manifests, key=lambda path: path.stat().st_mtime_ns)
+        cells = list((latest_manifest.parent / "cells").glob("*.png"))
         if grid.exists() and len(cells) == 2 * len(validate.DEFAULT_PROMPTS):
             print(f"PASS: validate grid ({len(cells)} cells) -> {grid.name}")
         else:

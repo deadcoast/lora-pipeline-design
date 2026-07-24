@@ -23,6 +23,9 @@ from src import train as train_module
 from src import validate as validate_module
 from src.comfy_client import ComfyClient
 
+TEST_LORA_IDENTITY = "sha256:test-lora-a"
+TEST_CHECKPOINT_IDENTITY = "sha256:test-checkpoint-a"
+
 
 def _pipeline_args(**overrides: object) -> argparse.Namespace:
     values: dict[str, object] = {
@@ -551,6 +554,367 @@ def test_validate_rejects_an_invalid_seed() -> None:
         )
 
 
+def test_validate_rejects_absolute_or_parent_model_paths() -> None:
+    with pytest.raises(ValueError, match="safe filename"):
+        validate_module.validation_signature(
+            lora="../private/model.safetensors",
+            strengths=[0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=42,
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+
+
+def test_validation_signature_is_stable_and_changes_with_generation_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "COMFY_HOST", "127.0.0.1:8188")
+    monkeypatch.setattr(config, "COMFY_SDXL_CKPT", "portrait-xl.safetensors")
+
+    first = validate_module.validation_signature(
+        lora="portrait_v1.safetensors",
+        strengths=[0.0, 0.8],
+        prompts=["{trigger}, portrait"],
+        trigger="ohwx person",
+        seed=42,
+        lora_content_identity=TEST_LORA_IDENTITY,
+        checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+    )
+
+    assert (
+        validate_module.validation_signature(
+            lora="portrait_v1.safetensors",
+            strengths=[0.0, 0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=42,
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+        == first
+    )
+    assert (
+        validate_module.validation_signature(
+            lora="portrait_v1.safetensors",
+            strengths=[0.0, 0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=43,
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+        != first
+    )
+    assert (
+        validate_module.validation_signature(
+            lora="portrait_v1.safetensors",
+            strengths=[0.0, 0.8],
+            prompts=["{trigger}, outdoors"],
+            trigger="ohwx person",
+            seed=42,
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+        != first
+    )
+    assert (
+        validate_module.validation_signature(
+            lora="portrait_v1.safetensors",
+            strengths=[0.0, 0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=42,
+            lora_content_identity="sha256:test-lora-b",
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+        != first
+    )
+    monkeypatch.setattr(config, "COMFY_HOST", "127.0.0.1:8189")
+    assert (
+        validate_module.validation_signature(
+            lora="portrait_v1.safetensors",
+            strengths=[0.0, 0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=42,
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+        != first
+    )
+
+
+def test_validation_retry_reuses_verified_cells_after_a_mid_sweep_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, Any]] = []
+    fail_once = True
+
+    class InterruptedClient:
+        def is_up(self) -> bool:
+            return True
+
+        def run_and_save(
+            self, graph: dict[str, Any], out_dir: Path, prefix: str = ""
+        ) -> list[Path]:
+            nonlocal fail_once
+            calls.append(graph)
+            if len(calls) == 3 and fail_once:
+                fail_once = False
+                raise RuntimeError("simulated ComfyUI interruption")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output = out_dir / f"{prefix}output.png"
+            Image.new("RGB", (32, 32), (len(calls) * 20, 80, 120)).save(output)
+            return [output]
+
+    monkeypatch.setattr(validate_module, "ComfyClient", InterruptedClient)
+    monkeypatch.setattr(config, "GRIDS_DIR", tmp_path)
+
+    def run_validation() -> Path:
+        return validate_module.validate(
+            lora="resume_v1.safetensors",
+            strengths=[0.0, 0.8],
+            prompts=["{trigger}, portrait", "{trigger}, outdoors"],
+            trigger="ohwx person",
+            seed=42,
+            run_name="resume_v1",
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+
+    with pytest.raises(RuntimeError, match="simulated ComfyUI interruption"):
+        run_validation()
+
+    attempt_root = tmp_path / "resume_v1" / "attempts"
+    attempt_dir = next(attempt_root.iterdir())
+    manifest_path = attempt_dir / validate_module.VALIDATION_MANIFEST_NAME
+    interrupted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert interrupted["status"] == "in_progress"
+    assert interrupted["completed_cells"] == 2
+    assert len(interrupted["cells"]) == 2
+    capsys.readouterr()
+
+    calls_before_retry = len(calls)
+    grid = run_validation()
+
+    assert len(calls) - calls_before_retry == 2
+    assert grid.is_file()
+    completed = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert completed["status"] == "complete"
+    assert completed["processed_cells"] == 4
+    assert completed["completed_cells"] == 4
+    assert len(completed["cells"]) == 4
+    assert len(list((attempt_dir / "cells").glob("*.png"))) == 4
+    workflow_path = validate_module.ready_workflow_path("resume_v1")
+    ready_workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    assert ready_workflow["version"] == 0.4
+    ready_nodes = ready_workflow["nodes"]
+    assert {node["type"] for node in ready_nodes} <= validate_module.CORE_NODE_TYPES
+    lora_node = next(node for node in ready_nodes if node["type"] == "LoraLoader")
+    assert lora_node["widgets_values"][0] == "resume_v1.safetensors"
+    assert lora_node["widgets_values"][1] == 0.8
+    ready_prompt = validate_module._ui_workflow_to_prompt(ready_workflow)
+    assert ready_prompt in calls
+    assert str(tmp_path) not in workflow_path.read_text(encoding="utf-8")
+    with Image.open(grid) as published_grid:
+        assert json.loads(published_grid.info["prompt"]) == ready_prompt
+        assert json.loads(published_grid.info["workflow"]) == ready_workflow
+    assert completed["ready_workflow"]["embedded_prompt_in_grid"] is True
+    assert completed["ready_workflow"]["embedded_workflow_in_grid"] is True
+    output = capsys.readouterr().out
+    assert "[validate] cell 1/4 reused strength=0 prompt#0" in output
+    assert "[validate] cell 2/4 reused strength=0 prompt#1" in output
+    assert "[validate] cell 3/4 created strength=0.8 prompt#0" in output
+    assert "[validate] cell 4/4 created strength=0.8 prompt#1" in output
+
+
+def test_validation_changed_inputs_use_an_isolated_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    class ImageClient:
+        def is_up(self) -> bool:
+            return True
+
+        def run_and_save(
+            self, graph: dict[str, Any], out_dir: Path, prefix: str = ""
+        ) -> list[Path]:
+            calls.append(graph)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output = out_dir / f"{prefix}output.png"
+            Image.new("RGB", (24, 24), (20 * len(calls), 90, 130)).save(output)
+            return [output]
+
+    monkeypatch.setattr(validate_module, "ComfyClient", ImageClient)
+    monkeypatch.setattr(config, "GRIDS_DIR", tmp_path)
+    portrait_signature = validate_module.validation_signature(
+        lora="isolated_v1.safetensors",
+        strengths=[0.8],
+        prompts=["{trigger}, portrait"],
+        trigger="ohwx person",
+        seed=42,
+        lora_content_identity=TEST_LORA_IDENTITY,
+        checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+    )
+    outdoor_signature = validate_module.validation_signature(
+        lora="isolated_v1.safetensors",
+        strengths=[0.8],
+        prompts=["{trigger}, outdoors"],
+        trigger="ohwx person",
+        seed=42,
+        lora_content_identity=TEST_LORA_IDENTITY,
+        checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+    )
+    validate_module.validate(
+        lora="isolated_v1.safetensors",
+        strengths=[0.8],
+        prompts=["{trigger}, portrait"],
+        trigger="ohwx person",
+        seed=42,
+        run_name="isolated_v1",
+        lora_content_identity=TEST_LORA_IDENTITY,
+        checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+    )
+    capsys.readouterr()
+    validate_module.validate(
+        lora="isolated_v1.safetensors",
+        strengths=[0.8],
+        prompts=["{trigger}, outdoors"],
+        trigger="ohwx person",
+        seed=42,
+        run_name="isolated_v1",
+        lora_content_identity=TEST_LORA_IDENTITY,
+        checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+    )
+
+    attempts = sorted((tmp_path / "isolated_v1" / "attempts").iterdir())
+    assert len(calls) == 2
+    assert len(attempts) == 2
+    assert {attempt.name for attempt in attempts} == {
+        portrait_signature,
+        outdoor_signature,
+    }
+    assert all(
+        len(list((attempt / "cells").glob("*.png"))) == 1 for attempt in attempts
+    )
+    signatures = {
+        json.loads(
+            (attempt / validate_module.VALIDATION_MANIFEST_NAME).read_text(
+                encoding="utf-8"
+            )
+        )["signature"]
+        for attempt in attempts
+    }
+    assert len(signatures) == 2
+    assert (
+        "[validate] cell 1/1 created strength=0.8 prompt#0" in capsys.readouterr().out
+    )
+
+
+def test_validation_changed_model_bytes_do_not_reuse_cells(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    class ImageClient:
+        def is_up(self) -> bool:
+            return True
+
+        def run_and_save(
+            self, graph: dict[str, Any], out_dir: Path, prefix: str = ""
+        ) -> list[Path]:
+            del graph
+            nonlocal calls
+            calls += 1
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output = out_dir / f"{prefix}output.png"
+            Image.new("RGB", (24, 24), (calls * 30, 90, 130)).save(output)
+            return [output]
+
+    monkeypatch.setattr(validate_module, "ComfyClient", ImageClient)
+    monkeypatch.setattr(config, "GRIDS_DIR", tmp_path)
+
+    def run(lora_identity: str) -> None:
+        validate_module.validate(
+            lora="same_name.safetensors",
+            strengths=[0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=42,
+            run_name="same_name_v1",
+            lora_content_identity=lora_identity,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+
+    run("sha256:first-lora-bytes")
+    run("sha256:replacement-lora-bytes")
+
+    attempts = list((tmp_path / "same_name_v1" / "attempts").iterdir())
+    assert calls == 2
+    assert len(attempts) == 2
+
+
+def test_validation_does_not_reuse_a_corrupted_cell(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    calls = 0
+
+    class ImageClient:
+        def is_up(self) -> bool:
+            return True
+
+        def run_and_save(
+            self, graph: dict[str, Any], out_dir: Path, prefix: str = ""
+        ) -> list[Path]:
+            nonlocal calls
+            calls += 1
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output = out_dir / f"{prefix}output.png"
+            Image.new("RGB", (24, 24), (30 * calls, 100, 140)).save(output)
+            return [output]
+
+    monkeypatch.setattr(validate_module, "ComfyClient", ImageClient)
+    monkeypatch.setattr(config, "GRIDS_DIR", tmp_path)
+
+    def run_validation() -> Path:
+        return validate_module.validate(
+            lora="corrupt_v1.safetensors",
+            strengths=[0.8],
+            prompts=["{trigger}, portrait"],
+            trigger="ohwx person",
+            seed=42,
+            run_name="corrupt_v1",
+            lora_content_identity=TEST_LORA_IDENTITY,
+            checkpoint_content_identity=TEST_CHECKPOINT_IDENTITY,
+        )
+
+    run_validation()
+    attempt_dir = next((tmp_path / "corrupt_v1" / "attempts").iterdir())
+    cell = next((attempt_dir / "cells").glob("*.png"))
+    cell.write_bytes(b"not an image")
+    capsys.readouterr()
+
+    run_validation()
+
+    assert calls == 2
+    with Image.open(cell) as regenerated:
+        regenerated.load()
+        assert regenerated.size == (24, 24)
+    assert (
+        "[validate] cell 1/1 created strength=0.8 prompt#0" in capsys.readouterr().out
+    )
+
+
 def test_validation_grid_has_plain_language_axes_and_baseline_space(
     tmp_path: Path,
 ) -> None:
@@ -659,7 +1023,10 @@ def test_fast_pipeline_preset_defaults_photo_preparation_to_768(
 
     def fake_prepare(**kwargs: object) -> Path:
         captured.update(kwargs)
-        return tmp_path / "dataset"
+        prepared = tmp_path / "datasets" / "subject_v1"
+        prepared.mkdir(parents=True)
+        (prepared / "001.txt").write_text("ohwx person\n", encoding="utf-8")
+        return prepared
 
     monkeypatch.setattr(pipeline_module.prep, "prepare", fake_prepare)
     monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
@@ -704,7 +1071,14 @@ def test_pipeline_uses_only_a_new_checkpoint(
 
     def fake_validate(**kwargs: object) -> Path:
         captured["lora"] = str(kwargs["lora"])
-        return grids / "subject_v1_grid.png"
+        grid = grids / "subject_v1_grid.png"
+        grid.parent.mkdir(parents=True, exist_ok=True)
+        grid.write_bytes(b"verified grid")
+        (grids / "subject_v1_use_in_comfyui.json").write_text(
+            "{}\n",
+            encoding="utf-8",
+        )
+        return grid
 
     monkeypatch.setattr(pipeline_module.trainer, "train", fake_train)
     monkeypatch.setattr(pipeline_module.validator, "validate", fake_validate)
@@ -716,9 +1090,14 @@ def test_pipeline_uses_only_a_new_checkpoint(
     recovery = json.loads(
         (tmp_path / "configs" / "subject_v1-recovery.json").read_text(encoding="utf-8")
     )
-    assert recovery["schema_version"] == 1
+    assert recovery["schema_version"] == 2
     assert recovery["state"] == "complete"
     assert recovery["lora_name"] == captured["lora"]
+    assert recovery["lora_fingerprint"] == io_utils.artifact_fingerprint(
+        comfy_loras / captured["lora"]
+    )
+    assert recovery["validation_signature"]
+    assert recovery["strengths"] == [0.6, 0.8]
 
 
 def test_pipeline_preserves_installed_lora_recovery_when_validation_fails(
@@ -755,18 +1134,23 @@ def test_pipeline_preserves_installed_lora_recovery_when_validation_fails(
     recovery = json.loads(
         (run_configs / "subject_v1-recovery.json").read_text(encoding="utf-8")
     )
-    assert recovery == {
-        "schema_version": 1,
-        "project_name": "subject_v1",
-        "state": "validation_pending",
-        "lora_name": installed.name,
-        "installed_lora_path": str(installed.resolve()),
-        "expected_grid_path": str((grids / "subject_v1_grid.png").resolve()),
-        "trigger": "ohwx person",
-        "preset": "balanced",
-        "checkpoint": "portraitXL.safetensors",
-        "updated_at": recovery["updated_at"],
-    }
+    assert recovery["schema_version"] == 2
+    assert recovery["project_name"] == "subject_v1"
+    assert recovery["state"] == "validation_pending"
+    assert recovery["lora_name"] == installed.name
+    assert recovery["installed_lora_path"] == str(installed.resolve())
+    assert recovery["expected_grid_path"] == str(
+        (grids / "subject_v1_grid.png").resolve()
+    )
+    assert recovery["trigger"] == "ohwx person"
+    assert recovery["preset"] == "balanced"
+    assert recovery["checkpoint"] == "portraitXL.safetensors"
+    assert recovery["lora_fingerprint"] == io_utils.artifact_fingerprint(installed)
+    assert recovery["checkpoint_path"] == ""
+    assert recovery["checkpoint_fingerprint"] == ""
+    assert recovery["validation_signature"]
+    assert recovery["strengths"] == [0.6, 0.8]
+    assert recovery["seed"] == 42
     assert not (run_configs / "subject_v1-result.json").exists()
 
 

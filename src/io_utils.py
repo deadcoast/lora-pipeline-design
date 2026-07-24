@@ -2,10 +2,58 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shutil
 import tempfile
 from pathlib import Path
+from typing import Protocol
+
+_HASH_CHUNK_SIZE = 1024 * 1024
+
+
+class _HashWriter(Protocol):
+    def update(self, data: bytes, /) -> object: ...
+
+
+def _hash_file_into(digest: _HashWriter, path: Path) -> None:
+    with path.open("rb") as stream:
+        while chunk := stream.read(_HASH_CHUNK_SIZE):
+            digest.update(chunk)
+
+
+def artifact_fingerprint(path: Path) -> str:
+    """Return a content fingerprint for one result file or directory tree.
+
+    Directory fingerprints include every relative filename and file body. Symlinks
+    are rejected so a persisted result cannot silently point outside its recorded
+    artifact.
+    """
+
+    if path.is_symlink():
+        raise ValueError(f"Result artifacts cannot be symbolic links: {path}")
+    digest = hashlib.sha256()
+    if path.is_file():
+        digest.update(b"mivim-file-v1\0")
+        _hash_file_into(digest, path)
+        return f"sha256:{digest.hexdigest()}"
+    if not path.is_dir():
+        raise FileNotFoundError(f"Result artifact not found: {path}")
+
+    digest.update(b"mivim-tree-v1\0")
+    files = sorted(
+        (entry for entry in path.rglob("*") if entry.is_file()),
+        key=lambda entry: entry.relative_to(path).as_posix(),
+    )
+    for entry in files:
+        if entry.is_symlink():
+            raise ValueError(f"Result artifacts cannot contain symbolic links: {entry}")
+        relative = entry.relative_to(path).as_posix().encode("utf-8")
+        digest.update(len(relative).to_bytes(8, "big"))
+        digest.update(relative)
+        digest.update(entry.stat().st_size.to_bytes(8, "big"))
+        _hash_file_into(digest, entry)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _temporary_path(destination: Path) -> tuple[int, Path]:

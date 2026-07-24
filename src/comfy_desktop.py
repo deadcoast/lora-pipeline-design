@@ -28,6 +28,8 @@ from urllib.parse import urlsplit
 
 import yaml
 
+from . import __version__
+
 COMFY_DESKTOP_APP_ID = "com.todesktop.241012ess7yxs0e"
 """Windows Start-menu AppID used by the current Comfy Desktop release."""
 
@@ -877,7 +879,7 @@ def _get_json(url: str, timeout: float) -> Any:
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "MIVIM-LoRA-Studio/0.3",
+            "User-Agent": f"MIVIM-LoRA-Studio/{__version__}",
         },
         method="GET",
     )

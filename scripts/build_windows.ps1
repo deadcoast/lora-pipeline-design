@@ -6,7 +6,9 @@ $deployPython = Join-Path $deployEnvironment "Scripts\python.exe"
 $deployTool = Join-Path $deployEnvironment "Scripts\pyside6-deploy.exe"
 $deploySpec = Join-Path $repoRoot "pysidedeploy.spec"
 $generatedDeploySpec = Join-Path $deployEnvironment "pysidedeploy.generated.spec"
-$deployIcon = Join-Path $deployEnvironment "Lib\site-packages\PySide6\scripts\deploy_lib\pyside_icon.ico"
+$lockedDeployRequirements = Join-Path $deployEnvironment "deploy-requirements.lock"
+$iconGenerator = Join-Path $repoRoot "scripts\generate_windows_icon.py"
+$deployIcon = Join-Path $deployEnvironment "mivim-lora-studio.ico"
 $expectedExecutable = Join-Path $repoRoot "dist\MIVIMLoRAStudio.dist\MIVIMLoRAStudio.exe"
 
 $uv = Get-Command uv -ErrorAction SilentlyContinue
@@ -26,9 +28,31 @@ if ($LASTEXITCODE -ne 0 -or $deployRuntime -ne "3.13|64") {
     throw "The deployment environment must use 64-bit Python 3.13. Found: $deployRuntime"
 }
 
-& $uv.Source pip install --python $deployPython -r (Join-Path $repoRoot "requirements.txt") "Nuitka==4.0" "pip>=26.0"
+& $uv.Source export `
+    --quiet `
+    --project $repoRoot `
+    --locked `
+    --no-dev `
+    --group deploy `
+    --no-emit-project `
+    --format requirements.txt `
+    --output-file $lockedDeployRequirements
 if ($LASTEXITCODE -ne 0) {
-    throw "Could not install deployment dependencies."
+    throw "Could not export the locked deployment dependencies."
+}
+
+& $uv.Source pip sync `
+    --python $deployPython `
+    --require-hashes `
+    --strict `
+    $lockedDeployRequirements
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not synchronize the locked deployment dependencies."
+}
+
+& $deployPython $iconGenerator $deployIcon
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $deployIcon -PathType Leaf)) {
+    throw "Could not generate the MIVIM Windows application icon."
 }
 
 Copy-Item -LiteralPath $deploySpec -Destination $generatedDeploySpec -Force

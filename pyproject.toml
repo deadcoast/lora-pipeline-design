@@ -1,6 +1,6 @@
 [project]
 name = "lora-pipeline-design"
-version = "0.3.0"
+version = "0.4.0"
 description = "MIVIM LoRA Studio: a guided SDXL training companion for Comfy Desktop"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -34,6 +34,10 @@ dev = [
     "pytest-qt>=4.5.0",
     "ruff>=0.14.0",
     "types-pyyaml>=6.0.12",
+]
+deploy = [
+    "nuitka==4.0",
+    "pip==26.1.2",
 ]
 
 [tool.hatch.build.targets.wheel]

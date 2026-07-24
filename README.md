@@ -106,16 +106,24 @@ Every plan includes a no-LoRA baseline for an honest before/after comparison:
 | Balanced     |   16 | 2,000 |    1,024 px | 0.6, 0.8, 1.0             |
 | High quality |   32 | 3,000 |    1,024 px | 0.5, 0.65, 0.8, 0.95, 1.1 |
 
-The run monitor streams the real pipeline output. It prevents concurrent GPU
-runs, and Stop cancels the complete Windows process tree so a trainer process
-is not silently left running. Failed starts and interrupted runs expose direct
-edit, output-folder, and retry actions. Prepared data and completed checkpoints
-are retained. If training and installation finish but ComfyUI validation fails,
+The run monitor streams the real pipeline output and prevents concurrent GPU
+runs. Before validation begins, Stop cancels the complete Windows process tree
+so a trainer process is not silently left running. During validation, pending
+owned prompts are removed individually. A running prompt receives a targeted
+interrupt only when ComfyUI reports version 0.3.56 or newer. Older or unknown
+versions and unverified ownership are safe no-ops toward ComfyUI: MIVIM remains
+attached, explains how to stop that job in ComfyUI, and refuses to close while
+it cannot confirm a safe stop. Other users' work is never stopped. Failed starts
+and interrupted runs expose direct edit, output-folder, and retry actions.
+Prepared data and completed checkpoints are retained. If training and
+installation finish but ComfyUI validation fails,
 the monitor offers a validation-only retry instead of repeating training. That
 post-install handoff is recorded atomically, so reopening the studio after a
 failed or interrupted validation restores the same validation-only recovery.
-The retry remains bound to the checkpoint saved with that training run, even if
-the current setup selection changed afterward.
+The retry remains bound to the exact Desktop installation, address, LoRA bytes,
+checkpoint file, prompts, strengths, and seed saved with that run. Verified
+cells resume individually; changed inputs get an isolated attempt instead of
+mixing old and new images.
 The Technical details header also opens the durable local support logs, so a
 user can inspect or share the relevant details without reproducing a failure in
 a terminal.
@@ -136,9 +144,15 @@ unsupported image files are named before Start can launch a process.
   LoRA-strength rows.
 - Persists and restores only the most recent verified result record, rather
   than guessing from stale files with the same project name.
+- Writes `<project>_use_in_comfyui.json` as an editable, core-node ComfyUI
+  Workflow JSON v0.4. The grid PNG embeds both the exact API prompt that ran and
+  its equivalent editable UI workflow.
 - Shows and copies the exact LoRA filename, identity phrase, base checkpoint,
-  and suggested starting strength for the next step in ComfyUI.
-- Opens the result folder and the connected ComfyUI instance.
+  ready-workflow path, and tested default strength nearest 0.8.
+- Hashes the exact LoRA and checkpoint in the background before enabling
+  handoff actions, then requires the same Desktop installation, host, and model
+  paths. The studio opens the workflow folder or ComfyUI; the user still drags
+  in the PNG/JSON or uses **Workflow → Open**.
 
 ## Required external tools
 
@@ -262,6 +276,13 @@ Build a standalone Windows application with Qt's official deployment tool:
 .\scripts\build_windows.ps1
 ```
 
+The build exports the runtime and deployment tools from the checked-in
+`uv.lock`, verifies package hashes, and synchronizes the private
+`.venv-deploy` before packaging. Run `uv lock` and commit the updated lockfile
+when intentionally changing application or deployment dependencies;
+`requirements.txt` supports the source-checkout launcher and is not the release
+build's dependency authority.
+
 `pysidedeploy.spec` includes the training config and ComfyUI validation
 workflow. The packaged executable reuses itself as a hidden-console pipeline
 worker, so it does not depend on a system Python interpreter after deployment.
@@ -313,9 +334,14 @@ Important source files:
 - Face-count review still requires a future local vision component. The current
   pass covers corruption, exact and likely near-duplicates, likely blur, count,
   and resolution.
-- The first complete review artifact is one validation grid. Multi-checkpoint
-  winner selection and per-cell validation resume are subsequent product work,
-  not hidden placeholders in this release.
+- Each completed validation produces a comparison grid plus a tested,
+  core-node-only ComfyUI Workflow JSON v0.4. The PNG separately embeds the API
+  prompt and equivalent editable UI workflow. Workflow JSON 1.0 is the newest
+  documented schema; automatic Desktop import and 1.0 export are not claimed.
+- Automated integration uses a mock ComfyUI API. A live Desktop/GPU training
+  run and manual workflow import remain environment acceptance checks.
+  Multi-checkpoint and automatic strength-winner selection remain subsequent
+  product work.
 
 The local ComfyUI routes used by the integration are documented in the
 [official server route reference](https://docs.comfy.org/development/comfyui-server/comms_routes).

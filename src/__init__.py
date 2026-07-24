@@ -20,6 +20,8 @@ Modules:
 
 from typing import TYPE_CHECKING
 
+__version__ = "0.4.0"
+
 if TYPE_CHECKING:
     from . import (
         app_models,
@@ -40,6 +42,7 @@ if TYPE_CHECKING:
     )
 
 __all__ = [
+    "__version__",
     "app_models",
     "app_service",
     "app_settings",

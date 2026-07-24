@@ -88,30 +88,27 @@ old nightly URL.
 
 ## 3. Repository layout
 
-One project folder in VSCode, trainer and ComfyUI referenced (not copied) from it:
+The repository contains the desktop product and CLI core. User projects default
+to a versioned writable application-data workspace; ai-toolkit and Comfy
+Desktop remain separate installations selected by the user.
 
 ```text
-lora-pipeline/
-├─ pyproject.toml / requirements.txt   # orchestrator + self-test dependencies
-├─ .env                                # paths to ComfyUI, ai-toolkit, model dirs
+lora-pipeline-design/
+├─ pyproject.toml / uv.lock            # app, test, and locked deploy dependencies
 ├─ configs/
 │  └─ person_sdxl.yaml                 # reusable SDXL training template
-├─ datasets/
-│  └─ subject_v1/
-│     ├─ 01.png   01.txt               # image + caption pairs
-│     ├─ 02.png   02.txt
-│     └─ ...
 ├─ src/
-│  ├─ prepare_dataset.py               # resize, auto-caption, sanity-check
-│  ├─ train.py                         # thin wrapper that calls ai-toolkit run.py
-│  ├─ comfy_client.py                  # ComfyUI API client (queue + websocket)
-│  ├─ validate.py                      # generate a validation grid from a trained LoRA
-│  └─ pipeline.py                      # ties it all together: prep → train → validate
+│  ├─ desktop.py                       # guided application and real worker lifecycle
+│  ├─ app_models.py / app_settings.py  # typed state and atomic persistence
+│  ├─ app_service.py                   # readiness, repairs, and command construction
+│  ├─ comfy_desktop.py                 # Desktop discovery and exact model roots
+│  ├─ prepare_dataset.py / train.py    # prepared pairs and ai-toolkit launch
+│  ├─ comfy_client.py / validate.py    # API execution and verified result workflow
+│  └─ pipeline.py                      # prep → train → install → validate
 ├─ workflows/
-│  └─ validate_sdxl_api.json           # ComfyUI workflow in "API format"
-└─ outputs/
-   ├─ checkpoints/                     # LoRA .safetensors land here
-   └─ grids/                           # validation images per epoch
+│  └─ validate_sdxl_api.json           # shipped API-format execution template
+└─ scripts/
+   └─ build_windows.ps1                # locked standalone Windows package
 ```
 
 ---
@@ -171,7 +168,7 @@ config:
           - prompt: "{trigger}, standing in a city street, 35mm"
 ```
 
-Two habits that save you: **save checkpoints often** (`save_every`) so you can pick the epoch *before* it overfit, and use ai-toolkit's built-in **sampling during training** to watch it learn in real time. On a 5090 an SDXL run like this is roughly 20–40 minutes.
+Two habits that save you: **save checkpoints often** (`save_every`) so you can pick the epoch *before* it overfit, and use ai-toolkit's built-in **sampling during training** to watch it learn in real time. Runtime varies materially with the model, trainer version, plan, dataset, GPU, and memory pressure; the application does not promise a fixed duration.
 
 You can drive training either from the **ai-toolkit web UI** (`http://localhost:8675` — start/stop/monitor jobs visually) or from code:
 
@@ -182,43 +179,20 @@ subprocess.run(
 )
 ```
 
-### Step 3: Validation via ComfyUI's API (this is the "application" part)
+### Step 3: Validation via ComfyUI's API
 
-Build a validation workflow **once** in the ComfyUI Desktop UI: `Load Checkpoint → Load LoRA → CLIP Text Encode (pos/neg) → KSampler → VAE Decode → Save Image`. Then **Save (API Format)** to `workflows/validate_sdxl_api.json`. That JSON is a template your code fills in and submits.
+The repository ships `workflows/validate_sdxl_api.json`, an API-format template
+using only core nodes. `validate.py` injects the exact checkpoint, LoRA, prompt,
+strength, and one fixed seed, then submits the prompt through the implemented
+client in `src/comfy_client.py`. It waits for this prompt's WebSocket completion,
+reads its history, and downloads its images.
 
-Minimal client:
-
-```python
-# src/comfy_client.py  (implemented client)
-import json, uuid, urllib.request, websocket  # websocket-client
-
-COMFY = "127.0.0.1:8188"  # ComfyUI server (enable API / run server mode)
-
-
-def queue_prompt(graph: dict) -> str:
-    body = json.dumps({"prompt": graph, "client_id": CLIENT_ID}).encode()
-    req = urllib.request.Request(f"http://{COMFY}/prompt", data=body)
-    return json.load(urllib.request.urlopen(req))["prompt_id"]
-
-
-def run_and_wait(graph: dict):
-    ws = websocket.WebSocket()
-    ws.connect(f"ws://{COMFY}/ws?clientId={CLIENT_ID}")
-    pid = queue_prompt(graph)
-    while True:  # block until this prompt finishes
-        msg = ws.recv()
-        if isinstance(msg, str):
-            m = json.loads(msg)
-            if (
-                m.get("type") == "executing"
-                and m["data"]["node"] is None
-                and m["data"]["prompt_id"] == pid
-            ):
-                break
-    # then fetch images from /history/<pid>
-```
-
-`validate.py` loads the workflow JSON, swaps in the new LoRA filename + a fixed set of seeds/prompts, runs them, and stitches an XY grid (LoRA strength × prompt) into `outputs/grids/`. Now every training run ends with a comparable contact sheet — that's your feedback loop.
+Successful validation stitches the prompt × strength sweep into a comparison
+grid. It also generates `<project>_use_in_comfyui.json` as an editable ComfyUI
+Workflow JSON v0.4. Before approval, the code reconstructs the API prompt from
+that UI graph and requires exact equality with what ran. The PNG embeds the
+executed API prompt under `prompt` and the editable graph under `workflow`.
+Workflow JSON 1.0 is the newest documented schema, so 1.0 export is not claimed.
 
 ### Step 4: The orchestrator
 
@@ -288,9 +262,15 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 - The app owns versioned per-user settings and a writable project workspace.
 - Fast, Balanced, and High Quality plans change real rank, steps, resolution,
   preview cadence, and validation breadth.
-- Setup checks, preparation-only operation, background logging, complete
-  Windows process-tree cancellation, result verification, and last-result
-  restoration are implemented in the user-facing application.
+- Setup checks, preparation-only operation, background logging, Windows
+  process-tree cancellation, result verification, and last-result restoration
+  are implemented in the user-facing application.
+- Validation emits a prompt, client, and host ownership marker. Stop verifies
+  that identity against ComfyUI's live queue before deleting a pending prompt.
+  A running prompt receives a prompt-ID-targeted interrupt only on ComfyUI
+  0.3.56 or newer. Older/unknown versions and absent/mismatched ownership are
+  safe no-ops toward ComfyUI; the worker remains attached with instructions,
+  and closing is refused until a safe stop can be confirmed.
 - Background logging is a bounded, rotating, local-only support trail beside
   the user's settings. It records setup/readiness outcomes, recoverable worker
   failures, and real pipeline output without dumping environment variables or
@@ -304,10 +284,19 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 - LoRA installation writes a versioned recovery record before validation starts.
   If validation fails or the studio closes, the next launch restores a
   validation-only retry and never repeats completed preparation or training.
+  Recovery is attempt-bound to the original Desktop installation, host, LoRA
+  and checkpoint paths/fingerprints, strengths, seed, and validation signature.
+  Startup and Retry hash large models outside the GUI thread and keep Retry
+  disabled until they match.
 - Validation includes a no-LoRA baseline and plain-language prompt/strength
-  axes. The verified result record carries the installed LoRA filename,
-  identity phrase, checkpoint, and suggested starting strength into the result
-  page.
+  axes. Each verified cell is resumable from an attempt-isolated atomic
+  manifest only when the full signature, including both model identities,
+  matches; a changed input receives an isolated attempt. The verified result
+  record uses the immutable launch snapshot and carries the installed LoRA,
+  identity phrase, checkpoint, tested default strength nearest 0.8, and an
+  editable core-node Workflow JSON v0.4. The PNG separately embeds the exact
+  API prompt and equivalent UI workflow. Model hashing and result-action gates
+  run outside the GUI thread.
 - Training configs are reusable templates; the orchestrator injects each run's
   name, dataset path, selected Comfy Desktop checkpoint file, output path, and
   selected preset before launching ai-toolkit.
@@ -329,9 +318,9 @@ Ship each milestone before starting the next — it keeps failures isolated to o
   matches the selected Desktop instance's verified model-root declaration; the
   repair never creates arbitrary or parent paths.
 - Video/Wan support remains an explicit Phase 2 roadmap item.
-- Face-count QC, multi-checkpoint winner selection, remote model upload, and
-  per-cell validation resume remain explicit future product work rather than
-  partially exposed controls. Blur and likely near-duplicate checks are local
-  review recommendations in Phase 1.
+- Face-count QC, multi-checkpoint winner selection, and remote model upload
+  remain explicit future product work rather than partially exposed controls.
+  Blur and likely near-duplicate checks are local review recommendations in
+  Phase 1.
 
 ---

@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import traceback
+import uuid
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
@@ -45,6 +47,7 @@ from PySide6.QtGui import (
     QIcon,
     QPainter,
     QPixmap,
+    QResizeEvent,
     QTextCursor,
 )
 from PySide6.QtWidgets import (
@@ -69,7 +72,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import config
+from . import __version__, config
 from .app_models import (
     AppSettings,
     ProjectDraft,
@@ -93,12 +96,14 @@ from .app_settings import (
     save_settings,
     with_user_storage_defaults,
 )
+from .comfy_client import ComfyClient, PromptCancellationResult
 from .comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
 )
 from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
+from .io_utils import artifact_fingerprint
 from .photo_review import PhotoIssueDialog
 from .studio_logging import StudioLog, log_directory_for
 
@@ -125,6 +130,13 @@ def _artifact_snapshot(path: Path) -> tuple[tuple[str, int, int], ...] | None:
     except OSError:
         return None
     return tuple(snapshot)
+
+
+def _file_stat_identity(path: Path) -> tuple[int, int]:
+    """Return a cheap post-hash guard for a model file."""
+
+    stat = path.stat()
+    return stat.st_size, stat.st_mtime_ns
 
 
 def _layout_clear(layout: QVBoxLayout | QGridLayout) -> None:
@@ -319,6 +331,39 @@ class PhotoDropZone(QFrame):
                 event.acceptProposedAction()
 
 
+class AspectRatioPixmapLabel(QLabel):
+    """Fit a retained source image whenever the result viewport changes."""
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self._source_pixmap: QPixmap | None = None
+
+    def set_source_pixmap(self, pixmap: QPixmap) -> None:
+        self._source_pixmap = QPixmap(pixmap)
+        self._fit_source_pixmap()
+
+    def clear_source_pixmap(self) -> None:
+        self._source_pixmap = None
+        self.clear()
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._fit_source_pixmap()
+
+    def _fit_source_pixmap(self) -> None:
+        pixmap = self._source_pixmap
+        size = self.contentsRect().size()
+        if pixmap is None or pixmap.isNull() or size.isEmpty():
+            return
+        self.setPixmap(
+            pixmap.scaled(
+                size,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+
 class DiagnosticCard(QFrame):
     def __init__(
         self,
@@ -384,7 +429,8 @@ class MainWindow(QMainWindow):
         self.studio_log = StudioLog(log_directory_for(self.settings_path))
         self.studio_log.info(
             "session.started",
-            "MIVIM LoRA Studio started. Support logs stay on this computer.",
+            f"MIVIM LoRA Studio {__version__} started. "
+            "Support logs stay on this computer.",
         )
         self.service = service or ApplicationService()
         self.discovery: ComfyDesktopDiscovery | None = None
@@ -416,15 +462,25 @@ class MainWindow(QMainWindow):
         self._training_elapsed_timer.timeout.connect(self._update_training_elapsed)
         self._trainer_stage_seen = False
         self._run_failure_kind: RunFailureKind = "generic"
+        self._owned_comfy_prompt: tuple[str, str, str] | None = None
+        self._comfy_cancel_detail = ""
         self._closing = False
         self._validated_settings: AppSettings | None = None
         self._validated_draft: ProjectDraft | None = None
+        self._run_settings_snapshot: AppSettings | None = None
+        self._run_draft_snapshot: ProjectDraft | None = None
+        self._verified_result_identity: (
+            tuple[RunResult, tuple[int, int], tuple[int, int]] | None
+        ) = None
+        self._result_identity_failure: tuple[RunResult, str] | None = None
+        self._result_identity_request = 0
+        self._recovery_check_request = 0
         self._setup_request = 0
         self._source_request = 0
         self._readiness_request = 0
         self._desktop_poll_remaining = 0
 
-        self.setWindowTitle("MIVIM LoRA Studio")
+        self.setWindowTitle(f"MIVIM LoRA Studio {__version__}")
         self.setWindowIcon(_app_icon())
         self.setMinimumSize(1040, 690)
         self.resize(1180, 780)
@@ -475,7 +531,7 @@ class MainWindow(QMainWindow):
         )
         privacy.setMaximumWidth(180)
         nav.addWidget(privacy)
-        version = QLabel("MIVIM • Phase 1 SDXL")
+        version = QLabel(f"Version {__version__} • SDXL")
         version.setObjectName("brandSubtitle")
         nav.addWidget(version)
 
@@ -489,6 +545,8 @@ class MainWindow(QMainWindow):
         self.show_page(NAV_SETUP)
 
     def _scroll_page(self, content: QWidget) -> QScrollArea:
+        if not content.objectName():
+            content.setObjectName("scrollPageContent")
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1033,6 +1091,7 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------- results UI
     def _build_results_page(self) -> QWidget:
         content = QWidget()
+        content.setObjectName("resultsPage")
         page = QVBoxLayout(content)
         page.setContentsMargins(34, 30, 34, 34)
         page.setSpacing(16)
@@ -1055,21 +1114,27 @@ class MainWindow(QMainWindow):
         result_card = _card()
         result_layout = QVBoxLayout(result_card)
         result_layout.setContentsMargins(18, 18, 18, 18)
-        self.result_image = QLabel("The comparison grid will appear here.")
+        self.result_image = AspectRatioPixmapLabel(
+            "The comparison grid will appear here."
+        )
         self.result_image.setObjectName("resultImage")
         self.result_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.result_image.setMinimumHeight(380)
+        self.result_image.setMinimumHeight(300)
         self.result_image.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
         self.result_image.setWordWrap(True)
         self.result_image.setAccessibleName("LoRA validation comparison grid")
         result_layout.addWidget(self.result_image, 1)
-        self.result_path_label = _hint()
-        self.result_path_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        result_layout.addWidget(self.result_path_label)
+        result_path = QHBoxLayout()
+        result_path.setSpacing(10)
+        result_path.addWidget(_hint("Saved result"))
+        self.result_path_label = QLineEdit()
+        self.result_path_label.setObjectName("resultPath")
+        self.result_path_label.setReadOnly(True)
+        self.result_path_label.setAccessibleName("Saved result path")
+        result_path.addWidget(self.result_path_label, 1)
+        result_layout.addLayout(result_path)
         page.addWidget(result_card, 1)
 
         self.comfy_handoff_card = _card()
@@ -1083,6 +1148,11 @@ class MainWindow(QMainWindow):
         )
         handoff_text.addWidget(self.result_details_label)
         handoff_layout.addLayout(handoff_text, 1)
+        self.open_ready_workflow_button = _button("Show ready workflow")
+        self.open_ready_workflow_button.setObjectName("openReadyWorkflowButton")
+        self.open_ready_workflow_button.clicked.connect(self.open_ready_workflow)
+        self.open_ready_workflow_button.setVisible(False)
+        handoff_layout.addWidget(self.open_ready_workflow_button)
         self.copy_result_setup_button = _button("Copy setup")
         self.copy_result_setup_button.setObjectName("copyResultSetupButton")
         self.copy_result_setup_button.clicked.connect(self.copy_result_setup)
@@ -1103,11 +1173,19 @@ class MainWindow(QMainWindow):
         self.open_full_grid_button.clicked.connect(self.open_full_size_grid)
         self.open_full_grid_button.setVisible(False)
         actions.addWidget(self.open_full_grid_button)
-        self.result_open_comfy_button = _button("Open ComfyUI", "primaryButton")
+        self.result_open_comfy_button = _button(
+            "Open ComfyUI in browser",
+            "primaryButton",
+        )
         self.result_open_comfy_button.setObjectName("resultOpenComfyButton")
         self.result_open_comfy_button.clicked.connect(self.open_comfy_ui)
         self.result_open_comfy_button.setEnabled(False)
         actions.addWidget(self.result_open_comfy_button)
+        self.result_open_desktop_button = _button("Open Comfy Desktop")
+        self.result_open_desktop_button.setObjectName("resultOpenDesktopButton")
+        self.result_open_desktop_button.clicked.connect(self.open_result_comfy_desktop)
+        self.result_open_desktop_button.setVisible(False)
+        actions.addWidget(self.result_open_desktop_button)
         self.review_prepared_button = _button("Review photos & captions")
         self.review_prepared_button.setObjectName("reviewPreparedButton")
         self.review_prepared_button.clicked.connect(self.review_prepared_dataset)
@@ -1127,7 +1205,9 @@ class MainWindow(QMainWindow):
         new_project.clicked.connect(self.new_project)
         actions.addWidget(new_project)
         page.addLayout(actions)
-        return content
+        results_scroll = self._scroll_page(content)
+        results_scroll.setObjectName("resultsScroll")
+        return results_scroll
 
     # ------------------------------------------------------------ async setup
     def _run_worker(
@@ -1219,7 +1299,13 @@ class MainWindow(QMainWindow):
         self._populate_settings()
         self.retry_comfy_button.setEnabled(True)
         self.open_comfy_button.setEnabled(status.reachable)
-        self.result_open_comfy_button.setEnabled(status.reachable)
+        self.result_open_comfy_button.setEnabled(
+            status.reachable
+            and self._result_comfy_context_issue(
+                self._displayed_result_record,
+            )
+            is None
+        )
         local_installations = tuple(
             installation
             for installation in discovery.installations
@@ -1356,12 +1442,13 @@ class MainWindow(QMainWindow):
         self.workspace_dir_edit.setToolTip(self.workspace_dir_edit.text())
         previous = self.settings.comfy_checkpoint
         names = list(self.comfy_status.checkpoints) if self.comfy_status else []
-        self.checkpoint_combo.clear()
-        self.checkpoint_combo.addItems(names)
-        if previous and previous not in names:
-            self.checkpoint_combo.addItem(previous)
-        if previous:
-            self.checkpoint_combo.setCurrentText(previous)
+        with QSignalBlocker(self.checkpoint_combo):
+            self.checkpoint_combo.clear()
+            self.checkpoint_combo.addItems(names)
+            if previous and previous not in names:
+                self.checkpoint_combo.addItem(previous)
+            if previous:
+                self.checkpoint_combo.setCurrentText(previous)
         with QSignalBlocker(self.sdxl_confirm_checkbox):
             self.sdxl_confirm_checkbox.setChecked(
                 bool(previous)
@@ -1413,8 +1500,28 @@ class MainWindow(QMainWindow):
         expected_kind = (
             result.is_dir() if record.mode == "prepare" else result.is_file()
         )
-        if result.exists() and expected_kind:
-            self._show_result(result, record)
+        if not result.exists() or not expected_kind or not record.result_fingerprint:
+            return
+        try:
+            current_fingerprint = artifact_fingerprint(result)
+        except (FileNotFoundError, OSError, ValueError):
+            return
+        if current_fingerprint != record.result_fingerprint:
+            return
+        if record.mode == "full":
+            workflow = record.workflow_path
+            if (
+                workflow is None
+                or not record.workflow_fingerprint
+                or not workflow.is_file()
+            ):
+                return
+            try:
+                if artifact_fingerprint(workflow) != record.workflow_fingerprint:
+                    return
+            except (FileNotFoundError, OSError, ValueError):
+                return
+        self._show_result(result, record)
 
     def _draft_for_recovery(self, recovery: ValidationRecovery) -> ProjectDraft:
         last = self.settings.last_project
@@ -1447,22 +1554,13 @@ class MainWindow(QMainWindow):
         self._pending_validation_recovery = recovery
         self._installed_lora_name = recovery.lora_name
         self.draft = draft
-        try:
-            self.pipeline_command = self.service.build_validation_command(
-                self.settings,
-                draft,
-                recovery.lora_name,
-                checkpoint=recovery.checkpoint,
-            )
-        except (TypeError, ValueError):
-            self.pipeline_command = None
+        self.pipeline_command = None
         self.run_stack.setCurrentIndex(1)
         self.run_progress.setValue(78)
-        self.run_stage_label.setText("LoRA installed; validation needs attention")
+        self.run_stage_label.setText("Checking saved validation…")
         self.run_detail_label.setText(
-            "Training is already complete and the LoRA is safely installed. Open "
-            "the selected ComfyUI instance, then retry validation without repeating "
-            "photo preparation or training."
+            "MIVIM is verifying the exact LoRA and SDXL checkpoint in the "
+            "background. The window remains available while large models are checked."
         )
         self.run_log.setPlainText(
             "[studio] Recovered an unfinished ComfyUI validation.\n"
@@ -1481,6 +1579,100 @@ class MainWindow(QMainWindow):
                 f"lora={recovery.lora_name}; state={recovery.state}"
             ),
         )
+        self.retry_validation_button.setEnabled(False)
+        self._recovery_check_request += 1
+        request = self._recovery_check_request
+        settings_snapshot = deepcopy(self.settings)
+        self._run_worker(
+            lambda: self.service.validation_recovery_issue(
+                settings_snapshot,
+                recovery,
+            ),
+            lambda result: self._restored_recovery_checked(
+                request,
+                recovery,
+                draft,
+                settings_snapshot,
+                result,
+            ),
+            lambda message: self._restored_recovery_check_failed(
+                request,
+                recovery,
+                message,
+            ),
+            operation="validation.recovery.verify",
+        )
+
+    def _restored_recovery_checked(
+        self,
+        request: int,
+        recovery: ValidationRecovery,
+        draft: ProjectDraft,
+        settings_snapshot: AppSettings,
+        result: object,
+    ) -> None:
+        if (
+            request != self._recovery_check_request
+            or self._pending_validation_recovery != recovery
+        ):
+            return
+        if result is None:
+            recovery_issue = None
+        elif isinstance(result, str):
+            recovery_issue = result
+        else:
+            recovery_issue = (
+                "Saved validation verification returned an unexpected result. "
+                "Use Check again before retrying."
+            )
+        try:
+            self.pipeline_command = (
+                None
+                if recovery_issue is not None
+                else self.service.build_validation_command(
+                    settings_snapshot,
+                    draft,
+                    recovery.lora_name,
+                    checkpoint=recovery.checkpoint,
+                    strengths=recovery.strengths,
+                    seed=recovery.seed,
+                )
+            )
+        except (TypeError, ValueError) as exc:
+            self.pipeline_command = None
+            recovery_issue = str(exc)
+        if recovery_issue is None:
+            self.run_stage_label.setText("LoRA installed; validation needs attention")
+            self.run_detail_label.setText(
+                "Training is already complete and the exact model files were "
+                "verified. Open the selected ComfyUI instance, then retry validation "
+                "without repeating photo preparation or training."
+            )
+            self.retry_validation_button.setEnabled(True)
+        else:
+            self.run_stage_label.setText("Reconnect the original ComfyUI setup")
+            self.run_detail_label.setText(recovery_issue)
+            self.retry_validation_button.setEnabled(False)
+
+    def _restored_recovery_check_failed(
+        self,
+        request: int,
+        recovery: ValidationRecovery,
+        message: str,
+    ) -> None:
+        if (
+            request != self._recovery_check_request
+            or self._pending_validation_recovery != recovery
+        ):
+            return
+        self.pipeline_command = None
+        self.run_stage_label.setText("Saved validation could not be verified")
+        self.run_detail_label.setText(
+            "MIVIM could not safely read the saved LoRA and checkpoint. Reconnect "
+            "the original files, then check again."
+        )
+        self.retry_validation_button.setEnabled(False)
+        self.studio_log.warning("validation.recovery.verify_failed", message)
 
     def _collect_settings(self) -> AppSettings:
         if not hasattr(self, "host_edit"):
@@ -1723,7 +1915,206 @@ class MainWindow(QMainWindow):
         self._desktop_poll_remaining = 18
         QTimer.singleShot(3000, self.refresh_setup)
 
+    def open_result_comfy_desktop(self) -> None:
+        issue = self._result_comfy_context_issue(self._displayed_result_record)
+        if issue is not None:
+            self._show_error("Reconnect the original ComfyUI setup", issue)
+            return
+        self.open_comfy_desktop()
+
+    def _start_result_identity_verification(self, record: RunResult) -> None:
+        """Hash restored model files off the GUI thread before handoff actions."""
+
+        if (
+            record.mode != "full"
+            or record.installed_lora_path is None
+            or record.checkpoint_path is None
+        ):
+            return
+        lora_path = record.installed_lora_path
+        checkpoint_path = record.checkpoint_path
+        cached = self._verified_result_identity
+        if cached is not None and cached[0] == record:
+            try:
+                if (
+                    _file_stat_identity(lora_path) == cached[1]
+                    and _file_stat_identity(checkpoint_path) == cached[2]
+                ):
+                    return
+            except OSError:
+                pass
+        self._result_identity_request += 1
+        request = self._result_identity_request
+        self._verified_result_identity = None
+        self._result_identity_failure = None
+        self.result_open_comfy_button.setEnabled(False)
+
+        def verify() -> tuple[tuple[int, int], tuple[int, int]]:
+            if (
+                not record.lora_fingerprint
+                or artifact_fingerprint(lora_path) != record.lora_fingerprint
+            ):
+                raise ValueError(
+                    "The installed LoRA no longer matches this validation result."
+                )
+            if (
+                not record.checkpoint_fingerprint
+                or artifact_fingerprint(checkpoint_path)
+                != record.checkpoint_fingerprint
+            ):
+                raise ValueError(
+                    "The SDXL checkpoint no longer matches this validation result."
+                )
+            return (
+                _file_stat_identity(lora_path),
+                _file_stat_identity(checkpoint_path),
+            )
+
+        def verified(result: object) -> None:
+            if (
+                request != self._result_identity_request
+                or self._displayed_result_record != record
+                or not isinstance(result, tuple)
+                or len(result) != 2
+            ):
+                return
+            lora_identity, checkpoint_identity = result
+            if not (
+                isinstance(lora_identity, tuple)
+                and len(lora_identity) == 2
+                and isinstance(checkpoint_identity, tuple)
+                and len(checkpoint_identity) == 2
+            ):
+                self._result_identity_failed(
+                    request,
+                    record,
+                    "Model verification returned an unexpected value.",
+                )
+                return
+            self._verified_result_identity = (
+                record,
+                cast(tuple[int, int], lora_identity),
+                cast(tuple[int, int], checkpoint_identity),
+            )
+            self._result_identity_failure = None
+            self.result_open_comfy_button.setEnabled(
+                self.comfy_status is not None
+                and self.comfy_status.reachable
+                and self._result_comfy_context_issue(record) is None
+            )
+            self.studio_log.info(
+                "result.models.verified",
+                f"project={record.project_name}",
+            )
+
+        self._run_worker(
+            verify,
+            verified,
+            lambda message: self._result_identity_failed(
+                request,
+                record,
+                message,
+            ),
+            operation="result.models.verify",
+        )
+
+    def _result_identity_failed(
+        self,
+        request: int,
+        record: RunResult,
+        message: str,
+    ) -> None:
+        if (
+            request != self._result_identity_request
+            or self._displayed_result_record != record
+        ):
+            return
+        self._verified_result_identity = None
+        self._result_identity_failure = (record, message)
+        self.result_open_comfy_button.setEnabled(False)
+        self.studio_log.warning(
+            "result.models.unverified",
+            f"project={record.project_name}; detail={message}",
+        )
+
+    def _result_comfy_context_issue(self, record: RunResult | None) -> str | None:
+        if record is None or record.mode != "full":
+            return None
+        current = self._collect_settings()
+        if record.comfy_installation_id != current.comfy_installation_id.strip():
+            return (
+                "This result belongs to another Comfy Desktop installation. "
+                "Reconnect that installation before opening the workflow."
+            )
+        live_host = (
+            self.comfy_status.host
+            if self.comfy_status is not None and self.comfy_status.reachable
+            else None
+        )
+        if live_host is not None and record.comfy_host != live_host:
+            return (
+                "The running ComfyUI address does not match the instance used for "
+                "this result. Reconnect the original Desktop installation."
+            )
+        if (
+            record.installed_lora_path is None
+            or not record.installed_lora_path.is_file()
+        ):
+            return "The LoRA is missing from the ComfyUI installation used by this run."
+        if (
+            current.comfy_lora_dir is None
+            or record.installed_lora_path.resolve().parent
+            != self.service.project_path(current.comfy_lora_dir).resolve()
+        ):
+            return (
+                "The selected ComfyUI model library is not the one that received "
+                "this LoRA. Reconnect the original installation."
+            )
+        if record.checkpoint_path is None or not record.checkpoint_path.is_file():
+            return "The SDXL checkpoint used for this result is missing."
+        if (
+            current.training_base_model is None
+            or self.service.project_path(current.training_base_model).resolve()
+            != record.checkpoint_path.resolve()
+            or current.comfy_checkpoint.strip() != record.checkpoint
+        ):
+            return (
+                "A different SDXL checkpoint is selected. Reconnect the exact "
+                "checkpoint used for this result."
+            )
+        failure = self._result_identity_failure
+        if failure is not None and failure[0] == record:
+            return (
+                f"{failure[1]} Retry validation after restoring the original "
+                "model files."
+            )
+        verified = self._verified_result_identity
+        if verified is None or verified[0] != record:
+            return (
+                "MIVIM is still checking the exact LoRA and checkpoint files. "
+                "Wait for verification before opening the workflow."
+            )
+        try:
+            lora_changed = (
+                _file_stat_identity(record.installed_lora_path) != verified[1]
+            )
+            checkpoint_changed = (
+                _file_stat_identity(record.checkpoint_path) != verified[2]
+            )
+        except OSError:
+            return "The LoRA or checkpoint could not be verified safely."
+        if lora_changed or checkpoint_changed:
+            return (
+                "The LoRA or checkpoint changed after verification. Retry "
+                "validation before using this workflow."
+            )
+        return None
+
     def open_comfy_ui(self) -> None:
+        context_issue = self._result_comfy_context_issue(self._displayed_result_record)
+        if context_issue is not None:
+            self._show_error("Reconnect the original ComfyUI setup", context_issue)
+            return
         host = (
             self.comfy_status.host
             if self.comfy_status is not None and self.comfy_status.reachable
@@ -2231,6 +2622,8 @@ class MainWindow(QMainWindow):
         self.pipeline_pid = None
         active_draft = self._validated_draft or self.draft
         active_settings = self._validated_settings or self._collect_settings()
+        self._run_settings_snapshot = deepcopy(active_settings)
+        self._run_draft_snapshot = deepcopy(active_draft)
         self._recovery_before_run = (
             self.service.read_validation_recovery(
                 active_settings,
@@ -2241,6 +2634,8 @@ class MainWindow(QMainWindow):
         )
         self._pipeline_line_buffer = ""
         self._pipeline_recent_output = ""
+        self._owned_comfy_prompt = None
+        self._comfy_cancel_detail = ""
         self._stop_training_progress(3)
         self._trainer_stage_seen = False
         self._run_failure_kind = "generic"
@@ -2311,6 +2706,36 @@ class MainWindow(QMainWindow):
                 self._pipeline_line_buffer = part
 
     def _process_pipeline_line(self, line: str) -> None:
+        owned_prompt = re.fullmatch(
+            r"\[comfy\] owned prompt queued "
+            r"prompt_id=([0-9A-Fa-f-]+) "
+            r"client_id=([0-9A-Fa-f-]+) host=(\S+)",
+            line.strip(),
+        )
+        if owned_prompt is not None:
+            prompt_id, client_id, host = owned_prompt.groups()
+            command = self.pipeline_command
+            expected_host = (
+                command.environment.get("COMFY_HOST", "").strip()
+                if command is not None
+                else ""
+            )
+            try:
+                prompt_id = str(uuid.UUID(prompt_id))
+                client_id = str(uuid.UUID(client_id))
+            except ValueError:
+                self.studio_log.warning(
+                    "comfy.prompt.marker_rejected",
+                    "The worker reported invalid prompt ownership identifiers.",
+                )
+            else:
+                if host == expected_host:
+                    self._owned_comfy_prompt = (prompt_id, client_id, host)
+                else:
+                    self.studio_log.warning(
+                        "comfy.prompt.marker_rejected",
+                        "The worker prompt host did not match the selected run host.",
+                    )
         progress = stage_from_log(line)
         if progress is not None:
             value, label = progress
@@ -2377,12 +2802,15 @@ class MainWindow(QMainWindow):
         process = self.pipeline_process
         if process is None or process.state() == QProcess.ProcessState.NotRunning:
             return
+        command = self.pipeline_command
         dialog = QMessageBox(self)
         dialog.setWindowTitle("Stop this run?")
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setText(
-            "The current step will stop. Prepared photos and completed checkpoints "
-            "are kept, but the current checkpoint may be incomplete."
+            "MIVIM will safely stop the current step when it can prove that the "
+            "ComfyUI job belongs to this run. Prepared photos and completed "
+            "checkpoints are kept. If this ComfyUI version cannot stop only that "
+            "job, MIVIM will keep watching and tell you how to stop it in ComfyUI."
         )
         stop_button = dialog.addButton(
             "Stop run",
@@ -2398,8 +2826,158 @@ class MainWindow(QMainWindow):
         self.run_cancelled = True
         self.cancel_button.setEnabled(False)
         self.run_stage_label.setText("Stopping safely…")
+        owned_prompt = self._owned_comfy_prompt
+        if owned_prompt is None:
+            self._stop_process_tree(force=False)
+            QTimer.singleShot(
+                3500,
+                lambda: self._force_stop_pipeline_for_attempt(process, command),
+            )
+            return
+        prompt_id, client_id, host = owned_prompt
+        self.run_detail_label.setText(
+            "Asking ComfyUI to stop only this run's verified prompt…"
+        )
+        self._run_worker(
+            lambda: ComfyClient(host=host, timeout=2.5).cancel_owned_prompt(
+                prompt_id,
+                client_id,
+            ),
+            lambda result: self._owned_prompt_cancelled_for_attempt(
+                process,
+                command,
+                result,
+            ),
+            lambda message: self._owned_prompt_cancel_failed_for_attempt(
+                process,
+                command,
+                message,
+            ),
+            operation="comfy.prompt.cancel",
+        )
+
+    def _pipeline_attempt_is_active(
+        self,
+        process: QProcess,
+        command: PipelineCommand | None,
+    ) -> bool:
+        """Confirm an asynchronous stop still belongs to the active run."""
+
+        try:
+            process.state()
+        except RuntimeError:
+            # The Python wrapper can outlive its Qt object until a delayed
+            # single-shot callback runs.
+            return False
+        if self.pipeline_process is not process:
+            return False
+        if command is None:
+            return self.pipeline_command is None
+        active_command = self.pipeline_command
+        return (
+            active_command is not None
+            and active_command is command
+            and active_command.attempt_id == command.attempt_id
+        )
+
+    def _owned_prompt_cancelled_for_attempt(
+        self,
+        process: QProcess,
+        command: PipelineCommand | None,
+        result: object,
+    ) -> None:
+        if not self._pipeline_attempt_is_active(process, command):
+            return
+        if not isinstance(result, PromptCancellationResult):
+            self._owned_prompt_cancel_failed_for_attempt(
+                process,
+                command,
+                "Unexpected ComfyUI cancellation result.",
+            )
+            return
+        if not result.requested and result.status != "not_found":
+            self._owned_prompt_still_running(
+                result.message,
+                status=result.status,
+            )
+            return
+        self._owned_prompt_cancelled(result)
+        QTimer.singleShot(
+            3500,
+            lambda: self._force_stop_pipeline_for_attempt(process, command),
+        )
+
+    def _owned_prompt_cancel_failed_for_attempt(
+        self,
+        process: QProcess,
+        command: PipelineCommand | None,
+        message: str,
+    ) -> None:
+        if not self._pipeline_attempt_is_active(process, command):
+            return
+        self._owned_prompt_cancel_failed(message)
+
+    def _owned_prompt_cancelled(self, result: object) -> None:
+        if not isinstance(result, PromptCancellationResult):
+            self._owned_prompt_cancel_failed("Unexpected ComfyUI cancellation result.")
+            return
+        self._comfy_cancel_detail = result.message
+        self.run_log.appendPlainText(f"[studio] {result.message}")
+        log = self.studio_log.info if result.requested else self.studio_log.warning
+        log(
+            "comfy.prompt.cancel.finished",
+            f"status={result.status}; prompt_id={result.prompt_id}",
+        )
+        self._refresh_cancelled_detail()
         self._stop_process_tree(force=False)
-        QTimer.singleShot(3500, self._force_stop_pipeline)
+
+    def _owned_prompt_cancel_failed(self, message: str) -> None:
+        detail = (
+            "MIVIM could not confirm that the ComfyUI prompt stopped. Check the "
+            "ComfyUI queue and stop this job there. MIVIM is still watching it."
+        )
+        self._owned_prompt_still_running(
+            detail,
+            status="verification_failed",
+            technical_detail=message,
+        )
+
+    def _owned_prompt_still_running(
+        self,
+        detail: str,
+        *,
+        status: str,
+        technical_detail: str = "",
+    ) -> None:
+        """Keep the worker attached when a safe prompt-specific stop is unavailable."""
+
+        self.run_cancelled = False
+        self._comfy_cancel_detail = detail
+        self.run_stage_label.setText("ComfyUI job is still running")
+        self.run_detail_label.setText(
+            f"{detail} MIVIM will keep watching this run. Do not start another "
+            "GPU task until ComfyUI shows that it stopped."
+        )
+        self.run_log.appendPlainText(
+            f"[studio] {detail}"
+            + (
+                f"\n[studio] Technical detail: {technical_detail}"
+                if technical_detail
+                else ""
+            )
+        )
+        self.studio_log.warning(
+            "comfy.prompt.cancel.left_running",
+            f"status={status}"
+            + (f"; detail={technical_detail}" if technical_detail else ""),
+        )
+
+    def _refresh_cancelled_detail(self) -> None:
+        if self.run_cancelled and self._run_terminal_handled:
+            self.run_detail_label.setText(
+                f"{self._comfy_cancel_detail} Completed files were kept. "
+                "Return to the review when you are ready."
+            )
 
     def _stop_process_tree(self, *, force: bool) -> None:
         process = self.pipeline_process
@@ -2424,8 +3002,23 @@ class MainWindow(QMainWindow):
 
     def _force_stop_pipeline(self) -> None:
         process = self.pipeline_process
-        if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+        if process is None:
+            return
+        try:
+            running = process.state() != QProcess.ProcessState.NotRunning
+        except RuntimeError:
+            return
+        if running:
             self._stop_process_tree(force=True)
+
+    def _force_stop_pipeline_for_attempt(
+        self,
+        process: QProcess,
+        command: PipelineCommand | None,
+    ) -> None:
+        if not self._pipeline_attempt_is_active(process, command):
+            return
+        self._force_stop_pipeline()
 
     def _pipeline_error(self, error: QProcess.ProcessError) -> None:
         process = self.pipeline_process
@@ -2464,10 +3057,13 @@ class MainWindow(QMainWindow):
             )
         except ValueError:
             return None
+        command = self.pipeline_command
         if (
             recovery is None
             or recovery.state != "validation_pending"
             or recovery == self._recovery_before_run
+            or command is None
+            or recovery.attempt_id != command.attempt_id
         ):
             return None
         self._pending_validation_recovery = recovery
@@ -2527,7 +3123,8 @@ class MainWindow(QMainWindow):
             )
             self.run_stage_label.setText("Run stopped")
             self.run_detail_label.setText(
-                "Completed files were kept. Return to the review when you are ready."
+                (f"{self._comfy_cancel_detail} " if self._comfy_cancel_detail else "")
+                + "Completed files were kept. Return to the review when you are ready."
             )
             self._stop_training_progress(0)
             self._show_recovery_actions(True, "generic")
@@ -2585,6 +3182,85 @@ class MainWindow(QMainWindow):
             )
             self._show_recovery_actions(True, "generic")
             return
+        settings_snapshot = deepcopy(
+            self._run_settings_snapshot or self._collect_settings()
+        )
+        draft_snapshot = deepcopy(
+            self._run_draft_snapshot
+            or self._validated_draft
+            or self.draft
+            or self._build_draft()
+        )
+        self.run_stage_label.setText("Verifying exact result files…")
+        self.run_detail_label.setText(
+            "MIVIM is checking the grid, workflow, LoRA, and checkpoint before "
+            "approving this result."
+        )
+        self._stop_training_progress(98)
+        for button in self.nav_buttons:
+            button.setEnabled(False)
+        self._run_worker(
+            lambda: self._record_run_result(
+                command,
+                settings_snapshot=settings_snapshot,
+                draft_snapshot=draft_snapshot,
+                persist=False,
+            ),
+            lambda result: self._run_result_verified(command, result),
+            lambda message: self._run_result_verification_failed(command, message),
+            operation="pipeline.result.verify",
+        )
+
+    def _run_result_verification_failed(
+        self,
+        command: PipelineCommand,
+        message: str,
+    ) -> None:
+        if self.pipeline_command is not command:
+            return
+        self.studio_log.error_event(
+            "pipeline.result.identity_mismatch",
+            message,
+        )
+        self._restore_navigation()
+        self.run_stage_label.setText("Result could not be verified")
+        self.run_detail_label.setText(
+            "The worker finished, but its completion record or exact model files "
+            "did not match this run. The files were kept; retry validation before "
+            "using the result."
+        )
+        self._show_recovery_actions(True, "generic")
+
+    def _run_result_verified(
+        self,
+        command: PipelineCommand,
+        result: object,
+    ) -> None:
+        if self.pipeline_command is not command:
+            return
+        if not isinstance(result, RunResult):
+            self._run_result_verification_failed(
+                command,
+                "The result verifier returned an unexpected value.",
+            )
+            return
+        record = result
+        self._persist_run_result(record)
+        if (
+            record.mode == "full"
+            and record.installed_lora_path is not None
+            and record.checkpoint_path is not None
+        ):
+            try:
+                self._verified_result_identity = (
+                    record,
+                    _file_stat_identity(record.installed_lora_path),
+                    _file_stat_identity(record.checkpoint_path),
+                )
+                self._result_identity_failure = None
+            except OSError:
+                self._verified_result_identity = None
+        self._restore_navigation()
         self._stop_training_progress(100)
         self._pending_validation_recovery = None
         self.studio_log.info(
@@ -2595,7 +3271,6 @@ class MainWindow(QMainWindow):
         self.run_detail_label.setText(
             "The result was verified on disk and is ready to review."
         )
-        record = self._record_run_result(command)
         self._show_result(command.expected_result, record)
         QTimer.singleShot(450, lambda: self.show_page(NAV_RESULTS))
 
@@ -2653,9 +3328,6 @@ class MainWindow(QMainWindow):
 
     def retry_validation(self) -> None:
         recovery = self._pending_validation_recovery
-        settings: AppSettings | None
-        draft: ProjectDraft | None
-        lora_name: str | None
         if recovery is not None:
             settings = self._collect_settings()
             current = self.service.read_validation_recovery(
@@ -2669,28 +3341,91 @@ class MainWindow(QMainWindow):
                     "library. Reconnect that library or start a new run.",
                 )
                 return
-            recovery = current
             self._pending_validation_recovery = current
-            draft = self._draft_for_recovery(current)
-            lora_name = current.lora_name
-        else:
-            settings = self._validated_settings
-            draft = self._validated_draft
-            lora_name = self._installed_lora_name
-        if settings is None or draft is None or lora_name is None:
+            self.retry_validation_button.setEnabled(False)
+            self.run_stage_label.setText("Checking exact model files…")
+            self.run_detail_label.setText(
+                "MIVIM is verifying the installed LoRA and checkpoint before "
+                "resuming only the unfinished ComfyUI validation."
+            )
+            self._recovery_check_request += 1
+            request = self._recovery_check_request
+            self._run_worker(
+                lambda: self.service.validation_recovery_issue(settings, current),
+                lambda result: self._retry_validation_checked(
+                    request,
+                    settings,
+                    current,
+                    result,
+                ),
+                lambda message: self._restored_recovery_check_failed(
+                    request,
+                    current,
+                    message,
+                ),
+                operation="validation.retry.verify",
+            )
+            return
+        validated_settings = self._validated_settings
+        draft = self._validated_draft
+        lora_name = self._installed_lora_name
+        if validated_settings is None or draft is None or lora_name is None:
             self._show_error(
                 "Validation cannot be retried yet",
                 "No installed LoRA from this run was found.",
             )
             return
+        self._launch_validation_retry(validated_settings, draft, lora_name)
+
+    def _retry_validation_checked(
+        self,
+        request: int,
+        settings: AppSettings,
+        recovery: ValidationRecovery,
+        result: object,
+    ) -> None:
+        if (
+            request != self._recovery_check_request
+            or self._pending_validation_recovery != recovery
+        ):
+            return
+        if result is not None:
+            issue = (
+                result
+                if isinstance(result, str)
+                else "Validation verification returned an unexpected result."
+            )
+            self.retry_validation_button.setEnabled(False)
+            self.run_stage_label.setText("Reconnect the original ComfyUI setup")
+            self.run_detail_label.setText(issue)
+            self._show_error("Reconnect the original ComfyUI setup", issue)
+            return
+        self._launch_validation_retry(
+            settings,
+            self._draft_for_recovery(recovery),
+            recovery.lora_name,
+            recovery=recovery,
+        )
+
+    def _launch_validation_retry(
+        self,
+        settings: AppSettings,
+        draft: ProjectDraft,
+        lora_name: str,
+        *,
+        recovery: ValidationRecovery | None = None,
+    ) -> None:
         try:
             command = self.service.build_validation_command(
                 settings,
                 draft,
                 lora_name,
                 checkpoint=(recovery.checkpoint if recovery is not None else None),
+                strengths=(recovery.strengths if recovery is not None else None),
+                seed=(recovery.seed if recovery is not None else 42),
             )
         except (TypeError, ValueError) as exc:
+            self.retry_validation_button.setEnabled(True)
             self._show_error("Validation could not start", str(exc))
             return
         self._launch_pipeline_command(command, "Retrying ComfyUI validation")
@@ -2709,56 +3444,178 @@ class MainWindow(QMainWindow):
         self._open_local_folder(folder)
 
     # ------------------------------------------------------------- result flow
-    def _record_run_result(self, command: PipelineCommand) -> RunResult:
-        draft = self._validated_draft or self.draft or self._build_draft()
+    def _record_run_result(
+        self,
+        command: PipelineCommand,
+        *,
+        settings_snapshot: AppSettings | None = None,
+        draft_snapshot: ProjectDraft | None = None,
+        persist: bool = True,
+    ) -> RunResult:
+        """Verify one worker outcome against the immutable launch context."""
+
+        draft = (
+            draft_snapshot
+            or self._run_draft_snapshot
+            or self._validated_draft
+            or self.draft
+            or self._build_draft()
+        )
         mode: Literal["prepare", "full"] = (
             "prepare" if command.mode == "prepare" else "full"
         )
-        current_settings = self._collect_settings()
+        current_settings = (
+            settings_snapshot or self._run_settings_snapshot or self._collect_settings()
+        )
         outcome = self.service.read_pipeline_outcome(
             current_settings,
             draft.project_name,
         )
-        outcome_matches = (
-            outcome is not None
-            and self.service.project_path(outcome.result_path).resolve()
-            == command.expected_result.resolve()
-        )
+        if outcome is None:
+            raise ValueError("The worker completion record is missing or unreadable.")
+        actual_fingerprint = artifact_fingerprint(command.expected_result)
+        expected_checkpoint = command.environment.get("COMFY_SDXL_CKPT", "").strip()
+        mismatches: list[str] = []
+        if not command.attempt_id or outcome.attempt_id != command.attempt_id:
+            mismatches.append("attempt identifier")
+        if outcome.mode != command.mode:
+            mismatches.append("run mode")
+        if (
+            self.service.project_path(outcome.result_path).resolve()
+            != command.expected_result.resolve()
+        ):
+            mismatches.append("result path")
+        if (
+            not outcome.result_fingerprint
+            or outcome.result_fingerprint != actual_fingerprint
+        ):
+            mismatches.append("result contents")
+        if outcome.trigger != draft.trigger.strip():
+            mismatches.append("trigger phrase")
+        if outcome.preset != draft.preset.value:
+            mismatches.append("training plan")
+        if expected_checkpoint and outcome.checkpoint != expected_checkpoint:
+            mismatches.append("checkpoint")
+        if command.mode != "prepare" and (
+            not outcome.lora_name
+            or Path(outcome.lora_name).name != outcome.lora_name
+            or Path(outcome.lora_name).suffix.casefold() != ".safetensors"
+        ):
+            mismatches.append("installed LoRA")
+        workflow_fingerprint = ""
+        if command.mode != "prepare":
+            expected_workflow = command.expected_result.parent / (
+                f"{draft.project_name}_use_in_comfyui.json"
+            )
+            if (
+                outcome.workflow_path is None
+                or outcome.workflow_path.resolve() != expected_workflow.resolve()
+                or not expected_workflow.is_file()
+            ):
+                mismatches.append("ready workflow path")
+            else:
+                workflow_fingerprint = artifact_fingerprint(expected_workflow)
+                if (
+                    not outcome.workflow_fingerprint
+                    or workflow_fingerprint != outcome.workflow_fingerprint
+                ):
+                    mismatches.append("ready workflow contents")
+            expected_installation = command.environment.get(
+                "MIVIM_COMFY_INSTALLATION_ID",
+                "",
+            ).strip()
+            expected_host = (
+                command.environment.get("COMFY_HOST", "")
+                .strip()
+                .removeprefix("http://")
+                .removeprefix("https://")
+                .rstrip("/")
+            )
+            if outcome.comfy_installation_id != expected_installation:
+                mismatches.append("Comfy Desktop installation")
+            if outcome.comfy_host != expected_host:
+                mismatches.append("ComfyUI address")
+            expected_lora_dir = current_settings.comfy_lora_dir
+            actual_lora_fingerprint = ""
+            if (
+                expected_lora_dir is None
+                or outcome.installed_lora_path is None
+                or outcome.installed_lora_path.resolve()
+                != (
+                    self.service.project_path(expected_lora_dir) / outcome.lora_name
+                ).resolve()
+                or not outcome.lora_fingerprint
+            ):
+                mismatches.append("installed LoRA identity")
+            elif outcome.installed_lora_path is not None:
+                try:
+                    actual_lora_fingerprint = artifact_fingerprint(
+                        outcome.installed_lora_path
+                    )
+                except (FileNotFoundError, OSError, ValueError):
+                    actual_lora_fingerprint = ""
+                if actual_lora_fingerprint != outcome.lora_fingerprint:
+                    mismatches.append("installed LoRA contents")
+            expected_base = current_settings.training_base_model
+            actual_checkpoint_fingerprint = ""
+            if (
+                expected_base is None
+                or outcome.checkpoint_path is None
+                or outcome.checkpoint_path.resolve()
+                != self.service.project_path(expected_base).resolve()
+                or not outcome.checkpoint_fingerprint
+            ):
+                mismatches.append("checkpoint identity")
+            elif outcome.checkpoint_path is not None:
+                try:
+                    actual_checkpoint_fingerprint = artifact_fingerprint(
+                        outcome.checkpoint_path
+                    )
+                except (FileNotFoundError, OSError, ValueError):
+                    actual_checkpoint_fingerprint = ""
+                if actual_checkpoint_fingerprint != outcome.checkpoint_fingerprint:
+                    mismatches.append("checkpoint contents")
+        if mismatches:
+            raise ValueError(
+                "The worker completion record did not match the "
+                + ", ".join(mismatches)
+                + " for this run."
+            )
         record = RunResult(
             project_name=draft.project_name,
             mode=mode,
             result_path=command.expected_result,
-            completed_at=(
-                outcome.completed_at
-                if outcome_matches and outcome is not None
-                else datetime.now(UTC).isoformat()
-            ),
-            trigger=(
-                outcome.trigger
-                if outcome_matches and outcome is not None
-                else draft.trigger
-            ),
+            completed_at=outcome.completed_at,
+            trigger=outcome.trigger,
             preset=draft.preset,
-            checkpoint=(
-                outcome.checkpoint
-                if outcome_matches and outcome is not None
-                else current_settings.comfy_checkpoint
-            ),
-            lora_name=(
-                outcome.lora_name
-                if outcome_matches and outcome is not None
-                else self._installed_lora_name or ""
-            ),
+            checkpoint=outcome.checkpoint,
+            lora_name=outcome.lora_name,
+            result_fingerprint=actual_fingerprint,
+            workflow_path=outcome.workflow_path,
+            workflow_fingerprint=workflow_fingerprint,
+            comfy_installation_id=outcome.comfy_installation_id,
+            comfy_host=outcome.comfy_host,
+            installed_lora_path=outcome.installed_lora_path,
+            lora_fingerprint=outcome.lora_fingerprint,
+            checkpoint_path=outcome.checkpoint_path,
+            checkpoint_fingerprint=outcome.checkpoint_fingerprint,
+            starting_strength=outcome.starting_strength,
         )
+        if persist:
+            self._persist_run_result(record)
+        return record
+
+    def _persist_run_result(self, record: RunResult) -> None:
+        """Publish a verified record on the UI thread without replacing setup."""
+
         self._installed_lora_name = record.lora_name or self._installed_lora_name
-        self.settings = replace(current_settings, last_result=record)
+        self.settings = replace(self._collect_settings(), last_result=record)
         try:
             save_settings(self.settings, self.settings_path)
         except (OSError, TypeError, ValueError) as exc:
             self.run_log.appendPlainText(
                 f"\n[studio] The verified result could not be added to history: {exc}"
             )
-        return record
 
     def _show_result(self, result: Path, record: RunResult | None = None) -> None:
         self._latest_result = result
@@ -2771,11 +3628,15 @@ class MainWindow(QMainWindow):
         self._displayed_result_record = record
         self.nav_buttons[NAV_RESULTS].setEnabled(True)
         self.result_path_label.setText(str(result))
+        self.result_path_label.setCursorPosition(0)
+        self.result_image.clear_source_pixmap()
         self.result_image.setStyleSheet("")
         self.comfy_handoff_card.setVisible(False)
         self.review_prepared_button.setVisible(False)
         self.continue_training_button.setVisible(False)
         self.open_full_grid_button.setVisible(False)
+        self.open_ready_workflow_button.setVisible(False)
+        self.result_open_desktop_button.setVisible(False)
         if result.is_file() and result.suffix.lower() in {
             ".png",
             ".jpg",
@@ -2792,36 +3653,31 @@ class MainWindow(QMainWindow):
                 self.open_full_grid_button.setVisible(True)
                 self.result_open_comfy_button.setVisible(True)
                 self.result_open_comfy_button.setEnabled(
-                    self.comfy_status is not None and self.comfy_status.reachable
+                    self.comfy_status is not None
+                    and self.comfy_status.reachable
+                    and self._result_comfy_context_issue(record) is None
                 )
                 if record is not None:
-                    preferred_strength = (
-                        0.8
-                        if 0.8 in record.preset.validation_strengths
-                        else next(
-                            (
-                                value
-                                for value in record.preset.validation_strengths
-                                if value > 0
-                            ),
-                            1.0,
-                        )
+                    workflow_ready = (
+                        record.workflow_path is not None
+                        and record.workflow_path.is_file()
+                        and bool(record.workflow_fingerprint)
                     )
+                    self.open_ready_workflow_button.setVisible(workflow_ready)
+                    self.result_open_desktop_button.setVisible(True)
                     self.result_details_label.setText(
                         f"LoRA: {record.lora_name or 'See the result folder'}\n"
                         f"Identity phrase: {record.trigger}\n"
                         f"Base checkpoint: {record.checkpoint or 'Not recorded'}\n"
-                        f"Suggested starting strength: {preferred_strength:g}"
+                        f"Tested starting strength: {record.starting_strength:g}\n"
+                        "Ready workflow: "
+                        f"{record.workflow_path.name if record.workflow_path else 'Not recorded'}\n"
+                        "Drag the JSON into ComfyUI or use Workflow → Open."
                     )
                     self.comfy_handoff_card.setVisible(True)
-                self.result_image.setPixmap(
-                    pixmap.scaled(
-                        920,
-                        520,
-                        Qt.AspectRatioMode.KeepAspectRatio,
-                        Qt.TransformationMode.SmoothTransformation,
-                    )
-                )
+                self.result_image.set_source_pixmap(pixmap)
+                if record is not None:
+                    self._start_result_identity_verification(record)
                 return
         if result.is_dir():
             self.result_title_label.setText("Your photos are ready for training")
@@ -2831,6 +3687,7 @@ class MainWindow(QMainWindow):
             )
             self.result_image.setAccessibleName("Prepared photo dataset status")
             self.result_open_comfy_button.setVisible(False)
+            self.result_open_desktop_button.setVisible(False)
             self.review_prepared_button.setVisible(True)
             self.continue_training_button.setVisible(True)
             self.result_image.setPixmap(QPixmap())
@@ -2894,21 +3751,22 @@ class MainWindow(QMainWindow):
         record = self._displayed_result_record
         if record is None:
             return
-        preferred_strength = (
-            0.8
-            if 0.8 in record.preset.validation_strengths
-            else next(
-                (value for value in record.preset.validation_strengths if value > 0),
-                1.0,
-            )
-        )
+        context_issue = self._result_comfy_context_issue(record)
+        if context_issue is not None:
+            self._show_error("Reconnect the original ComfyUI setup", context_issue)
+            return
         QApplication.clipboard().setText(
             "\n".join(
                 (
                     f"LoRA: {record.lora_name}",
                     f"Identity phrase: {record.trigger}",
                     f"Base checkpoint: {record.checkpoint}",
-                    f"Starting strength: {preferred_strength:g}",
+                    f"Starting strength: {record.starting_strength:g}",
+                    (
+                        f"Ready workflow: {record.workflow_path}"
+                        if record.workflow_path is not None
+                        else "Ready workflow: not recorded"
+                    ),
                 )
             )
         )
@@ -2939,6 +3797,38 @@ class MainWindow(QMainWindow):
                 "Windows could not open the full-size image.",
             )
 
+    def open_ready_workflow(self) -> None:
+        record = self._displayed_result_record
+        workflow = record.workflow_path if record is not None else None
+        context_issue = self._result_comfy_context_issue(record)
+        if context_issue is not None:
+            self._show_error("Reconnect the original ComfyUI setup", context_issue)
+            return
+        if (
+            record is None
+            or workflow is None
+            or not workflow.is_file()
+            or not record.workflow_fingerprint
+        ):
+            self._show_error(
+                "Ready workflow not found",
+                "The ComfyUI workflow is no longer available. Retry validation to "
+                "recreate it without retraining.",
+            )
+            return
+        try:
+            fingerprint = artifact_fingerprint(workflow)
+        except (FileNotFoundError, OSError, ValueError):
+            fingerprint = ""
+        if fingerprint != record.workflow_fingerprint:
+            self._show_error(
+                "Ready workflow changed",
+                "This workflow no longer matches the verified validation result. "
+                "Retry validation to recreate the safe version.",
+            )
+            return
+        self._open_local_folder(workflow.parent)
+
     def _open_local_folder(self, folder: Path) -> None:
         if not folder.is_dir():
             self._show_error(
@@ -2966,6 +3856,8 @@ class MainWindow(QMainWindow):
 
     def new_project(self) -> None:
         previous_name = self.draft.project_name if self.draft is not None else ""
+        self._result_identity_request += 1
+        self._recovery_check_request += 1
         self.pipeline_process = None
         self.pipeline_command = None
         self.pipeline_pid = None
@@ -2976,6 +3868,12 @@ class MainWindow(QMainWindow):
         self._installed_lora_name = None
         self._pending_validation_recovery = None
         self._recovery_before_run = None
+        self._run_settings_snapshot = None
+        self._run_draft_snapshot = None
+        self._latest_result = None
+        self._displayed_result_record = None
+        self._verified_result_identity = None
+        self._result_identity_failure = None
         self._pipeline_line_buffer = ""
         self.run_stack.setCurrentIndex(0)
         self.run_log.clear()
@@ -3002,6 +3900,10 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:
         process = self.pipeline_process
         if process is not None and process.state() != QProcess.ProcessState.NotRunning:
+            # Capture a just-emitted ownership marker before deciding whether
+            # closing can safely stop this run.
+            self._read_pipeline_output()
+            self._flush_pipeline_line_buffer()
             answer = QMessageBox.question(
                 self,
                 "A run is still active",
@@ -3012,6 +3914,35 @@ class MainWindow(QMainWindow):
             if answer == QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            if self._owned_comfy_prompt is not None:
+                prompt_id, client_id, host = self._owned_comfy_prompt
+                try:
+                    result = ComfyClient(
+                        host=host,
+                        timeout=2.5,
+                    ).cancel_owned_prompt(prompt_id, client_id)
+                    self.studio_log.info(
+                        "comfy.prompt.cancel.on_close",
+                        f"status={result.status}; prompt_id={prompt_id}",
+                    )
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    self.studio_log.warning(
+                        "comfy.prompt.cancel.on_close_failed",
+                        str(exc),
+                    )
+                    self._warn_close_for_running_comfy_prompt(
+                        "MIVIM could not verify that this ComfyUI job stopped."
+                    )
+                    event.ignore()
+                    return
+                if not result.requested and result.status != "not_found":
+                    self.studio_log.warning(
+                        "comfy.prompt.cancel.on_close_unconfirmed",
+                        f"status={result.status}; prompt_id={prompt_id}",
+                    )
+                    self._warn_close_for_running_comfy_prompt(result.message)
+                    event.ignore()
+                    return
             self.run_cancelled = True
             self._stop_process_tree(force=True)
         self._closing = True
@@ -3019,6 +3950,20 @@ class MainWindow(QMainWindow):
         self.studio_log.info("session.closed", "MIVIM LoRA Studio closed.")
         self.studio_log.close()
         event.accept()
+
+    def _warn_close_for_running_comfy_prompt(self, detail: str) -> None:
+        message = (
+            f"{detail}\n\nMIVIM will stay open and leave the worker running. "
+            "Open ComfyUI, stop this job from its queue, then close MIVIM again."
+        )
+        self._comfy_cancel_detail = message
+        self.run_stage_label.setText("ComfyUI job still needs attention")
+        self.run_detail_label.setText(message)
+        QMessageBox.warning(
+            self,
+            "Stop the ComfyUI job before closing",
+            message,
+        )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -3033,6 +3978,12 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1400,
         help="Milliseconds to wait before a requested screenshot (default: 1400).",
+    )
+    parser.add_argument(
+        "--screenshot-page",
+        choices=("connect", "project", "run", "result"),
+        default="connect",
+        help="Page to capture with --screenshot (default: connect).",
     )
     parser.add_argument(
         "--settings",
@@ -3052,6 +4003,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         else cast(QApplication, existing_app)
     )
     app.setApplicationName("MIVIM LoRA Studio")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("MIVIM")
     app.setWindowIcon(_app_icon())
     settings_path = args.settings or default_settings_path()
@@ -3063,8 +4015,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.screenshot is not None:
         destination = args.screenshot.resolve()
+        page = {
+            "connect": NAV_SETUP,
+            "project": NAV_PROJECT,
+            "run": NAV_RUN,
+            "result": NAV_RESULTS,
+        }[args.screenshot_page]
 
         def capture() -> None:
+            if not window.nav_buttons[page].isEnabled():
+                print(
+                    f"Screenshot page is unavailable: {args.screenshot_page}",
+                    file=sys.stderr,
+                )
+                app.exit(3)
+                return
+            window.show_page(page)
+            app.processEvents()
             destination.parent.mkdir(parents=True, exist_ok=True)
             if not window.grab().save(str(destination)):
                 print(

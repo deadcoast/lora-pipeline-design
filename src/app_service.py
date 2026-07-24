@@ -17,6 +17,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
@@ -42,6 +44,7 @@ from .dataset_pairs import (
     DatasetPairInventory,
     scan_dataset_pairs,
 )
+from .io_utils import artifact_fingerprint
 
 ReadinessState = Literal["ready", "warning", "error"]
 RunMode = Literal["full", "prepare", "validate"]
@@ -169,6 +172,7 @@ class ProjectArtifactSummary:
     dataset: Path | None
     checkpoints: tuple[Path, ...]
     validation_grid: Path | None
+    validation_workflow: Path | None
     validation_work_dir: Path | None
     run_config: Path | None
     result_record: Path | None
@@ -178,6 +182,7 @@ class ProjectArtifactSummary:
     def non_dataset_paths(self) -> tuple[Path, ...]:
         optional = (
             self.validation_grid,
+            self.validation_workflow,
             self.validation_work_dir,
             self.run_config,
             self.result_record,
@@ -203,6 +208,8 @@ class ProjectArtifactSummary:
             )
         if self.validation_grid is not None:
             descriptions.append("a comparison grid")
+        if self.validation_workflow is not None:
+            descriptions.append("a ready ComfyUI workflow")
         if self.validation_work_dir is not None:
             descriptions.append("validation work files")
         if self.run_config is not None:
@@ -250,6 +257,7 @@ class PipelineCommand:
     working_directory: Path
     mode: RunMode
     expected_result: Path
+    attempt_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +272,17 @@ class PipelineOutcome:
     checkpoint: str
     lora_name: str
     completed_at: str
+    attempt_id: str = ""
+    result_fingerprint: str = ""
+    workflow_path: Path | None = None
+    workflow_fingerprint: str = ""
+    comfy_installation_id: str = ""
+    comfy_host: str = ""
+    installed_lora_path: Path | None = None
+    lora_fingerprint: str = ""
+    checkpoint_path: Path | None = None
+    checkpoint_fingerprint: str = ""
+    starting_strength: float = 0.8
 
 
 def _normalise_host(host: str) -> str:
@@ -899,7 +918,7 @@ class ApplicationService:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(value, dict) or value.get("schema_version") != 1:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3}:
             return None
         mode = value.get("mode")
         fields = {
@@ -914,12 +933,101 @@ class ApplicationService:
                 "completed_at",
             )
         }
+        attempt_id = value.get("attempt_id", "")
+        result_fingerprint = value.get("result_fingerprint", "")
         if (
             mode not in {"prepare", "full", "validate"}
             or fields["project_name"] != project_name
             or not all(isinstance(field, str) for field in fields.values())
+            or not isinstance(attempt_id, str)
+            or not isinstance(result_fingerprint, str)
         ):
             return None
+        workflow_path: Path | None = None
+        workflow_fingerprint = ""
+        comfy_installation_id = ""
+        comfy_host = ""
+        installed_lora_path: Path | None = None
+        lora_fingerprint = ""
+        checkpoint_path: Path | None = None
+        checkpoint_fingerprint = ""
+        starting_strength = 0.8
+        if value.get("schema_version") == 3:
+            path_fields = {
+                key: value.get(key)
+                for key in (
+                    "workflow_path",
+                    "installed_lora_path",
+                    "checkpoint_path",
+                )
+            }
+            extra_strings = {
+                key: value.get(key)
+                for key in (
+                    "workflow_fingerprint",
+                    "comfy_installation_id",
+                    "comfy_host",
+                    "lora_fingerprint",
+                    "checkpoint_fingerprint",
+                )
+            }
+            raw_strength = value.get("starting_strength")
+            if (
+                not all(isinstance(field, str) for field in path_fields.values())
+                or not all(isinstance(field, str) for field in extra_strings.values())
+                or not isinstance(raw_strength, (int, float))
+                or isinstance(raw_strength, bool)
+                or not math.isfinite(raw_strength)
+            ):
+                return None
+            for fingerprint in (
+                cast(str, extra_strings["workflow_fingerprint"]),
+                cast(str, extra_strings["lora_fingerprint"]),
+                cast(str, extra_strings["checkpoint_fingerprint"]),
+            ):
+                if (
+                    fingerprint
+                    and re.fullmatch(
+                        r"sha256:[0-9a-f]{64}",
+                        fingerprint,
+                    )
+                    is None
+                ):
+                    return None
+
+            def optional_absolute(raw: object) -> Path | None:
+                if not isinstance(raw, str) or not raw:
+                    return None
+                parsed = Path(raw)
+                return parsed if parsed.is_absolute() else None
+
+            workflow_path = optional_absolute(path_fields["workflow_path"])
+            installed_lora_path = optional_absolute(path_fields["installed_lora_path"])
+            checkpoint_path = optional_absolute(path_fields["checkpoint_path"])
+            if any(
+                raw and parsed is None
+                for raw, parsed in (
+                    (path_fields["workflow_path"], workflow_path),
+                    (path_fields["installed_lora_path"], installed_lora_path),
+                    (path_fields["checkpoint_path"], checkpoint_path),
+                )
+            ):
+                return None
+            workflow_fingerprint = cast(
+                str,
+                extra_strings["workflow_fingerprint"],
+            )
+            comfy_installation_id = cast(
+                str,
+                extra_strings["comfy_installation_id"],
+            )
+            comfy_host = cast(str, extra_strings["comfy_host"])
+            lora_fingerprint = cast(str, extra_strings["lora_fingerprint"])
+            checkpoint_fingerprint = cast(
+                str,
+                extra_strings["checkpoint_fingerprint"],
+            )
+            starting_strength = float(raw_strength)
         return PipelineOutcome(
             project_name=project_name,
             mode=mode,
@@ -929,6 +1037,17 @@ class ApplicationService:
             checkpoint=cast(str, fields["checkpoint"]),
             lora_name=cast(str, fields["lora_name"]),
             completed_at=cast(str, fields["completed_at"]),
+            attempt_id=attempt_id,
+            result_fingerprint=result_fingerprint,
+            workflow_path=workflow_path,
+            workflow_fingerprint=workflow_fingerprint,
+            comfy_installation_id=comfy_installation_id,
+            comfy_host=comfy_host,
+            installed_lora_path=installed_lora_path,
+            lora_fingerprint=lora_fingerprint,
+            checkpoint_path=checkpoint_path,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            starting_strength=starting_strength,
         )
 
     def recovery_path(self, settings: AppSettings, project_name: str) -> Path:
@@ -945,7 +1064,7 @@ class ApplicationService:
         settings: AppSettings,
         project_name: str,
     ) -> ValidationRecovery | None:
-        """Read a safe, locally verified post-install validation recovery record."""
+        """Read a structurally safe post-install validation recovery record."""
 
         path = self.recovery_path(settings, project_name)
         try:
@@ -954,8 +1073,9 @@ class ApplicationService:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(value, dict) or value.get("schema_version") != 1:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
             return None
+        schema_version = cast(int, value["schema_version"])
         string_fields = {
             key: value.get(key)
             for key in (
@@ -997,12 +1117,84 @@ class ApplicationService:
         ).resolve()
         if expected_grid.resolve() != configured_grid:
             return None
-        configured_lora_dir = settings.comfy_lora_dir
-        if configured_lora_dir is None:
-            return None
-        configured_lora = (self.project_path(configured_lora_dir) / lora_name).resolve()
-        if installed_lora.resolve() != configured_lora or not installed_lora.is_file():
-            return None
+
+        attempt_id = ""
+        comfy_installation_id = ""
+        comfy_host = ""
+        lora_fingerprint = ""
+        checkpoint_path: Path | None = None
+        checkpoint_fingerprint = ""
+        validation_signature = ""
+        strengths: tuple[float, ...] = ()
+        seed = 42
+        if schema_version == 2:
+            extra_strings = {
+                key: value.get(key)
+                for key in (
+                    "attempt_id",
+                    "comfy_installation_id",
+                    "comfy_host",
+                    "lora_fingerprint",
+                    "checkpoint_path",
+                    "checkpoint_fingerprint",
+                    "validation_signature",
+                )
+            }
+            raw_strengths = value.get("strengths")
+            raw_seed = value.get("seed")
+            if (
+                not all(isinstance(field, str) for field in extra_strings.values())
+                or not isinstance(raw_strengths, list)
+                or not raw_strengths
+                or not all(
+                    isinstance(item, (int, float)) and not isinstance(item, bool)
+                    for item in raw_strengths
+                )
+                or not isinstance(raw_seed, int)
+                or isinstance(raw_seed, bool)
+            ):
+                return None
+            attempt_id = cast(str, extra_strings["attempt_id"])
+            try:
+                attempt_id = str(uuid.UUID(attempt_id))
+            except (AttributeError, TypeError, ValueError):
+                return None
+            comfy_installation_id = cast(
+                str,
+                extra_strings["comfy_installation_id"],
+            )
+            comfy_host = cast(str, extra_strings["comfy_host"])
+            lora_fingerprint = cast(str, extra_strings["lora_fingerprint"])
+            raw_checkpoint_path = cast(str, extra_strings["checkpoint_path"])
+            checkpoint_fingerprint = cast(
+                str,
+                extra_strings["checkpoint_fingerprint"],
+            )
+            validation_signature = cast(
+                str,
+                extra_strings["validation_signature"],
+            )
+            if (
+                not comfy_host
+                or re.fullmatch(r"sha256:[0-9a-f]{64}", lora_fingerprint) is None
+                or (
+                    checkpoint_fingerprint
+                    and re.fullmatch(
+                        r"sha256:[0-9a-f]{64}",
+                        checkpoint_fingerprint,
+                    )
+                    is None
+                )
+                or re.fullmatch(r"[0-9a-f]{64}", validation_signature) is None
+            ):
+                return None
+            if bool(raw_checkpoint_path) != bool(checkpoint_fingerprint):
+                return None
+            checkpoint_path = Path(raw_checkpoint_path) if raw_checkpoint_path else None
+            if checkpoint_path is not None and not checkpoint_path.is_absolute():
+                return None
+            strengths = tuple(float(item) for item in raw_strengths)
+            seed = raw_seed
         return ValidationRecovery(
             project_name=project_name,
             state=cast(
@@ -1016,7 +1208,108 @@ class ApplicationService:
             preset=preset,
             checkpoint=cast(str, string_fields["checkpoint"]),
             updated_at=cast(str, string_fields["updated_at"]),
+            attempt_id=attempt_id,
+            comfy_installation_id=comfy_installation_id,
+            comfy_host=comfy_host,
+            lora_fingerprint=lora_fingerprint,
+            checkpoint_path=checkpoint_path,
+            checkpoint_fingerprint=checkpoint_fingerprint,
+            validation_signature=validation_signature,
+            strengths=strengths,
+            seed=seed,
         )
+
+    def validation_recovery_issue(
+        self,
+        settings: AppSettings,
+        recovery: ValidationRecovery,
+    ) -> str | None:
+        """Explain why a saved retry cannot safely run against current settings."""
+
+        if (
+            not recovery.attempt_id
+            or not recovery.lora_fingerprint
+            or recovery.checkpoint_path is None
+            or not recovery.checkpoint_fingerprint
+            or not recovery.validation_signature
+            or not recovery.strengths
+        ):
+            return (
+                "This recovery was saved by an older version without model identity "
+                "checks. Start a new run so MIVIM can verify the exact ComfyUI "
+                "installation and model files."
+            )
+        if recovery.comfy_installation_id != settings.comfy_installation_id.strip():
+            return (
+                "This LoRA belongs to a different Comfy Desktop installation. "
+                "Return to Connection and select the installation used for training."
+            )
+        current_host = (
+            settings.comfy_host.strip()
+            .removeprefix("http://")
+            .removeprefix("https://")
+            .rstrip("/")
+        )
+        if recovery.comfy_host != current_host:
+            return (
+                "This retry belongs to a different ComfyUI address. Return to "
+                "Connection and reconnect the original Desktop instance."
+            )
+        configured_lora_dir = settings.comfy_lora_dir
+        if configured_lora_dir is None:
+            return (
+                "The original ComfyUI LoRA folder is not connected. Return to "
+                "Connection and select the training installation."
+            )
+        configured_lora = (
+            self.project_path(configured_lora_dir) / recovery.lora_name
+        ).resolve()
+        if recovery.installed_lora_path.resolve() != configured_lora:
+            return (
+                "The selected ComfyUI model library is not the one that received "
+                "this LoRA. Reconnect the original installation."
+            )
+        if not configured_lora.is_file():
+            return (
+                "The installed LoRA is missing from the original ComfyUI model "
+                "library. Restore it before retrying validation."
+            )
+        try:
+            lora_fingerprint = artifact_fingerprint(configured_lora)
+        except (FileNotFoundError, OSError, ValueError):
+            return "The installed LoRA could not be read safely."
+        if lora_fingerprint != recovery.lora_fingerprint:
+            return (
+                "The installed LoRA changed after training. Restore the original "
+                "file or start a new run; MIVIM will not validate substituted weights."
+            )
+        current_checkpoint = settings.training_base_model
+        if current_checkpoint is None:
+            return (
+                "The original SDXL checkpoint is not connected. Return to Connection "
+                "and select it before retrying."
+            )
+        current_checkpoint = self.project_path(current_checkpoint).resolve()
+        if current_checkpoint != recovery.checkpoint_path.resolve():
+            return (
+                "A different SDXL checkpoint is selected. Reconnect the exact model "
+                "used for this training run."
+            )
+        if settings.comfy_checkpoint.strip() != recovery.checkpoint:
+            return (
+                "The selected ComfyUI checkpoint name changed. Re-select the model "
+                "used for this training run."
+            )
+        try:
+            checkpoint_fingerprint = artifact_fingerprint(current_checkpoint)
+        except (FileNotFoundError, OSError, ValueError):
+            return "The original SDXL checkpoint could not be read safely."
+        if checkpoint_fingerprint != recovery.checkpoint_fingerprint:
+            return (
+                "The SDXL checkpoint file changed after training. Restore the "
+                "original model or start a new run."
+            )
+        return None
 
     def resolve_checkpoint_path(
         self,
@@ -1076,7 +1369,9 @@ class ApplicationService:
             if installation.is_local
         )
         selected_id = settings.comfy_installation_id
-        if not any(item.id == selected_id for item in local_installations):
+        if local_installations and not any(
+            item.id == selected_id for item in local_installations
+        ):
             if found.selected_installation is not None:
                 selected_id = found.selected_installation.id
             elif len(local_installations) == 1:
@@ -1165,6 +1460,15 @@ class ApplicationService:
             for candidate in checkpoint_paths
         ):
             training_base_model = previous_base
+        elif (
+            not checkpoint_paths
+            and not found.model_roots
+            and previous_base is not None
+            and previous_base.is_file()
+        ):
+            # A transient Desktop discovery failure must not erase the exact
+            # checkpoint identity needed to resume a verified run.
+            training_base_model = previous_base
         elif len(checkpoint_paths) == 1:
             training_base_model = checkpoint_paths[0]
         else:
@@ -1208,6 +1512,7 @@ class ApplicationService:
         grids_dir = self.project_path(settings.grids_dir)
         configs_dir = self.project_path(settings.run_configs_dir)
         validation_grid = grids_dir / f"{project_name}_grid.png"
+        validation_workflow = grids_dir / f"{project_name}_use_in_comfyui.json"
         validation_work_dir = grids_dir / project_name
         run_config = configs_dir / f"{project_name}.yaml"
         result_record = configs_dir / f"{project_name}-result.json"
@@ -1215,6 +1520,9 @@ class ApplicationService:
             dataset=dataset_path if dataset_path.exists() else None,
             checkpoints=_project_model_files(checkpoints_dir, project_name),
             validation_grid=validation_grid if validation_grid.exists() else None,
+            validation_workflow=(
+                validation_workflow if validation_workflow.exists() else None
+            ),
             validation_work_dir=(
                 validation_work_dir if validation_work_dir.exists() else None
             ),
@@ -1948,6 +2256,8 @@ class ApplicationService:
         )
         args = [
             *worker_prefix,
+            "--attempt-id",
+            (attempt_id := str(uuid.uuid4())),
             "--name",
             draft.project_name,
             "--trigger",
@@ -1993,6 +2303,7 @@ class ApplicationService:
             self.root,
             mode,
             expected,
+            attempt_id,
         )
 
     def build_validation_command(
@@ -2002,6 +2313,8 @@ class ApplicationService:
         lora_name: str,
         *,
         checkpoint: str | None = None,
+        strengths: Sequence[float] | None = None,
+        seed: int = 42,
     ) -> PipelineCommand:
         """Build a validation-only retry after training already installed a LoRA."""
 
@@ -2028,8 +2341,19 @@ class ApplicationService:
             if os.environ.get("MIVIM_PACKAGED_APP") == "1"
             else ["-m", "src.pipeline"]
         )
-        arguments = (
+        selected_strengths = tuple(
+            draft.preset.validation_strengths if strengths is None else strengths
+        )
+        if not selected_strengths or not all(
+            math.isfinite(value) for value in selected_strengths
+        ):
+            raise ValueError("Validation strengths must be finite numbers.")
+        if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+            raise ValueError("Validation seed must be a non-negative whole number.")
+        arguments = [
             *worker_prefix,
+            "--attempt-id",
+            (attempt_id := str(uuid.uuid4())),
             "--name",
             draft.project_name,
             "--trigger",
@@ -2037,12 +2361,16 @@ class ApplicationService:
             "--preset",
             draft.preset.value,
             "--strengths",
-            *(str(value) for value in draft.preset.validation_strengths),
+            *(str(value) for value in selected_strengths),
+            "--seed",
+            str(seed),
             "--skip-prep",
             "--skip-train",
             "--lora",
             cleaned_lora,
-        )
+        ]
+        if settings.training_base_model is not None:
+            arguments.extend(("--base-model", str(settings.training_base_model)))
         environment = dict(os.environ)
         environment.update(settings.environment_overrides())
         # A durable retry must use the checkpoint saved when the LoRA was
@@ -2060,6 +2388,7 @@ class ApplicationService:
             self.root,
             "validate",
             expected,
+            attempt_id,
         )
 
 
@@ -2077,10 +2406,19 @@ def stage_from_log(line: str) -> tuple[int, str] | None:
         return 42, "Training the LoRA"
     if "[pipeline] copied lora" in lowered:
         return 78, "Installing in ComfyUI"
-    if "[ok] strength=" in lowered:
-        return 86, "Creating comparison images"
+    cell_progress = re.search(
+        r"\[validate\]\s+cell\s+(\d+)/(\d+)\s+(?:created|reused)\b",
+        lowered,
+    )
+    if cell_progress is not None:
+        completed = int(cell_progress.group(1))
+        total = max(1, int(cell_progress.group(2)))
+        progress = min(94, 80 + round(14 * min(completed, total) / total))
+        return progress, f"Creating comparison images ({completed}/{total})"
     if "[validate] grid written:" in lowered:
         return 96, "Building the result"
+    if "[validate] ready workflow written:" in lowered:
+        return 98, "Preparing the ComfyUI handoff"
     if "[pipeline] complete" in lowered:
         return 100, "Complete"
     return None

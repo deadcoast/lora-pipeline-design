@@ -1,8 +1,10 @@
 # MIVIM quality-of-life map
 
 This map keeps the casual-user promise testable. A feature is considered
-complete only when the desktop application exposes it and the same path used by
-the real pipeline is exercised.
+implemented only when the desktop application exposes it and its production
+path is exercised. Packaged UI and mock ComfyUI API coverage do not prove a
+live Desktop workflow import or GPU training run; those remain environment
+acceptance checks.
 
 ## Current user journey
 
@@ -17,10 +19,12 @@ the real pipeline is exercised.
 | Captions | A removed identity phrase silently ruins training | Require the phrase in every caption and offer to restore it automatically |
 | Prepared work | A failed later stage forces photo preparation again | Validate the source manifest and caption pairs, then continue with `--skip-prep` |
 | Project names | Old checkpoints, grids, or LoRAs mix with a new run | Detect the whole project artifact namespace; require a new version name or explicit rebuild |
-| Long training | Progress appears frozen and errors are opaque | Show elapsed/indeterminate training progress, durable local logs, and targeted recovery actions |
+| Long training | Progress appears frozen, errors are opaque, or Stop affects another ComfyUI user | Show elapsed/indeterminate training progress and durable local logs; remove an owned pending prompt, or target a running prompt only on ComfyUI 0.3.56+ |
 | Validation | Users cannot compare against the unchanged model | Include a clearly labelled no-LoRA baseline and plain-language prompt/strength axes |
-| Failed validation | Restarting causes unnecessary retraining | Persist the installed LoRA handoff before validation and expose validation-only retry after restart |
-| Result handoff | Casual users do not know what to enter in ComfyUI | Show and copy the exact LoRA, identity phrase, base checkpoint, and starting strength |
+| Failed validation | Restarting causes unnecessary retraining or regeneration | Persist the exact handoff; retry missing or corrupt cells only when the full signature, including both model content identities, matches |
+| Result handoff | Casual users do not know what to enter or build in ComfyUI | Export editable Workflow JSON v0.4; embed both the API prompt and UI workflow in the PNG; show and copy the exact LoRA, phrase, checkpoint, and tested strength |
+| Restored result | Large files freeze the UI or stale model bytes are trusted | Hash the LoRA and checkpoint in a worker; keep handoff actions disabled until the original Desktop context and exact bytes are verified |
+| Offline restart | A temporary Desktop discovery failure forgets a valid setup | Retain the known installation and checkpoint identity, then ask the user to reconnect that exact context |
 
 ## Comfy Desktop compatibility boundary
 
@@ -33,6 +37,11 @@ A selected Desktop instance is an identity boundary. If its runtime cannot be
 matched safely, a full run is blocked instead of falling through to another
 running instance.
 
+MIVIM can open Desktop or its browser UI, but Windows does not expose a reliable
+external command to select/start one particular Desktop instance or import a
+workflow into it. The app therefore verifies the selected context, opens the
+destination, and gives the user a ready PNG/JSON to drag in or open.
+
 ## Recovery policy
 
 - Correct automatically when the result is deterministic and source data stays
@@ -42,8 +51,10 @@ running instance.
 - Preserve completed work before attempting the next fallible stage.
 - Keep technical output and rotating logs available locally without making
   terminal commands part of the normal workflow.
-- Never report a full run as complete unless its expected artifact is new or
-  changed and its result record is verified.
+- Never report a full run as complete unless its immutable launch snapshot,
+  attempt ID, grid, workflow, installation, host, model paths, LoRA, checkpoint,
+  and content fingerprints agree. Rehash both models after validation and keep
+  the grid but refuse approval if either changed during the sweep.
 
 ## Explicit next roadmap
 
@@ -51,7 +62,5 @@ These items remain future work and are not represented as complete:
 
 - face-count and multi-person source-photo checks;
 - guided selection of the best intermediate training checkpoint;
-- a ready-to-load ComfyUI starter workflow;
-- resumable validation at the individual cell level;
 - managed ai-toolkit installation and updates;
 - video, remote, and cloud training paths.

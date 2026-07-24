@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from collections.abc import Mapping
@@ -13,7 +14,7 @@ from typing import Any
 from .app_models import AppSettings, ProjectDraft, RunResult, TrainingPreset
 from .io_utils import atomic_write_text
 
-SETTINGS_SCHEMA_VERSION = 3
+SETTINGS_SCHEMA_VERSION = 4
 DATA_DIR_OVERRIDE = "MIVIM_LORA_PIPELINE_DATA_DIR"
 _APPLICATION_DIRECTORY = Path("MIVIM") / "LoRA Pipeline"
 
@@ -143,6 +144,14 @@ def _run_result_from_json(value: object) -> RunResult | None:
         preset = TrainingPreset(raw_preset)
     except ValueError:
         return None
+    raw_starting_strength = value.get("starting_strength", 0.8)
+    starting_strength = (
+        float(raw_starting_strength)
+        if isinstance(raw_starting_strength, (int, float))
+        and not isinstance(raw_starting_strength, bool)
+        and math.isfinite(raw_starting_strength)
+        else 0.8
+    )
     if (
         not project_name
         or result_path is None
@@ -159,6 +168,36 @@ def _run_result_from_json(value: object) -> RunResult | None:
         preset=preset,
         checkpoint=_text(value.get("checkpoint"), "", allow_empty=True),
         lora_name=_text(value.get("lora_name"), "", allow_empty=True),
+        result_fingerprint=_text(
+            value.get("result_fingerprint"),
+            "",
+            allow_empty=True,
+        ),
+        workflow_path=_path(value.get("workflow_path"), None),
+        workflow_fingerprint=_text(
+            value.get("workflow_fingerprint"),
+            "",
+            allow_empty=True,
+        ),
+        comfy_installation_id=_text(
+            value.get("comfy_installation_id"),
+            "",
+            allow_empty=True,
+        ),
+        comfy_host=_text(value.get("comfy_host"), "", allow_empty=True),
+        installed_lora_path=_path(value.get("installed_lora_path"), None),
+        lora_fingerprint=_text(
+            value.get("lora_fingerprint"),
+            "",
+            allow_empty=True,
+        ),
+        checkpoint_path=_path(value.get("checkpoint_path"), None),
+        checkpoint_fingerprint=_text(
+            value.get("checkpoint_fingerprint"),
+            "",
+            allow_empty=True,
+        ),
+        starting_strength=starting_strength,
     )
 
 
@@ -170,7 +209,7 @@ def _settings_from_json(value: object) -> AppSettings:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in {1, 2, SETTINGS_SCHEMA_VERSION}
+        or version not in {1, 2, 3, SETTINGS_SCHEMA_VERSION}
     ):
         return defaults
 
@@ -266,6 +305,16 @@ def _run_result_to_json(result: RunResult | None) -> dict[str, object] | None:
         "preset": result.preset.value,
         "checkpoint": result.checkpoint,
         "lora_name": result.lora_name,
+        "result_fingerprint": result.result_fingerprint,
+        "workflow_path": _path_for_json(result.workflow_path),
+        "workflow_fingerprint": result.workflow_fingerprint,
+        "comfy_installation_id": result.comfy_installation_id,
+        "comfy_host": result.comfy_host,
+        "installed_lora_path": _path_for_json(result.installed_lora_path),
+        "lora_fingerprint": result.lora_fingerprint,
+        "checkpoint_path": _path_for_json(result.checkpoint_path),
+        "checkpoint_fingerprint": result.checkpoint_fingerprint,
+        "starting_strength": result.starting_strength,
     }
 
 

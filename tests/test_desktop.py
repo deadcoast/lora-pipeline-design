@@ -3,14 +3,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+import shiboken6
 from PIL import Image
 from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
     QLineEdit,
@@ -20,10 +24,17 @@ from PySide6.QtWidgets import (
 )
 from pytestqt.exceptions import TimeoutError as QtBotTimeout
 
-from src import app_service, dataset_review
-from src.app_models import AppSettings, ProjectDraft, RunResult, TrainingPreset
+from src import __version__, app_service, dataset_review
+from src.app_models import (
+    AppSettings,
+    ProjectDraft,
+    RunResult,
+    TrainingPreset,
+    ValidationRecovery,
+)
 from src.app_service import ApplicationService, PipelineCommand
 from src.app_settings import load_settings, save_settings
+from src.comfy_client import PromptCancellationResult
 from src.comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
@@ -32,7 +43,8 @@ from src.comfy_desktop import (
     ComfyModelRoot,
 )
 from src.dataset_review import PreparedDatasetDialog
-from src.desktop import NAV_RESULTS, NAV_RUN, MainWindow
+from src.desktop import NAV_RESULTS, NAV_RUN, MainWindow, _build_parser
+from src.io_utils import artifact_fingerprint
 from src.photo_review import PhotoIssueDialog
 
 
@@ -683,6 +695,344 @@ def test_real_trainer_process_uses_elapsed_indeterminate_progress_then_restores(
     assert not window.repair_trainer_after_run_button.isVisible()
 
 
+def test_desktop_tracks_and_reports_only_its_owned_comfy_prompt(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    command = _script_pipeline_command(tmp_path, "raise SystemExit(1)")
+    command = replace(
+        command,
+        environment={**command.environment, "COMFY_HOST": "127.0.0.1:8188"},
+    )
+    window.pipeline_command = command
+    prompt_id = "118762ff-c271-48f7-934a-1061bc1abafe"
+    client_id = "77605834-738e-4644-be3e-0262fe5b3b14"
+
+    window._process_pipeline_line(
+        "[comfy] owned prompt queued "
+        f"prompt_id={prompt_id} client_id={client_id} host=127.0.0.1:8188"
+    )
+
+    assert window._owned_comfy_prompt == (
+        prompt_id,
+        client_id,
+        "127.0.0.1:8188",
+    )
+    window.run_cancelled = True
+    window._run_terminal_handled = True
+    window._owned_prompt_cancelled(
+        PromptCancellationResult(
+            status="running_interrupt_requested",
+            prompt_id=prompt_id,
+            client_id=client_id,
+            message="Interrupt requested for this running ComfyUI prompt.",
+        )
+    )
+    assert "Interrupt requested" in window.run_detail_label.text()
+
+
+def test_pipeline_failure_ignores_validation_recovery_from_another_attempt(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    draft = ProjectDraft(project_name="attempt_bound_v1")
+    window.draft = draft
+    command = replace(
+        _script_pipeline_command(tmp_path, "pass"),
+        mode="validate",
+        attempt_id="11111111-1111-4111-8111-111111111111",
+    )
+    window.pipeline_command = command
+    recovery = ValidationRecovery(
+        project_name=draft.project_name,
+        state="validation_pending",
+        lora_name="attempt_bound_v1.safetensors",
+        installed_lora_path=tmp_path / "attempt_bound_v1.safetensors",
+        expected_grid_path=tmp_path / "attempt_bound_v1_grid.png",
+        trigger=draft.trigger,
+        preset=draft.preset,
+        checkpoint="portraitXL.safetensors",
+        updated_at="2026-07-24T12:00:00+00:00",
+        attempt_id="22222222-2222-4222-8222-222222222222",
+    )
+    monkeypatch.setattr(
+        window.service,
+        "read_validation_recovery",
+        lambda *_args, **_kwargs: recovery,
+    )
+
+    assert window._refresh_validation_recovery_after_run() is None
+    assert window._pending_validation_recovery is None
+
+
+def test_saved_recovery_model_hashing_does_not_block_window_construction(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    draft = ProjectDraft(project_name="background_recovery_v1")
+    recovery = ValidationRecovery(
+        project_name=draft.project_name,
+        state="validation_pending",
+        lora_name="background_recovery_v1.safetensors",
+        installed_lora_path=tmp_path / "background_recovery_v1.safetensors",
+        expected_grid_path=tmp_path / "background_recovery_v1_grid.png",
+        trigger=draft.trigger,
+        preset=draft.preset,
+        checkpoint="portraitXL.safetensors",
+        updated_at="2026-07-24T12:00:00+00:00",
+        attempt_id="33333333-3333-4333-8333-333333333333",
+    )
+    service = _OfflineLocalService(root=tmp_path)
+    worker_threads: list[int] = []
+    main_thread = threading.get_ident()
+    monkeypatch.setattr(
+        service,
+        "read_validation_recovery",
+        lambda *_args, **_kwargs: recovery,
+    )
+
+    def check_recovery(*_args, **_kwargs) -> str:
+        worker_threads.append(threading.get_ident())
+        return "Reconnect the original files."
+
+    monkeypatch.setattr(service, "validation_recovery_issue", check_recovery)
+
+    window = MainWindow(
+        settings=AppSettings(last_project=draft),
+        settings_path=tmp_path / "settings.json",
+        service=service,
+    )
+    qtbot.addWidget(window)
+
+    qtbot.waitUntil(lambda: bool(worker_threads), timeout=3_000)
+    assert worker_threads[0] != main_thread
+
+
+def test_stale_cancel_callbacks_and_force_timer_cannot_stop_a_later_attempt(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    stale_process = QProcess(window)
+    active_process = QProcess(window)
+    stale_command = replace(
+        _script_pipeline_command(tmp_path, "pass"),
+        attempt_id="11111111-1111-4111-8111-111111111111",
+    )
+    active_command = replace(
+        _script_pipeline_command(tmp_path, "pass"),
+        attempt_id="22222222-2222-4222-8222-222222222222",
+    )
+    window.pipeline_process = active_process
+    window.pipeline_command = active_command
+    handled: list[object] = []
+    forced: list[bool] = []
+    monkeypatch.setattr(window, "_owned_prompt_cancelled", handled.append)
+    monkeypatch.setattr(window, "_force_stop_pipeline", lambda: forced.append(True))
+    result = PromptCancellationResult(
+        status="not_found",
+        prompt_id="prompt",
+        client_id="client",
+        message="Already finished.",
+    )
+
+    window._owned_prompt_cancelled_for_attempt(
+        stale_process,
+        stale_command,
+        result,
+    )
+    window._force_stop_pipeline_for_attempt(stale_process, stale_command)
+    window._owned_prompt_cancelled_for_attempt(
+        active_process,
+        stale_command,
+        result,
+    )
+    window._force_stop_pipeline_for_attempt(active_process, stale_command)
+
+    assert handled == []
+    assert forced == []
+
+    window._owned_prompt_cancelled_for_attempt(
+        active_process,
+        active_command,
+        result,
+    )
+    window._force_stop_pipeline_for_attempt(active_process, active_command)
+
+    assert handled == [result]
+    assert forced == [True]
+
+
+def test_cancel_timer_ignores_a_deleted_qprocess_wrapper(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    process = QProcess(window)
+    command = _script_pipeline_command(tmp_path, "pass")
+    window.pipeline_process = process
+    window.pipeline_command = command
+    shiboken6.delete(process)
+
+    assert not window._pipeline_attempt_is_active(process, command)
+    window._force_stop_pipeline()
+
+    window.pipeline_process = None
+    window.pipeline_command = None
+
+
+def test_unsupported_targeted_cancel_keeps_watching_the_running_job(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    process = QProcess(window)
+    process.start(sys.executable, ["-c", "import time; time.sleep(30)"])
+    qtbot.waitUntil(
+        lambda: process.state() == QProcess.ProcessState.Running,
+        timeout=3_000,
+    )
+    command = replace(
+        _script_pipeline_command(tmp_path, "pass"),
+        attempt_id="44444444-4444-4444-8444-444444444444",
+    )
+    window.pipeline_process = process
+    window.pipeline_command = command
+    window.run_cancelled = True
+    stopped: list[bool] = []
+    monkeypatch.setattr(
+        window,
+        "_stop_process_tree",
+        lambda *, force: stopped.append(force),
+    )
+
+    window._owned_prompt_cancelled_for_attempt(
+        process,
+        command,
+        PromptCancellationResult(
+            status="running_interrupt_unsupported",
+            prompt_id="prompt",
+            client_id="client",
+            message=(
+                "This ComfyUI version cannot safely stop only this running prompt."
+            ),
+        ),
+    )
+
+    assert process.state() == QProcess.ProcessState.Running
+    assert stopped == []
+    assert not window.run_cancelled
+    assert window.run_stage_label.text() == "ComfyUI job is still running"
+    assert "Do not start another GPU task" in window.run_detail_label.text()
+
+    process.kill()
+    process.waitForFinished(3_000)
+    window.pipeline_process = None
+    window.pipeline_command = None
+
+
+def test_close_stays_open_when_running_comfy_prompt_cannot_be_safely_stopped(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    process = QProcess(window)
+    process.start(sys.executable, ["-c", "import time; time.sleep(30)"])
+    qtbot.waitUntil(
+        lambda: process.state() == QProcess.ProcessState.Running,
+        timeout=3_000,
+    )
+    command = replace(
+        _script_pipeline_command(tmp_path, "pass"),
+        attempt_id="33333333-3333-4333-8333-333333333333",
+    )
+    prompt_id = "118762ff-c271-48f7-934a-1061bc1abafe"
+    client_id = "77605834-738e-4644-be3e-0262fe5b3b14"
+    window.pipeline_process = process
+    window.pipeline_command = command
+    window._owned_comfy_prompt = (prompt_id, client_id, "127.0.0.1:8188")
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.No,
+    )
+
+    def record_warning(
+        _parent,
+        _title: str,
+        message: str,
+    ) -> QMessageBox.StandardButton:
+        warnings.append(message)
+        return QMessageBox.StandardButton.Ok
+
+    monkeypatch.setattr(QMessageBox, "warning", record_warning)
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.cancel_owned_prompt",
+        lambda *_args, **_kwargs: PromptCancellationResult(
+            status="running_interrupt_unsupported",
+            prompt_id=prompt_id,
+            client_id=client_id,
+            message=(
+                "This ComfyUI version cannot safely stop only this running prompt."
+            ),
+        ),
+    )
+    event = QCloseEvent()
+
+    window.closeEvent(event)
+
+    assert not event.isAccepted()
+    assert process.state() == QProcess.ProcessState.Running
+    assert not window.run_cancelled
+    assert not window._closing
+    assert warnings
+    assert "MIVIM will stay open" in warnings[0]
+    assert "stop this job from its queue" in warnings[0]
+
+    process.kill()
+    process.waitForFinished(3_000)
+    window.pipeline_process = None
+    window.pipeline_command = None
+
+
 def test_real_cuda_oom_offers_fast_plan_and_applies_the_recovery(
     qtbot,
     tmp_path: Path,
@@ -837,6 +1187,11 @@ def test_validation_failure_recovers_after_restart_without_retraining(
     lora_dir.mkdir(parents=True)
     installed = lora_dir / "restart_recovery_v1.safetensors"
     installed.write_bytes(b"trained weights")
+    base_model = (
+        tmp_path / "ComfyUI" / "models" / "checkpoints" / "portraitXL.safetensors"
+    )
+    base_model.parent.mkdir(parents=True)
+    base_model.write_bytes(b"sdxl checkpoint")
     draft = ProjectDraft(
         project_name="restart_recovery_v1",
         trigger="ohwx person",
@@ -844,8 +1199,10 @@ def test_validation_failure_recovers_after_restart_without_retraining(
     )
     settings = AppSettings(
         comfy_host="127.0.0.1:1",
+        comfy_installation_id="desktop-a",
         comfy_lora_dir=lora_dir,
         comfy_checkpoint="portraitXL.safetensors",
+        training_base_model=base_model,
         datasets_dir=tmp_path / "datasets",
         checkpoints_dir=tmp_path / "checkpoints",
         grids_dir=tmp_path / "grids",
@@ -868,11 +1225,14 @@ def test_validation_failure_recovers_after_restart_without_retraining(
     environment.update(settings.environment_overrides())
     environment["COMFY_HOST"] = "127.0.0.1:1"
     environment["PYTHONUNBUFFERED"] = "1"
+    attempt_id = "3d570ae6-c094-46d9-93b0-eb90cf6a3893"
     command = PipelineCommand(
         program=sys.executable,
         arguments=(
             "-m",
             "src.pipeline",
+            "--attempt-id",
+            attempt_id,
             "--name",
             draft.project_name,
             "--trigger",
@@ -886,11 +1246,14 @@ def test_validation_failure_recovers_after_restart_without_retraining(
             "--skip-train",
             "--lora",
             installed.name,
+            "--base-model",
+            str(base_model),
         ),
         environment=environment,
         working_directory=root,
         mode="validate",
         expected_result=settings.grids_dir / f"{draft.project_name}_grid.png",
+        attempt_id=attempt_id,
     )
 
     window.pages.setCurrentIndex(NAV_RUN)
@@ -924,9 +1287,6 @@ def test_validation_failure_recovers_after_restart_without_retraining(
     assert recovery_file.is_file()
     window.close()
     QApplication.processEvents()
-    changed_settings = load_settings(settings_path)
-    changed_settings.comfy_checkpoint = "different-after-training.safetensors"
-    save_settings(changed_settings, settings_path)
 
     restarted = MainWindow(
         settings=load_settings(settings_path),
@@ -940,9 +1300,24 @@ def test_validation_failure_recovers_after_restart_without_retraining(
     assert restarted.retry_validation_button.isVisible()
     assert restarted._pending_validation_recovery is not None
     assert restarted._pending_validation_recovery.lora_name == installed.name
+    assert (
+        restarted.service.validation_recovery_issue(
+            restarted._collect_settings(),
+            restarted._pending_validation_recovery,
+        )
+        is None
+    )
+    qtbot.waitUntil(
+        lambda: restarted.retry_validation_button.isEnabled(),
+        timeout=5_000,
+    )
     qtbot.mouseClick(
         restarted.retry_validation_button,
         Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(
+        lambda: restarted.pipeline_command is not None,
+        timeout=5_000,
     )
     assert restarted.pipeline_command is not None
     assert "--skip-prep" in restarted.pipeline_command.arguments
@@ -1188,6 +1563,7 @@ def test_restore_uses_verified_result_record_instead_of_an_older_grid(
         completed_at="2026-07-24T12:00:00+00:00",
         trigger="ohwx person",
         preset=TrainingPreset.BALANCED,
+        result_fingerprint=artifact_fingerprint(dataset),
     )
     settings = AppSettings(
         datasets_dir=datasets,
@@ -1212,6 +1588,131 @@ def test_restore_uses_verified_result_record_instead_of_an_older_grid(
     assert not window.review_prepared_button.isHidden()
 
 
+def test_run_result_rejects_a_completion_record_from_another_attempt(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    grid = tmp_path / "grids" / "strict_v1_grid.png"
+    grid.parent.mkdir()
+    Image.new("RGB", (32, 32), "purple").save(grid)
+    workflow = grid.parent / "strict_v1_use_in_comfyui.json"
+    workflow.write_text("{}\n", encoding="utf-8")
+    lora = tmp_path / "models" / "loras" / "strict_v1.safetensors"
+    lora.parent.mkdir(parents=True)
+    lora.write_bytes(b"lora weights")
+    checkpoint = tmp_path / "models" / "checkpoints" / "portraitXL.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint weights")
+    settings = AppSettings(
+        comfy_host="127.0.0.1:8188",
+        comfy_installation_id="desktop-a",
+        comfy_lora_dir=lora.parent,
+        comfy_checkpoint="portraitXL.safetensors",
+        training_base_model=checkpoint,
+        datasets_dir=tmp_path / "datasets",
+        checkpoints_dir=tmp_path / "checkpoints",
+        grids_dir=grid.parent,
+        run_configs_dir=tmp_path / "configs",
+    )
+    draft = ProjectDraft(
+        project_name="strict_v1",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+    )
+    settings.run_configs_dir.mkdir()
+    outcome_path = settings.run_configs_dir / "strict_v1-result.json"
+    outcome = {
+        "schema_version": 3,
+        "project_name": draft.project_name,
+        "attempt_id": "6e58ac26-21aa-4851-bc17-9800b1a5fa24",
+        "mode": "full",
+        "result_path": str(grid.resolve()),
+        "result_fingerprint": artifact_fingerprint(grid),
+        "trigger": draft.trigger,
+        "preset": draft.preset.value,
+        "checkpoint": settings.comfy_checkpoint,
+        "lora_name": lora.name,
+        "workflow_path": str(workflow.resolve()),
+        "workflow_fingerprint": artifact_fingerprint(workflow),
+        "comfy_installation_id": settings.comfy_installation_id,
+        "comfy_host": settings.comfy_host,
+        "installed_lora_path": str(lora.resolve()),
+        "lora_fingerprint": artifact_fingerprint(lora),
+        "checkpoint_path": str(checkpoint.resolve()),
+        "checkpoint_fingerprint": artifact_fingerprint(checkpoint),
+        "starting_strength": 0.8,
+        "completed_at": "2026-07-24T12:00:00+00:00",
+    }
+    outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+    window = MainWindow(
+        settings=settings,
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.draft = draft
+    window._validated_draft = draft
+    command = PipelineCommand(
+        program=sys.executable,
+        arguments=(),
+        environment={
+            "COMFY_SDXL_CKPT": settings.comfy_checkpoint,
+            "COMFY_HOST": settings.comfy_host,
+            "MIVIM_COMFY_INSTALLATION_ID": settings.comfy_installation_id,
+        },
+        working_directory=tmp_path,
+        mode="full",
+        expected_result=grid,
+        attempt_id="0d6d97cf-7e1b-4f1d-a3eb-795153a05458",
+    )
+
+    with pytest.raises(ValueError, match="attempt identifier"):
+        window._record_run_result(command)
+
+    assert window.settings.last_result is None
+    outcome["attempt_id"] = command.attempt_id
+    outcome_path.write_text(json.dumps(outcome), encoding="utf-8")
+    lora.write_bytes(b"substituted lora")
+    with pytest.raises(ValueError, match="installed LoRA contents"):
+        window._record_run_result(command)
+    lora.write_bytes(b"lora weights")
+    checkpoint.write_bytes(b"substituted checkpoint")
+    with pytest.raises(ValueError, match="checkpoint contents"):
+        window._record_run_result(command)
+    checkpoint.write_bytes(b"checkpoint weights")
+    record = window._record_run_result(command)
+    assert record.workflow_path == workflow
+    assert record.comfy_installation_id == "desktop-a"
+    assert record.starting_strength == 0.8
+
+
+def test_restore_ignores_a_result_whose_contents_changed(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    grid = tmp_path / "portrait_grid.png"
+    Image.new("RGB", (32, 32), "blue").save(grid)
+    record = RunResult(
+        project_name="portrait_v1",
+        mode="full",
+        result_path=grid,
+        completed_at="2026-07-24T12:00:00+00:00",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+        result_fingerprint=artifact_fingerprint(grid),
+    )
+    Image.new("RGB", (32, 32), "red").save(grid)
+
+    window = MainWindow(
+        settings=AppSettings(last_result=record),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    assert window._latest_result is None
+
+
 def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
     qtbot,
     tmp_path: Path,
@@ -1219,6 +1720,14 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
 ) -> None:
     grid = tmp_path / "portrait_grid.png"
     Image.new("RGB", (64, 64), "blue").save(grid)
+    workflow = tmp_path / "portrait_v1_use_in_comfyui.json"
+    workflow.write_text('{"1": {"class_type": "LoraLoader"}}\n', encoding="utf-8")
+    lora = tmp_path / "models" / "loras" / "portrait_v1_000002000.safetensors"
+    lora.parent.mkdir(parents=True)
+    lora.write_bytes(b"lora weights")
+    checkpoint = tmp_path / "models" / "checkpoints" / "portraitXL.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint weights")
     record = RunResult(
         project_name="portrait_v1",
         mode="full",
@@ -1228,9 +1737,25 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
         preset=TrainingPreset.BALANCED,
         checkpoint="portraitXL.safetensors",
         lora_name="portrait_v1_000002000.safetensors",
+        result_fingerprint=artifact_fingerprint(grid),
+        workflow_path=workflow,
+        workflow_fingerprint=artifact_fingerprint(workflow),
+        comfy_installation_id="desktop-a",
+        comfy_host="127.0.0.1:8188",
+        installed_lora_path=lora,
+        lora_fingerprint=artifact_fingerprint(lora),
+        checkpoint_path=checkpoint,
+        checkpoint_fingerprint=artifact_fingerprint(checkpoint),
+        starting_strength=0.8,
     )
     window = MainWindow(
-        settings=AppSettings(last_result=record),
+        settings=AppSettings(
+            comfy_installation_id="desktop-a",
+            comfy_lora_dir=lora.parent,
+            comfy_checkpoint=checkpoint.name,
+            training_base_model=checkpoint,
+            last_result=record,
+        ),
         settings_path=tmp_path / "settings.json",
         service=_OfflineLocalService(root=tmp_path),
     )
@@ -1246,6 +1771,13 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
         "src.desktop.QDesktopServices.openUrl",
         capture_opened_path,
     )
+    qtbot.waitUntil(
+        lambda: (
+            window._verified_result_identity is not None
+            and window._verified_result_identity[0] == record
+        ),
+        timeout=5_000,
+    )
 
     assert "portrait_v1_000002000.safetensors" in window.result_details_label.text()
     assert "ohwx person" in window.result_details_label.text()
@@ -1255,6 +1787,12 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
         Qt.MouseButton.LeftButton,
     )
     assert opened == [grid]
+    assert not window.open_ready_workflow_button.isHidden()
+    qtbot.mouseClick(
+        window.open_ready_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    assert opened == [grid, workflow.parent]
     qtbot.mouseClick(
         window.copy_result_setup_button,
         Qt.MouseButton.LeftButton,
@@ -1262,3 +1800,155 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
     copied = QApplication.clipboard().text()
     assert "LoRA: portrait_v1_000002000.safetensors" in copied
     assert "Starting strength: 0.8" in copied
+    assert str(workflow) in copied
+    window.installation_combo.clear()
+    window.installation_combo.addItem("Other Desktop", "desktop-b")
+    assert "another Comfy Desktop installation" in (
+        window._result_comfy_context_issue(record) or ""
+    )
+    errors: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+    qtbot.mouseClick(
+        window.open_ready_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    assert opened == [grid, workflow.parent]
+    assert errors and errors[-1][0] == "Reconnect the original ComfyUI setup"
+
+
+def test_release_version_matches_project_and_is_visible(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    repository = Path(__file__).resolve().parents[1]
+    project = tomllib.loads((repository / "pyproject.toml").read_text(encoding="utf-8"))
+    deploy_spec = (repository / "pysidedeploy.spec").read_text(encoding="utf-8")
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+
+    assert project["project"]["version"] == __version__
+    assert f"--file-version={__version__}.0" in deploy_spec
+    assert f"--product-version={__version__}.0" in deploy_spec
+    assert __version__ in window.windowTitle()
+
+
+def test_result_preview_fits_a_wide_grid_without_clipping(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    grid = tmp_path / "wide_grid.png"
+    Image.new("RGB", (1200, 400), "navy").save(grid)
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.resize(1040, 690)
+    window.show()
+    window._show_result(grid)
+    window.show_page(NAV_RESULTS)
+    qtbot.waitUntil(lambda: window.result_image.pixmap() is not None)
+
+    preview = window.result_image.pixmap()
+    assert preview is not None
+    viewport = window.result_image.contentsRect().size()
+    assert preview.width() <= viewport.width()
+    assert preview.height() <= viewport.height()
+    assert preview.width() / preview.height() == pytest.approx(3.0, abs=0.02)
+    assert window.result_path_label.text() == str(grid)
+
+
+def test_screenshot_cli_selects_a_real_application_page() -> None:
+    args = _build_parser().parse_args(
+        ["--screenshot", "capture.png", "--screenshot-page", "result"]
+    )
+
+    assert args.screenshot == Path("capture.png")
+    assert args.screenshot_page == "result"
+
+
+def test_new_project_invalidates_stale_result_identity_state(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    result = RunResult(
+        project_name="portrait_v1",
+        mode="full",
+        result_path=tmp_path / "grid.png",
+        completed_at="2026-07-24T12:00:00+00:00",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+    )
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.draft = ProjectDraft(project_name="portrait_v1")
+    window._latest_result = result.result_path
+    window._displayed_result_record = result
+    window._verified_result_identity = (result, (1, 2), (3, 4))
+    window._result_identity_failure = (result, "old verification")
+    window._run_settings_snapshot = AppSettings()
+    window._run_draft_snapshot = window.draft
+    result_request = window._result_identity_request
+
+    window.new_project()
+
+    assert window._result_identity_request == result_request + 1
+    assert window._latest_result is None
+    assert window._displayed_result_record is None
+    assert window._verified_result_identity is None
+    assert window._result_identity_failure is None
+    assert window._run_settings_snapshot is None
+    assert window._run_draft_snapshot is None
+
+
+def test_unexpected_recovery_verifier_output_never_enables_retry(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    recovery = ValidationRecovery(
+        project_name="portrait_v1",
+        state="validation_pending",
+        lora_name="portrait_v1.safetensors",
+        installed_lora_path=tmp_path / "portrait_v1.safetensors",
+        expected_grid_path=tmp_path / "portrait_v1_grid.png",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+        checkpoint="sdxl.safetensors",
+        updated_at="2026-07-24T12:00:00+00:00",
+    )
+    window._pending_validation_recovery = recovery
+    request = window._recovery_check_request
+
+    window._restored_recovery_checked(
+        request,
+        recovery,
+        ProjectDraft(
+            project_name="portrait_v1",
+            trigger="ohwx person",
+        ),
+        AppSettings(),
+        object(),
+    )
+
+    assert window.pipeline_command is None
+    assert not window.retry_validation_button.isEnabled()
+    assert "unexpected result" in window.run_detail_label.text()

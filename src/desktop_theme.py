@@ -11,6 +11,9 @@ QMainWindow, QWidget#appRoot {
     background: #0c1220;
     color: #eef2ff;
 }
+QWidget#scrollPageContent, QWidget#resultsPage {
+    background: #0c1220;
+}
 QWidget#navigation {
     background: #111a2e;
     border-right: 1px solid #25304a;
