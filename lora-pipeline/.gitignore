@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Data + outputs (large / private — don't commit)
+datasets/*/
+outputs/checkpoints/*
+outputs/grids/*
+!**/.gitkeep
+
+# Models
+*.safetensors
+*.ckpt

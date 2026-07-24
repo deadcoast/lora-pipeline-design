@@ -1,0 +1,15 @@
+# Orchestrator dependencies (your pipeline glue).
+# NOTE: This is intentionally lightweight. PyTorch is NOT listed here —
+# install it separately with the Blackwell/CUDA nightly (see README §1),
+# and let ai-toolkit + ComfyUI manage their own heavy deps in their own venvs.
+
+Pillow>=10.3
+requests>=2.31
+websocket-client>=1.7
+python-dotenv>=1.0
+PyYAML>=6.0
+tqdm>=4.66
+
+# --- Optional: local auto-captioning with BLIP (heavy; only if you use --vision) ---
+# transformers>=4.44
+# torch            # install the Blackwell nightly, not the default wheel
