@@ -48,13 +48,13 @@ So the pipeline has two engines that talk to each other:
 
 ```text
    photos/             shared local SDXL model              ComfyUI (API)
- ┌───────────┐   prep   ┌────────────────────┐  .safetensors ┌──────────────┐
- │ raw images│ ───────▶ │ dataset (img+txt)  │ ───────▶     │ load LoRA +  │
- │           │  caption │ + training config  │   train       │ generate     │
- └───────────┘          └────────────────────┘               │ validation   │
-       ▲                          │                          │ grid         │
-       │                          ▼                          └──────┬───────┘
-       │                    checkpoints/                            │
+ ┌───────────┐   prep    ┌────────────────────┐  .safetensors ┌──────────────┐
+ │ raw images│ ───────▶ │ dataset (img+txt)  │ ───────▶      │ load LoRA +  │
+ │           │  caption  │ + training config  │   train       │ generate     │
+ └───────────┘           └────────────────────┘               │ validation   │
+       ▲                          │                           │ grid         │
+       │                          ▼                           └──────┬───────┘
+       │                    checkpoints/                             │
        └──────────────── review grid, adjust, retrain ◀─────────────┘
                           (your Python orchestrator drives this whole loop)
 ```
