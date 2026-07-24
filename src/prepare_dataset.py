@@ -65,6 +65,29 @@ def _iter_images(src: Path) -> Iterator[Path]:
             yield p
 
 
+def _deduplicate_images(
+    images: list[Path],
+) -> tuple[list[Path], list[tuple[Path, Path]]]:
+    """Keep one exact file while preserving every source photo untouched."""
+
+    unique: list[Path] = []
+    duplicates: list[tuple[Path, Path]] = []
+    digests: dict[str, Path] = {}
+    for image in images:
+        digest = hashlib.sha256()
+        with image.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        fingerprint = digest.hexdigest()
+        original = digests.get(fingerprint)
+        if original is None:
+            digests[fingerprint] = image
+            unique.append(image)
+        else:
+            duplicates.append((image, original))
+    return unique, duplicates
+
+
 def _is_generated_pair(path: Path) -> bool:
     return path.is_file() and path.stem.isdigit() and path.suffix in {".png", ".txt"}
 
@@ -295,9 +318,16 @@ def prepare(
         )
     out.mkdir(parents=True, exist_ok=True)
 
-    images = list(_iter_images(src))
-    if not images:
+    candidates = list(_iter_images(src))
+    if not candidates:
         raise ValueError(f"No supported images found under {src}")
+    images, duplicates = _deduplicate_images(candidates)
+    for duplicate, original in duplicates:
+        print(
+            "  [ignore] Exact duplicate "
+            f"{duplicate.relative_to(src).as_posix()} matches "
+            f"{original.relative_to(src).as_posix()}"
+        )
     manifest = _source_manifest(
         src,
         images,
@@ -307,7 +337,10 @@ def prepare(
     )
     _validate_source_manifest(out, manifest, overwrite=overwrite)
 
-    print(f"[prepare] {len(images)} candidate image(s) -> {out}")
+    print(
+        f"[prepare] {len(images)} unique image(s) -> {out}"
+        + (f" ({len(duplicates)} exact duplicate(s) ignored)" if duplicates else "")
+    )
     staging: Path | None = None
     if overwrite:
         staging = Path(tempfile.mkdtemp(prefix=f".{name}.prepare-", dir=out.parent))

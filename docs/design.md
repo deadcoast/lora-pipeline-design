@@ -21,8 +21,9 @@ The default journey is:
 2. Choose and review source photos.
 3. Select a plain-language training plan.
 4. Resolve readiness failures through user-facing actions.
-5. Monitor or stop the real pipeline.
-6. Review the verified grid and continue in ComfyUI.
+5. Review prepared thumbnails and edit captions when preparation is separated.
+6. Monitor or stop the real pipeline.
+7. Review the verified baseline grid and copy the exact setup into ComfyUI.
 
 Comfy Desktop state is read-only discovery input. The studio stores its own
 approved connection and workspace settings, validates the live local API, and
@@ -281,23 +282,56 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 
 - Phase 1 is implemented as a guided desktop application for a single
   person/identity LoRA on SDXL.
-- Current Comfy Desktop 2 multi-instance state, shared model roots, port locks,
-  and legacy Desktop layouts are discovered read-only.
+- Current Comfy Desktop 2 multi-instance state, shared model roots,
+  `extra_model_paths.yaml`, live-process port locks, and legacy Desktop layouts
+  are discovered read-only. Dead-process port locks are rejected.
 - The app owns versioned per-user settings and a writable project workspace.
 - Fast, Balanced, and High Quality plans change real rank, steps, resolution,
   preview cadence, and validation breadth.
 - Setup checks, preparation-only operation, background logging, complete
   Windows process-tree cancellation, result verification, and last-result
   restoration are implemented in the user-facing application.
+- Background logging is a bounded, rotating, local-only support trail beside
+  the user's settings. It records setup/readiness outcomes, recoverable worker
+  failures, and real pipeline output without dumping environment variables or
+  photo contents. The run monitor exposes the folder through **Open local
+  logs**; no upload is automatic.
+- Prepared projects are validated against their generation manifest, exposed in
+  a thumbnail/caption editor, and resumed with `--skip-prep` after preparation
+  or a later-stage failure. The review and trainer consume one shared supported
+  image/`.txt` inventory, and filename-specific structural failures block
+  process launch.
+- LoRA installation writes a versioned recovery record before validation starts.
+  If validation fails or the studio closes, the next launch restores a
+  validation-only retry and never repeats completed preparation or training.
+- Validation includes a no-LoRA baseline and plain-language prompt/strength
+  axes. The verified result record carries the installed LoRA filename,
+  identity phrase, checkpoint, and suggested starting strength into the result
+  page.
 - Training configs are reusable templates; the orchestrator injects each run's
   name, dataset path, selected Comfy Desktop checkpoint file, output path, and
   selected preset before launching ai-toolkit.
-- Readiness executes the selected trainer Python and verifies PyTorch/CUDA,
-  write-probes output locations, blocks output collisions, and invalidates
-  stale reviews whenever a user-facing choice changes.
+- Readiness executes the selected trainer Python, identifies the installed
+  GPU's compute capability, and completes a real CUDA kernel before approving
+  training. This catches CUDA-visible but architecture-incompatible wheels
+  (notably Blackwell `sm_120`) while retaining support for older GPUs.
+- Output collision checks cover the prepared dataset, exact project
+  checkpoints, validation work/grid, trainer and result records, and the
+  installed ComfyUI LoRA. The app requires a new version name or an explicit
+  rebuild decision, while a successful prepare-only result remains resumable.
+- Readiness write-probes output locations and invalidates stale reviews whenever
+  a user-facing choice changes.
+- Desktop selection binds only its identity-matched live runtime, effective
+  model-root set, exact checkpoint file, and LoRA destination—even when only
+  one installation exists. Missing ownership or a path outside those effective
+  roots blocks a full run instead of falling through to another instance.
+- A missing LoRA directory can be created from the GUI only when it exactly
+  matches the selected Desktop instance's verified model-root declaration; the
+  repair never creates arbitrary or parent paths.
 - Video/Wan support remains an explicit Phase 2 roadmap item.
-- Face/blur/near-duplicate QC, multi-checkpoint winner selection, remote model
-  upload, and resumable validation remain explicit future product work rather
-  than partially exposed controls.
+- Face-count QC, multi-checkpoint winner selection, remote model upload, and
+  per-cell validation resume remain explicit future product work rather than
+  partially exposed controls. Blur and likely near-duplicate checks are local
+  review recommendations in Phase 1.
 
 ---

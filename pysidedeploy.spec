@@ -68,7 +68,7 @@ macos.permissions =
 mode = standalone
 
 # specify any extra nuitka arguments
-extra_args = --quiet --assume-yes-for-downloads --output-filename=MIVIMLoRAStudio.exe --windows-console-mode=hide --company-name=MIVIM --product-name=MIVIM-LoRA-Studio --file-description=MIVIM-LoRA-Studio --file-version=0.2.0.0 --product-version=0.2.0.0 --noinclude-qt-translations --include-data-dir=configs=configs --include-data-dir=workflows=workflows
+extra_args = --quiet --assume-yes-for-downloads --output-filename=MIVIMLoRAStudio.exe --windows-console-mode=hide --company-name=MIVIM --product-name=MIVIM-LoRA-Studio --file-description=MIVIM-LoRA-Studio --file-version=0.3.0.0 --product-version=0.3.0.0 --noinclude-qt-translations --include-data-dir=configs=configs --include-data-dir=workflows=workflows
 
 [buildozer]
 

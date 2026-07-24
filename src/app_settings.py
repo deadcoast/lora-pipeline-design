@@ -10,10 +10,10 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
-from .app_models import AppSettings, ProjectDraft, TrainingPreset
+from .app_models import AppSettings, ProjectDraft, RunResult, TrainingPreset
 from .io_utils import atomic_write_text
 
-SETTINGS_SCHEMA_VERSION = 2
+SETTINGS_SCHEMA_VERSION = 3
 DATA_DIR_OVERRIDE = "MIVIM_LORA_PIPELINE_DATA_DIR"
 _APPLICATION_DIRECTORY = Path("MIVIM") / "LoRA Pipeline"
 
@@ -129,6 +129,39 @@ def _project_from_json(value: object, default: ProjectDraft) -> ProjectDraft:
     )
 
 
+def _run_result_from_json(value: object) -> RunResult | None:
+    if not isinstance(value, dict):
+        return None
+    project_name = _text(value.get("project_name"), "", allow_empty=True)
+    result_path = _path(value.get("result_path"), None)
+    completed_at = _text(value.get("completed_at"), "", allow_empty=True)
+    mode = value.get("mode")
+    raw_preset = value.get("preset")
+    if not isinstance(raw_preset, str):
+        return None
+    try:
+        preset = TrainingPreset(raw_preset)
+    except ValueError:
+        return None
+    if (
+        not project_name
+        or result_path is None
+        or not completed_at
+        or mode not in {"prepare", "full"}
+    ):
+        return None
+    return RunResult(
+        project_name=project_name,
+        mode=mode,
+        result_path=result_path,
+        completed_at=completed_at,
+        trigger=_text(value.get("trigger"), "", allow_empty=True),
+        preset=preset,
+        checkpoint=_text(value.get("checkpoint"), "", allow_empty=True),
+        lora_name=_text(value.get("lora_name"), "", allow_empty=True),
+    )
+
+
 def _settings_from_json(value: object) -> AppSettings:
     defaults = AppSettings()
     if not isinstance(value, dict):
@@ -137,13 +170,18 @@ def _settings_from_json(value: object) -> AppSettings:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in {1, SETTINGS_SCHEMA_VERSION}
+        or version not in {1, 2, SETTINGS_SCHEMA_VERSION}
     ):
         return defaults
 
     return AppSettings(
         schema_version=SETTINGS_SCHEMA_VERSION,
         comfy_host=_text(value.get("comfy_host"), defaults.comfy_host),
+        comfy_installation_id=_text(
+            value.get("comfy_installation_id"),
+            defaults.comfy_installation_id,
+            allow_empty=True,
+        ),
         comfy_lora_dir=_path(
             value.get("comfy_lora_dir"),
             defaults.comfy_lora_dir,
@@ -151,6 +189,11 @@ def _settings_from_json(value: object) -> AppSettings:
         comfy_checkpoint=_text(
             value.get("comfy_checkpoint"),
             defaults.comfy_checkpoint,
+        ),
+        confirmed_sdxl_checkpoint=_text(
+            value.get("confirmed_sdxl_checkpoint"),
+            defaults.confirmed_sdxl_checkpoint,
+            allow_empty=True,
         ),
         training_base_model=_path(
             value.get("training_base_model"),
@@ -182,6 +225,7 @@ def _settings_from_json(value: object) -> AppSettings:
             value.get("last_project"),
             defaults.last_project,
         ),
+        last_result=_run_result_from_json(value.get("last_result")),
     )
 
 
@@ -210,13 +254,30 @@ def _project_to_json(project: ProjectDraft) -> dict[str, object]:
     }
 
 
+def _run_result_to_json(result: RunResult | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    return {
+        "project_name": result.project_name,
+        "mode": result.mode,
+        "result_path": _path_for_json(result.result_path),
+        "completed_at": result.completed_at,
+        "trigger": result.trigger,
+        "preset": result.preset.value,
+        "checkpoint": result.checkpoint,
+        "lora_name": result.lora_name,
+    }
+
+
 def _settings_to_json(settings: AppSettings) -> dict[str, object]:
     """Serialize an explicit allowlist so credentials can never leak into JSON."""
     return {
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "comfy_host": settings.comfy_host,
+        "comfy_installation_id": settings.comfy_installation_id,
         "comfy_lora_dir": _path_for_json(settings.comfy_lora_dir),
         "comfy_checkpoint": settings.comfy_checkpoint,
+        "confirmed_sdxl_checkpoint": settings.confirmed_sdxl_checkpoint,
         "training_base_model": _path_for_json(settings.training_base_model),
         "ai_toolkit_dir": _path_for_json(settings.ai_toolkit_dir),
         "ai_toolkit_python": _path_for_json(settings.ai_toolkit_python),
@@ -225,6 +286,7 @@ def _settings_to_json(settings: AppSettings) -> dict[str, object]:
         "grids_dir": _path_for_json(settings.grids_dir),
         "run_configs_dir": _path_for_json(settings.run_configs_dir),
         "last_project": _project_to_json(settings.last_project),
+        "last_result": _run_result_to_json(settings.last_result),
     }
 
 

@@ -8,6 +8,7 @@ import pytest
 from src.app_models import (
     AppSettings,
     ProjectDraft,
+    RunResult,
     TrainingPreset,
 )
 from src.app_settings import (
@@ -26,10 +27,22 @@ def test_settings_round_trip_is_versioned_and_keeps_path_semantics(
     source.mkdir()
     settings = AppSettings(
         comfy_host="127.0.0.1:9000",
+        comfy_installation_id="portrait-desktop",
         comfy_lora_dir=Path("D:/Comfy Shared/models/loras"),
         comfy_checkpoint="realistic.safetensors",
+        confirmed_sdxl_checkpoint="realistic.safetensors",
         ai_toolkit_dir=Path("D:/tools/ai-toolkit"),
         ai_toolkit_python=Path("D:/tools/ai-toolkit/.venv/Scripts/python.exe"),
+        last_result=RunResult(
+            project_name="family_portrait",
+            mode="full",
+            result_path=Path("D:/MIVIM/grids/family_portrait_grid.png"),
+            completed_at="2026-07-24T12:00:00+00:00",
+            trigger="mivm person",
+            preset=TrainingPreset.QUALITY,
+            checkpoint="realistic.safetensors",
+            lora_name="family_portrait.safetensors",
+        ),
         last_project=ProjectDraft(
             project_name="family_portrait",
             source_dir=source,

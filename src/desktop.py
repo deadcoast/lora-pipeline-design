@@ -15,16 +15,20 @@ import argparse
 import os
 import subprocess
 import sys
+import traceback
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from PySide6.QtCore import (
+    QElapsedTimer,
     QObject,
     QProcess,
     QProcessEnvironment,
     QRunnable,
+    QSignalBlocker,
     Qt,
     QThreadPool,
     QTimer,
@@ -66,14 +70,22 @@ from PySide6.QtWidgets import (
 )
 
 from . import config
-from .app_models import AppSettings, ProjectDraft, TrainingPreset
+from .app_models import (
+    AppSettings,
+    ProjectDraft,
+    RunResult,
+    TrainingPreset,
+    ValidationRecovery,
+)
 from .app_service import (
     ApplicationService,
     PipelineCommand,
     ReadinessItem,
     ReadinessReport,
+    SourceSummary,
     inspect_source,
     stage_from_log,
+    verified_missing_lora_directory,
 )
 from .app_settings import (
     default_settings_path,
@@ -85,9 +97,13 @@ from .comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
 )
+from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
+from .photo_review import PhotoIssueDialog
+from .studio_logging import StudioLog, log_directory_for
 
 NAV_SETUP, NAV_PROJECT, NAV_RUN, NAV_RESULTS = range(4)
+RunFailureKind = Literal["generic", "oom", "trainer", "validation"]
 
 
 def _artifact_snapshot(path: Path) -> tuple[tuple[str, int, int], ...] | None:
@@ -203,7 +219,7 @@ def _app_icon() -> QIcon:
 
 class WorkerSignals(QObject):
     finished = Signal(object)
-    failed = Signal(str)
+    failed = Signal(str, str)
 
 
 class FunctionWorker(QRunnable):
@@ -218,8 +234,12 @@ class FunctionWorker(QRunnable):
         try:
             result = self.function()
         except Exception as exc:  # noqa: BLE001 - errors are rendered in the UI
+            message = str(exc).strip() or type(exc).__name__
+            technical_details = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
             try:
-                self.signals.failed.emit(str(exc))
+                self.signals.failed.emit(message, technical_details)
             except RuntimeError:
                 pass  # The application closed while this short check was finishing.
         else:
@@ -361,12 +381,18 @@ class MainWindow(QMainWindow):
             loaded_settings,
             self.settings_path,
         )
+        self.studio_log = StudioLog(log_directory_for(self.settings_path))
+        self.studio_log.info(
+            "session.started",
+            "MIVIM LoRA Studio started. Support logs stay on this computer.",
+        )
         self.service = service or ApplicationService()
         self.discovery: ComfyDesktopDiscovery | None = None
         self.comfy_status: ComfyApiStatus | None = None
         self.draft: ProjectDraft | None = None
         self.readiness_report: ReadinessReport | None = None
         self.source_folder: Path | None = None
+        self.source_summary: SourceSummary | None = None
         self.pipeline_process: QProcess | None = None
         self.pipeline_command: PipelineCommand | None = None
         self.pipeline_pid: int | None = None
@@ -377,11 +403,26 @@ class MainWindow(QMainWindow):
         self.thread_pool = QThreadPool.globalInstance()
         self._workers: list[FunctionWorker] = []
         self._latest_result: Path | None = None
+        self._displayed_result_record: RunResult | None = None
+        self._pending_validation_recovery: ValidationRecovery | None = None
+        self._recovery_before_run: ValidationRecovery | None = None
+        self._pipeline_line_buffer = ""
+        self._pipeline_recent_output = ""
+        self._last_determinate_progress = 0
+        self._training_progress_active = False
+        self._training_elapsed_clock = QElapsedTimer()
+        self._training_elapsed_timer = QTimer(self)
+        self._training_elapsed_timer.setInterval(250)
+        self._training_elapsed_timer.timeout.connect(self._update_training_elapsed)
+        self._trainer_stage_seen = False
+        self._run_failure_kind: RunFailureKind = "generic"
+        self._closing = False
         self._validated_settings: AppSettings | None = None
         self._validated_draft: ProjectDraft | None = None
         self._setup_request = 0
         self._source_request = 0
         self._readiness_request = 0
+        self._desktop_poll_remaining = 0
 
         self.setWindowTitle("MIVIM LoRA Studio")
         self.setWindowIcon(_app_icon())
@@ -392,6 +433,7 @@ class MainWindow(QMainWindow):
         self._populate_settings()
         self._populate_last_project()
         self._restore_last_result()
+        self._restore_validation_recovery()
         self._connect_form_invalidation()
         QTimer.singleShot(80, self.refresh_setup)
 
@@ -488,6 +530,14 @@ class MainWindow(QMainWindow):
         hero_text.addWidget(_title("Comfy Desktop"))
         self.comfy_summary_label = _body("Looking for the Windows desktop app…")
         hero_text.addWidget(self.comfy_summary_label)
+        self.installation_label = _hint("Desktop instance")
+        self.installation_combo = QComboBox()
+        self.installation_combo.setObjectName("comfyInstallationCombo")
+        self.installation_combo.setAccessibleName("Comfy Desktop instance")
+        self.installation_label.setVisible(False)
+        self.installation_combo.setVisible(False)
+        hero_text.addWidget(self.installation_label)
+        hero_text.addWidget(self.installation_combo)
         hero_layout.addLayout(hero_text, 1)
         self.comfy_badge = _status_badge("CHECKING", "warning")
         hero_layout.addWidget(self.comfy_badge)
@@ -499,7 +549,22 @@ class MainWindow(QMainWindow):
         self.retry_comfy_button.setObjectName("retryComfyButton")
         self.retry_comfy_button.clicked.connect(self.refresh_setup)
         hero_layout.addWidget(self.retry_comfy_button)
+        self.setup_logs_button = _button("Open local logs")
+        self.setup_logs_button.setObjectName("setupOpenLogsButton")
+        self.setup_logs_button.setAccessibleName(
+            "Open local support logs for this setup problem"
+        )
+        self.setup_logs_button.clicked.connect(self.open_logs_folder)
+        self.setup_logs_button.setVisible(False)
+        hero_layout.addWidget(self.setup_logs_button)
         page.addWidget(hero)
+
+        self.advanced_setup_toggle = QCheckBox("Show advanced paths and ports")
+        self.advanced_setup_toggle.setObjectName("advancedSetupToggle")
+        self.advanced_setup_toggle.setAccessibleName(
+            "Show technical setup paths and custom ComfyUI port"
+        )
+        page.addWidget(self.advanced_setup_toggle)
 
         form_grid = QGridLayout()
         form_grid.setHorizontalSpacing(16)
@@ -523,7 +588,19 @@ class MainWindow(QMainWindow):
         self.checkpoint_combo.setEditable(True)
         self.checkpoint_combo.setAccessibleName("SDXL validation checkpoint")
         model_layout.addWidget(self.checkpoint_combo)
-        model_layout.addWidget(_hint("Local training model file"))
+        self.sdxl_confirm_checkbox = QCheckBox(
+            "This is an SDXL base checkpoint (not a refiner)"
+        )
+        self.sdxl_confirm_checkbox.setObjectName("confirmSdxlCheckpoint")
+        self.sdxl_confirm_checkbox.setAccessibleName(
+            "Confirm the selected checkpoint is an SDXL base model"
+        )
+        self.sdxl_confirm_checkbox.setToolTip(
+            "Check the model's download page if you are unsure."
+        )
+        model_layout.addWidget(self.sdxl_confirm_checkbox)
+        self.base_model_path_label = _hint("Local training model file")
+        model_layout.addWidget(self.base_model_path_label)
         self.base_model_edit = QLineEdit()
         self.base_model_edit.setObjectName("trainingBaseModelEdit")
         self.base_model_edit.setPlaceholderText(
@@ -532,11 +609,13 @@ class MainWindow(QMainWindow):
         self.base_model_edit.setAccessibleName("Local SDXL training checkpoint file")
         base_model_row = QHBoxLayout()
         base_model_row.addWidget(self.base_model_edit, 1)
-        base_model_browse = _button("Browse")
-        base_model_browse.setObjectName("browseBaseModelButton")
-        base_model_browse.setAccessibleName("Browse for local SDXL checkpoint file")
-        base_model_browse.clicked.connect(self.choose_base_model)
-        base_model_row.addWidget(base_model_browse)
+        self.base_model_browse_button = _button("Browse")
+        self.base_model_browse_button.setObjectName("browseBaseModelButton")
+        self.base_model_browse_button.setAccessibleName(
+            "Browse for local SDXL checkpoint file"
+        )
+        self.base_model_browse_button.clicked.connect(self.choose_base_model)
+        base_model_row.addWidget(self.base_model_browse_button)
         model_layout.addLayout(base_model_row)
         self.model_hint = _hint("Models appear after a ComfyUI instance is running.")
         model_layout.addWidget(self.model_hint)
@@ -556,11 +635,11 @@ class MainWindow(QMainWindow):
         self.toolkit_dir_edit.setAccessibleName("ai-toolkit folder")
         toolkit_row = QHBoxLayout()
         toolkit_row.addWidget(self.toolkit_dir_edit, 1)
-        toolkit_browse = _button("Browse")
-        toolkit_browse.setObjectName("browseToolkitButton")
-        toolkit_browse.setAccessibleName("Browse for ai-toolkit folder")
-        toolkit_browse.clicked.connect(self.choose_toolkit_dir)
-        toolkit_row.addWidget(toolkit_browse)
+        self.toolkit_browse_button = _button("Browse")
+        self.toolkit_browse_button.setObjectName("browseToolkitButton")
+        self.toolkit_browse_button.setAccessibleName("Browse for ai-toolkit folder")
+        self.toolkit_browse_button.clicked.connect(self.choose_toolkit_dir)
+        toolkit_row.addWidget(self.toolkit_browse_button)
         trainer_layout.addLayout(toolkit_row)
         self.toolkit_python_edit = QLineEdit()
         self.toolkit_python_edit.setObjectName("toolkitPythonEdit")
@@ -570,16 +649,28 @@ class MainWindow(QMainWindow):
         self.toolkit_python_edit.setAccessibleName("ai-toolkit Python executable")
         python_row = QHBoxLayout()
         python_row.addWidget(self.toolkit_python_edit, 1)
-        python_browse = _button("Browse")
-        python_browse.setObjectName("browseToolkitPythonButton")
-        python_browse.setAccessibleName("Browse for ai-toolkit Python executable")
-        python_browse.clicked.connect(self.choose_toolkit_python)
-        python_row.addWidget(python_browse)
+        self.toolkit_python_browse_button = _button("Browse")
+        self.toolkit_python_browse_button.setObjectName("browseToolkitPythonButton")
+        self.toolkit_python_browse_button.setAccessibleName(
+            "Browse for ai-toolkit Python executable"
+        )
+        self.toolkit_python_browse_button.clicked.connect(self.choose_toolkit_python)
+        python_row.addWidget(self.toolkit_python_browse_button)
         trainer_layout.addLayout(python_row)
+        self.trainer_help_button = _button("Set up or repair trainer")
+        self.trainer_help_button.setObjectName("trainerHelpButton")
+        self.trainer_help_button.setAccessibleName(
+            "Open guided LoRA trainer setup and repair"
+        )
+        self.trainer_help_button.clicked.connect(self.show_trainer_help)
+        trainer_layout.addWidget(
+            self.trainer_help_button,
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
         form_grid.addWidget(trainer_card, 0, 1)
 
-        storage_card = _card()
-        storage_layout = QVBoxLayout(storage_card)
+        self.storage_card = _card()
+        storage_layout = QVBoxLayout(self.storage_card)
         storage_layout.setContentsMargins(18, 17, 18, 18)
         storage_layout.setSpacing(9)
         storage_layout.addWidget(_title("ComfyUI LoRA library"))
@@ -613,10 +704,10 @@ class MainWindow(QMainWindow):
         workspace_browse.clicked.connect(self.choose_workspace_dir)
         workspace_row.addWidget(workspace_browse)
         storage_layout.addLayout(workspace_row)
-        form_grid.addWidget(storage_card, 1, 0)
+        form_grid.addWidget(self.storage_card, 1, 0)
 
-        advanced_card = _card()
-        advanced_layout = QVBoxLayout(advanced_card)
+        self.connection_details_card = _card()
+        advanced_layout = QVBoxLayout(self.connection_details_card)
         advanced_layout.setContentsMargins(18, 17, 18, 18)
         advanced_layout.setSpacing(9)
         advanced_layout.addWidget(_title("Connection details"))
@@ -636,11 +727,24 @@ class MainWindow(QMainWindow):
         self.open_comfy_button.clicked.connect(self.open_comfy_ui)
         self.open_comfy_button.setEnabled(False)
         advanced_layout.addWidget(self.open_comfy_button)
-        form_grid.addWidget(advanced_card, 1, 1)
+        form_grid.addWidget(self.connection_details_card, 1, 1)
 
         form_grid.setColumnStretch(0, 1)
         form_grid.setColumnStretch(1, 1)
         page.addLayout(form_grid)
+        self._advanced_setup_widgets = (
+            self.base_model_path_label,
+            self.base_model_edit,
+            self.base_model_browse_button,
+            self.toolkit_dir_edit,
+            self.toolkit_browse_button,
+            self.toolkit_python_edit,
+            self.toolkit_python_browse_button,
+            self.storage_card,
+            self.connection_details_card,
+        )
+        self.advanced_setup_toggle.toggled.connect(self._set_advanced_setup_visible)
+        self._set_advanced_setup_visible(False)
 
         footer = QHBoxLayout()
         self.setup_save_note = _hint(
@@ -658,6 +762,15 @@ class MainWindow(QMainWindow):
         page.addLayout(footer)
         page.addStretch(1)
         return self._scroll_page(content)
+
+    def _set_advanced_setup_visible(self, visible: bool) -> None:
+        for widget in self._advanced_setup_widgets:
+            widget.setVisible(visible)
+        self.advanced_setup_toggle.setText(
+            "Hide advanced paths and ports"
+            if visible
+            else "Show advanced paths and ports"
+        )
 
     # ------------------------------------------------------------- project UI
     def _build_project_page(self) -> QWidget:
@@ -677,7 +790,14 @@ class MainWindow(QMainWindow):
         self.photo_drop.folder_selected.connect(self._photo_folder_changed)
         page.addWidget(self.photo_drop)
         self.photo_summary = _hint("No folder selected.")
-        page.addWidget(self.photo_summary)
+        photo_summary_row = QHBoxLayout()
+        photo_summary_row.addWidget(self.photo_summary, 1)
+        self.review_photos_button = _button("Review photo checks")
+        self.review_photos_button.setObjectName("reviewPhotoChecksButton")
+        self.review_photos_button.setEnabled(False)
+        self.review_photos_button.clicked.connect(self.review_photo_checks)
+        photo_summary_row.addWidget(self.review_photos_button)
+        page.addLayout(photo_summary_row)
 
         project_card = _card()
         grid = QGridLayout(project_card)
@@ -719,7 +839,7 @@ class MainWindow(QMainWindow):
         self.preset_combo.setAccessibleName("Training quality plan")
         grid.addWidget(self.preset_combo, 4, 0)
         self.preset_hint = _hint(
-            "Balanced uses 1024 px photos and three comparison strengths."
+            "Balanced uses 1024 px photos, a no-LoRA baseline, and three strengths."
         )
         grid.addWidget(self.preset_hint, 5, 0, 1, 2)
         self.preset_combo.currentIndexChanged.connect(self._preset_changed)
@@ -735,9 +855,14 @@ class MainWindow(QMainWindow):
             self.vision_checkbox.setChecked(False)
             self.vision_checkbox.setVisible(False)
         self.overwrite_checkbox = QCheckBox(
-            "Rebuild the prepared photos if this project already exists"
+            "Rebuild this project and replace its existing outputs"
         )
         self.overwrite_checkbox.setObjectName("overwriteCheck")
+        self.overwrite_checkbox.setToolTip(
+            "Keeps source photos untouched, but replaces this project's prepared "
+            "dataset and allows new checkpoints, grids, run records, and the "
+            "installed ComfyUI LoRA to supersede older outputs."
+        )
         grid.addWidget(self.vision_checkbox, 6, 0, 1, 2)
         grid.addWidget(self.overwrite_checkbox, 7, 0, 1, 2)
         grid.setColumnStretch(0, 1)
@@ -826,6 +951,16 @@ class MainWindow(QMainWindow):
         log_heading = QHBoxLayout()
         log_heading.addWidget(_title("Technical details"))
         log_heading.addStretch(1)
+        self.open_logs_button = _button("Open local logs")
+        self.open_logs_button.setObjectName("openLogsButton")
+        self.open_logs_button.setAccessibleName(
+            "Open the local MIVIM support log folder"
+        )
+        self.open_logs_button.setToolTip(
+            "Logs stay on this computer and may include local file paths."
+        )
+        self.open_logs_button.clicked.connect(self.open_logs_folder)
+        log_heading.addWidget(self.open_logs_button)
         self.cancel_button = _button("Stop safely", "dangerButton")
         self.cancel_button.setObjectName("cancelPipelineButton")
         self.cancel_button.clicked.connect(self.cancel_pipeline)
@@ -848,6 +983,34 @@ class MainWindow(QMainWindow):
         self.open_run_folder_button.clicked.connect(self.open_pipeline_output_folder)
         self.open_run_folder_button.setVisible(False)
         recovery_actions.addWidget(self.open_run_folder_button)
+        self.use_fast_after_run_button = _button(
+            "Use Fast & check again",
+            "primaryButton",
+        )
+        self.use_fast_after_run_button.setObjectName("useFastAfterRunButton")
+        self.use_fast_after_run_button.setAccessibleName(
+            "Switch to the lower-memory Fast plan and check the project again"
+        )
+        self.use_fast_after_run_button.clicked.connect(self.use_fast_after_oom)
+        self.use_fast_after_run_button.setVisible(False)
+        recovery_actions.addWidget(self.use_fast_after_run_button)
+        self.repair_trainer_after_run_button = _button(
+            "Repair trainer",
+            "primaryButton",
+        )
+        self.repair_trainer_after_run_button.setObjectName(
+            "repairTrainerAfterRunButton"
+        )
+        self.repair_trainer_after_run_button.clicked.connect(
+            self.repair_trainer_after_failure
+        )
+        self.repair_trainer_after_run_button.setVisible(False)
+        recovery_actions.addWidget(self.repair_trainer_after_run_button)
+        self.open_desktop_after_run_button = _button("Open Comfy Desktop")
+        self.open_desktop_after_run_button.setObjectName("openDesktopAfterRunButton")
+        self.open_desktop_after_run_button.clicked.connect(self.open_comfy_desktop)
+        self.open_desktop_after_run_button.setVisible(False)
+        recovery_actions.addWidget(self.open_desktop_after_run_button)
         self.retry_validation_button = _button("Retry validation only")
         self.retry_validation_button.setObjectName("retryValidationButton")
         self.retry_validation_button.clicked.connect(self.retry_validation)
@@ -860,7 +1023,9 @@ class MainWindow(QMainWindow):
         self.retry_after_run_button.setVisible(False)
         recovery_actions.addWidget(self.retry_after_run_button)
         monitor.addLayout(recovery_actions)
-        self.run_stack.addWidget(readiness_widget)
+        readiness_scroll = self._scroll_page(readiness_widget)
+        readiness_scroll.setObjectName("readinessScroll")
+        self.run_stack.addWidget(readiness_scroll)
         self.run_stack.addWidget(monitor_widget)
         page.addWidget(self.run_stack, 1)
         return content
@@ -907,16 +1072,55 @@ class MainWindow(QMainWindow):
         result_layout.addWidget(self.result_path_label)
         page.addWidget(result_card, 1)
 
+        self.comfy_handoff_card = _card()
+        handoff_layout = QHBoxLayout(self.comfy_handoff_card)
+        handoff_layout.setContentsMargins(18, 14, 18, 14)
+        handoff_text = QVBoxLayout()
+        handoff_text.addWidget(_title("Use this LoRA in ComfyUI"))
+        self.result_details_label = _body()
+        self.result_details_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        handoff_text.addWidget(self.result_details_label)
+        handoff_layout.addLayout(handoff_text, 1)
+        self.copy_result_setup_button = _button("Copy setup")
+        self.copy_result_setup_button.setObjectName("copyResultSetupButton")
+        self.copy_result_setup_button.clicked.connect(self.copy_result_setup)
+        handoff_layout.addWidget(self.copy_result_setup_button)
+        self.comfy_handoff_card.setVisible(False)
+        page.addWidget(self.comfy_handoff_card)
+
         actions = QHBoxLayout()
         self.open_result_button = _button("Open result folder")
         self.open_result_button.setObjectName("openResultButton")
         self.open_result_button.clicked.connect(self.open_result_folder)
         actions.addWidget(self.open_result_button)
+        self.open_full_grid_button = _button("View full-size grid")
+        self.open_full_grid_button.setObjectName("openFullGridButton")
+        self.open_full_grid_button.setAccessibleName(
+            "Open the validation comparison grid at full size"
+        )
+        self.open_full_grid_button.clicked.connect(self.open_full_size_grid)
+        self.open_full_grid_button.setVisible(False)
+        actions.addWidget(self.open_full_grid_button)
         self.result_open_comfy_button = _button("Open ComfyUI", "primaryButton")
         self.result_open_comfy_button.setObjectName("resultOpenComfyButton")
         self.result_open_comfy_button.clicked.connect(self.open_comfy_ui)
         self.result_open_comfy_button.setEnabled(False)
         actions.addWidget(self.result_open_comfy_button)
+        self.review_prepared_button = _button("Review photos & captions")
+        self.review_prepared_button.setObjectName("reviewPreparedButton")
+        self.review_prepared_button.clicked.connect(self.review_prepared_dataset)
+        self.review_prepared_button.setVisible(False)
+        actions.addWidget(self.review_prepared_button)
+        self.continue_training_button = _button(
+            "Check tools & continue training",
+            "primaryButton",
+        )
+        self.continue_training_button.setObjectName("continuePreparedTrainingButton")
+        self.continue_training_button.clicked.connect(self.continue_prepared_training)
+        self.continue_training_button.setVisible(False)
+        actions.addWidget(self.continue_training_button)
         actions.addStretch(1)
         new_project = _button("Train another version  →", "successButton")
         new_project.setObjectName("newProjectButton")
@@ -931,6 +1135,8 @@ class MainWindow(QMainWindow):
         function: Callable[[], object],
         success: Callable[[object], None],
         failure: Callable[[str], None] | None = None,
+        *,
+        operation: str = "background",
     ) -> None:
         worker = FunctionWorker(function)
         self._workers.append(worker)
@@ -938,11 +1144,20 @@ class MainWindow(QMainWindow):
         def done(result: object) -> None:
             if worker in self._workers:
                 self._workers.remove(worker)
+            if self._closing:
+                return
             success(result)
 
-        def failed(message: str) -> None:
+        def failed(message: str, technical_details: str) -> None:
             if worker in self._workers:
                 self._workers.remove(worker)
+            if self._closing:
+                return
+            self.studio_log.exception_details(
+                f"{operation}.failed",
+                message,
+                technical_details,
+            )
             if failure is not None:
                 failure(message)
             else:
@@ -956,6 +1171,7 @@ class MainWindow(QMainWindow):
         self._setup_request += 1
         request = self._setup_request
         self.retry_comfy_button.setEnabled(False)
+        self.setup_logs_button.setVisible(False)
         self.comfy_badge.setText("CHECKING")
         self.comfy_badge.setObjectName("statusWarning")
         self.comfy_badge.style().unpolish(self.comfy_badge)
@@ -963,18 +1179,22 @@ class MainWindow(QMainWindow):
         self.comfy_summary_label.setText(
             "Checking the installed Desktop instances and local ComfyUI API…"
         )
+        self.studio_log.info(
+            "setup.check.started",
+            "Checking local Comfy Desktop installations and API availability.",
+        )
 
         original = self._collect_settings()
 
         def work() -> tuple[AppSettings, ComfyDesktopDiscovery, ComfyApiStatus]:
             discovery = self.service.discover_comfy()
-            applied, status = self.service.setup_snapshot(original, discovery)
-            return applied, discovery, status
+            return self.service.setup_snapshot(original, discovery)
 
         self._run_worker(
             work,
             lambda result: self._setup_refreshed(request, original, result),
             lambda message: self._setup_failed_for(request, message),
+            operation="setup.check",
         )
 
     def _setup_refreshed(
@@ -998,13 +1218,18 @@ class MainWindow(QMainWindow):
         self.comfy_status = status
         self._populate_settings()
         self.retry_comfy_button.setEnabled(True)
-        self.open_desktop_button.setEnabled(discovery.launcher.supported)
         self.open_comfy_button.setEnabled(status.reachable)
         self.result_open_comfy_button.setEnabled(status.reachable)
         local_installations = tuple(
             installation
             for installation in discovery.installations
             if installation.is_local
+        )
+        self.open_desktop_button.setText(
+            "Open Comfy Desktop" if local_installations else "Install Comfy Desktop"
+        )
+        self.open_desktop_button.setEnabled(
+            discovery.launcher.supported or not local_installations
         )
         if status.reachable:
             self.comfy_badge.setText("CONNECTED")
@@ -1037,14 +1262,30 @@ class MainWindow(QMainWindow):
         )
         self.comfy_badge.style().unpolish(self.comfy_badge)
         self.comfy_badge.style().polish(self.comfy_badge)
+        self.setup_logs_button.setVisible(False)
+        self.studio_log.info(
+            "setup.check.finished",
+            (
+                f"state={state}; local_installations={len(local_installations)}; "
+                f"api_reachable={status.reachable}; checkpoints="
+                f"{len(status.checkpoints)}"
+            ),
+        )
         self.save_current_settings(silent=True)
+        if status.reachable:
+            self._desktop_poll_remaining = 0
+        elif self._desktop_poll_remaining > 0:
+            self._desktop_poll_remaining -= 1
+            QTimer.singleShot(5000, self.refresh_setup)
 
     def _setup_failed_for(self, request: int, message: str) -> None:
         if request == self._setup_request:
             self._setup_failed(message)
 
     def _setup_failed(self, message: str) -> None:
+        self.studio_log.error_event("setup.check.failed", message)
         self.retry_comfy_button.setEnabled(True)
+        self.setup_logs_button.setVisible(True)
         self.comfy_badge.setText("CHECK FAILED")
         self.comfy_badge.setObjectName("statusError")
         self.comfy_badge.style().unpolish(self.comfy_badge)
@@ -1054,6 +1295,31 @@ class MainWindow(QMainWindow):
         )
 
     def _populate_settings(self) -> None:
+        local_installations = (
+            tuple(
+                installation
+                for installation in self.discovery.installations
+                if installation.is_local
+            )
+            if self.discovery is not None
+            else ()
+        )
+        with QSignalBlocker(self.installation_combo):
+            self.installation_combo.clear()
+            for installation in local_installations:
+                label = installation.name + (
+                    f"  ·  {installation.version}" if installation.version else ""
+                )
+                self.installation_combo.addItem(label, installation.id)
+            selected_index = self.installation_combo.findData(
+                self.settings.comfy_installation_id
+            )
+            if selected_index >= 0:
+                self.installation_combo.setCurrentIndex(selected_index)
+        show_instance_picker = len(local_installations) > 1
+        self.installation_label.setVisible(show_instance_picker)
+        self.installation_combo.setVisible(show_instance_picker)
+
         self.host_edit.setText(self.settings.comfy_host)
         self.host_edit.setCursorPosition(0)
         self.lora_dir_edit.setText(
@@ -1096,6 +1362,12 @@ class MainWindow(QMainWindow):
             self.checkpoint_combo.addItem(previous)
         if previous:
             self.checkpoint_combo.setCurrentText(previous)
+        with QSignalBlocker(self.sdxl_confirm_checkbox):
+            self.sdxl_confirm_checkbox.setChecked(
+                bool(previous)
+                and self.settings.confirmed_sdxl_checkpoint.casefold()
+                == previous.casefold()
+            )
         if names:
             self.model_hint.setText(
                 f"{len(names)} model(s) reported by the running ComfyUI instance."
@@ -1104,6 +1376,16 @@ class MainWindow(QMainWindow):
             self.model_hint.setText(
                 "No checkpoint is currently visible. Add an SDXL model in ComfyUI."
             )
+        if self.discovery is not None:
+            matches = self.service.resolve_checkpoint_paths(
+                self.discovery,
+                previous,
+            )
+            if len(matches) > 1:
+                self.model_hint.setText(
+                    f"{len(matches)} local files share this checkpoint name. "
+                    "Choose the exact file below before training."
+                )
 
     def _populate_last_project(self) -> None:
         last = self.settings.last_project
@@ -1120,20 +1402,85 @@ class MainWindow(QMainWindow):
             self.photo_drop.set_folder(last.source_dir)
 
     def _restore_last_result(self) -> None:
-        name = self.settings.last_project.project_name.strip()
-        if not name:
+        record = self.settings.last_result
+        if record is None:
             return
         try:
-            config.validate_project_name(name)
+            config.validate_project_name(record.project_name)
         except ValueError:
             return
-        candidates = (
-            self.service.project_path(self.settings.grids_dir) / f"{name}_grid.png",
-            self.service.project_path(self.settings.datasets_dir) / name,
+        result = self.service.project_path(record.result_path)
+        expected_kind = (
+            result.is_dir() if record.mode == "prepare" else result.is_file()
         )
-        result = next((path for path in candidates if path.exists()), None)
-        if result is not None:
-            self._show_result(result)
+        if result.exists() and expected_kind:
+            self._show_result(result, record)
+
+    def _draft_for_recovery(self, recovery: ValidationRecovery) -> ProjectDraft:
+        last = self.settings.last_project
+        source_dir = (
+            last.source_dir if last.project_name == recovery.project_name else None
+        )
+        return ProjectDraft(
+            project_name=recovery.project_name,
+            source_dir=source_dir,
+            trigger=recovery.trigger,
+            preset=recovery.preset,
+        )
+
+    def _restore_validation_recovery(self) -> None:
+        """Surface an installed LoRA whose validation did not finish before exit."""
+
+        project_name = self.settings.last_project.project_name.strip()
+        if not project_name:
+            return
+        try:
+            recovery = self.service.read_validation_recovery(
+                self.settings,
+                project_name,
+            )
+        except ValueError:
+            return
+        if recovery is None or recovery.state != "validation_pending":
+            return
+        draft = self._draft_for_recovery(recovery)
+        self._pending_validation_recovery = recovery
+        self._installed_lora_name = recovery.lora_name
+        self.draft = draft
+        try:
+            self.pipeline_command = self.service.build_validation_command(
+                self.settings,
+                draft,
+                recovery.lora_name,
+                checkpoint=recovery.checkpoint,
+            )
+        except (TypeError, ValueError):
+            self.pipeline_command = None
+        self.run_stack.setCurrentIndex(1)
+        self.run_progress.setValue(78)
+        self.run_stage_label.setText("LoRA installed; validation needs attention")
+        self.run_detail_label.setText(
+            "Training is already complete and the LoRA is safely installed. Open "
+            "the selected ComfyUI instance, then retry validation without repeating "
+            "photo preparation or training."
+        )
+        self.run_log.setPlainText(
+            "[studio] Recovered an unfinished ComfyUI validation.\n"
+            f"[studio] Installed LoRA: {recovery.lora_name}\n"
+        )
+        self.cancel_button.setEnabled(False)
+        self.nav_buttons[NAV_RUN].setEnabled(True)
+        self.pages.setCurrentIndex(NAV_RUN)
+        for position, button in enumerate(self.nav_buttons):
+            button.setChecked(position == NAV_RUN)
+        self._show_recovery_actions(True, "validation")
+        self.studio_log.warning(
+            "validation.recovered",
+            (
+                f"project={recovery.project_name}; "
+                f"lora={recovery.lora_name}; state={recovery.state}"
+            ),
+        )
 
     def _collect_settings(self) -> AppSettings:
         if not hasattr(self, "host_edit"):
@@ -1153,8 +1500,16 @@ class MainWindow(QMainWindow):
         return replace(
             self.settings,
             comfy_host=self.host_edit.text().strip() or "127.0.0.1:8188",
+            comfy_installation_id=str(
+                self.installation_combo.currentData()
+                or self.settings.comfy_installation_id
+                or ""
+            ),
             comfy_lora_dir=optional_path(self.lora_dir_edit.text()),
             comfy_checkpoint=checkpoint,
+            confirmed_sdxl_checkpoint=(
+                checkpoint if self.sdxl_confirm_checkbox.isChecked() else ""
+            ),
             training_base_model=optional_path(self.base_model_edit.text()),
             ai_toolkit_dir=optional_path(self.toolkit_dir_edit.text()),
             ai_toolkit_python=optional_path(self.toolkit_python_edit.text()),
@@ -1186,6 +1541,36 @@ class MainWindow(QMainWindow):
             self.lora_dir_edit.setText(selected)
             self._invalidate_readiness()
 
+    def create_verified_lora_folder(self) -> None:
+        """Create only the missing LoRA directory proven by selected discovery."""
+
+        settings = self._collect_settings()
+        target = verified_missing_lora_directory(settings, self.discovery)
+        if target is None:
+            self._show_error(
+                "LoRA folder was not created",
+                "The selected Comfy Desktop model location could not be verified. "
+                "Refresh the connection or choose its existing LoRA folder.",
+            )
+            return
+        try:
+            target.mkdir(parents=False, exist_ok=False)
+        except OSError as exc:
+            self._show_error(
+                "LoRA folder was not created",
+                f"Windows could not create the verified folder:\n{target}\n\n{exc}",
+            )
+            return
+        self.lora_dir_edit.setText(str(target))
+        self.save_current_settings(silent=True)
+        self.studio_log.info(
+            "setup.lora_folder.created",
+            f"Created the selected Desktop instance's LoRA folder: {target}",
+        )
+        self._invalidate_readiness()
+        self.refresh_setup()
+        QTimer.singleShot(0, self.run_readiness_checks)
+
     def choose_base_model(self) -> None:
         start = self.base_model_edit.text().strip()
         if not start:
@@ -1213,6 +1598,7 @@ class MainWindow(QMainWindow):
             return
         folder = Path(selected)
         self.toolkit_dir_edit.setText(str(folder))
+        self.toolkit_python_edit.clear()
         for python in (
             folder / "venv" / "Scripts" / "python.exe",
             folder / ".venv" / "Scripts" / "python.exe",
@@ -1239,6 +1625,52 @@ class MainWindow(QMainWindow):
             self.toolkit_python_edit.setCursorPosition(0)
             self._invalidate_readiness()
 
+    def show_trainer_help(self) -> None:
+        box = QMessageBox(self)
+        box.setWindowTitle("Set up or repair the LoRA trainer")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText("ai-toolkit needs its own working Python and NVIDIA PyTorch.")
+        box.setInformativeText(
+            "1. Choose the ai-toolkit folder.\n"
+            "2. Choose that folder's venv Python if it was not detected.\n"
+            "3. Install the current CUDA build from PyTorch's official selector, "
+            "then use Check again.\n\n"
+            "The studio tests the exact Python used by the real training run."
+        )
+        choose_folder = box.addButton(
+            "Choose ai-toolkit folder",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        choose_python = box.addButton(
+            "Choose venv Python",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        toolkit_guide = box.addButton(
+            "Open ai-toolkit guide",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        pytorch_guide = box.addButton(
+            "Open PyTorch selector",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        check_again = box.addButton(
+            "Check on Review page",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        box.addButton(QMessageBox.StandardButton.Close)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is choose_folder:
+            self.choose_toolkit_dir()
+        elif clicked is choose_python:
+            self.choose_toolkit_python()
+        elif clicked is toolkit_guide:
+            QDesktopServices.openUrl(QUrl("https://github.com/ostris/ai-toolkit"))
+        elif clicked is pytorch_guide:
+            QDesktopServices.openUrl(QUrl("https://pytorch.org/get-started/locally/"))
+        elif clicked is check_again:
+            self.review_project()
+
     def choose_workspace_dir(self) -> None:
         start = self.workspace_dir_edit.text().strip() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(
@@ -1253,6 +1685,20 @@ class MainWindow(QMainWindow):
             self._invalidate_readiness()
 
     def open_comfy_desktop(self) -> None:
+        local_installations = (
+            tuple(
+                installation
+                for installation in self.discovery.installations
+                if installation.is_local
+            )
+            if self.discovery is not None
+            else ()
+        )
+        if not local_installations:
+            QDesktopServices.openUrl(
+                QUrl("https://docs.comfy.org/installation/desktop/windows")
+            )
+            return
         if self.discovery is None or not self.discovery.launcher.supported:
             self._show_error(
                 "Comfy Desktop is not available",
@@ -1274,14 +1720,22 @@ class MainWindow(QMainWindow):
         self.comfy_summary_label.setText(
             "Comfy Desktop is opening. The studio will check the local instance again."
         )
-        QTimer.singleShot(5000, self.refresh_setup)
+        self._desktop_poll_remaining = 18
+        QTimer.singleShot(3000, self.refresh_setup)
 
     def open_comfy_ui(self) -> None:
-        host = self.host_edit.text().strip() or self.settings.comfy_host
-        cleaned = (
-            host.strip().removeprefix("http://").removeprefix("https://").rstrip("/")
+        host = (
+            self.comfy_status.host
+            if self.comfy_status is not None and self.comfy_status.reachable
+            else None
         )
-        if not cleaned or not QDesktopServices.openUrl(QUrl(f"http://{cleaned}")):
+        if host is None:
+            self._show_error(
+                "ComfyUI is not connected",
+                "Check the local connection before opening ComfyUI.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl(f"http://{host}")):
             self._show_error(
                 "Could not open ComfyUI",
                 "Windows could not open the local ComfyUI address in a browser.",
@@ -1294,8 +1748,8 @@ class MainWindow(QMainWindow):
         self.show_page(NAV_PROJECT)
 
     def _connect_form_invalidation(self) -> None:
+        self.host_edit.textEdited.connect(self._connection_changed)
         for editor in (
-            self.host_edit,
             self.lora_dir_edit,
             self.toolkit_dir_edit,
             self.toolkit_python_edit,
@@ -1305,11 +1759,30 @@ class MainWindow(QMainWindow):
             self.trigger_edit,
         ):
             editor.textEdited.connect(self._invalidate_readiness)
+        self.installation_combo.currentIndexChanged.connect(self._installation_changed)
         self.checkpoint_combo.currentTextChanged.connect(self._checkpoint_changed)
+        self.sdxl_confirm_checkbox.toggled.connect(self._invalidate_readiness)
         self.vision_checkbox.toggled.connect(self._invalidate_readiness)
         self.overwrite_checkbox.toggled.connect(self._invalidate_readiness)
 
+    def _connection_changed(self, *_args: object) -> None:
+        self.comfy_status = None
+        self.open_comfy_button.setEnabled(False)
+        self.result_open_comfy_button.setEnabled(False)
+        self._invalidate_readiness()
+
+    def _installation_changed(self, *_args: object) -> None:
+        self._connection_changed()
+        QTimer.singleShot(0, self.refresh_setup)
+
     def _checkpoint_changed(self, checkpoint: str) -> None:
+        confirmed = self.settings.confirmed_sdxl_checkpoint
+        with QSignalBlocker(self.sdxl_confirm_checkbox):
+            self.sdxl_confirm_checkbox.setChecked(
+                bool(checkpoint)
+                and bool(confirmed)
+                and checkpoint.casefold() == confirmed.casefold()
+            )
         resolved = self.service.resolve_checkpoint_path(self.discovery, checkpoint)
         current = self.base_model_edit.text().strip()
         selected_name = Path(checkpoint.replace("\\", "/")).name.casefold()
@@ -1338,6 +1811,8 @@ class MainWindow(QMainWindow):
 
     def _photo_folder_changed(self, folder: Path) -> None:
         self.source_folder = folder
+        self.source_summary = None
+        self.review_photos_button.setEnabled(False)
         self._invalidate_readiness()
         if not self.project_name_edit.text().strip():
             safe = "".join(
@@ -1347,6 +1822,10 @@ class MainWindow(QMainWindow):
             if safe:
                 self.project_name_edit.setText(f"{safe}_v1")
         self.photo_summary.setText("Inspecting the selected photos…")
+        self.studio_log.info(
+            "photos.check.started",
+            f"Inspecting the selected folder: {folder}",
+        )
 
         preset = TrainingPreset(self.preset_combo.currentData())
         self._source_request += 1
@@ -1357,6 +1836,7 @@ class MainWindow(QMainWindow):
             lambda message: self._source_inspection_failed(
                 request, folder, preset, message
             ),
+            operation="photos.check",
         )
 
     def _source_inspected_for(
@@ -1386,29 +1866,54 @@ class MainWindow(QMainWindow):
             and folder == self.source_folder
             and preset.value == self.preset_combo.currentData()
         ):
+            self.studio_log.error_event("photos.check.failed", message)
+            self.source_summary = None
+            self.review_photos_button.setEnabled(False)
             self.photo_summary.setText(f"The photos could not be inspected: {message}")
 
     def _source_inspected(self, result: object) -> None:
-        summary = result
-        detail = f"{summary.usable_count} usable photo(s)"  # type: ignore[attr-defined]
-        if summary.unreadable_count:  # type: ignore[attr-defined]
-            detail += f" • {summary.unreadable_count} unreadable"  # type: ignore[attr-defined]
-        if summary.small_count:  # type: ignore[attr-defined]
-            detail += f" • {summary.small_count} will be enlarged"  # type: ignore[attr-defined]
-        if summary.duplicate_count:  # type: ignore[attr-defined]
-            detail += f" • {summary.duplicate_count} exact duplicate(s)"  # type: ignore[attr-defined]
+        summary = cast(SourceSummary, result)
+        self.studio_log.info(
+            "photos.check.finished",
+            (
+                f"usable={summary.usable_count}; unreadable="
+                f"{summary.unreadable_count}; too_small={summary.small_count}; "
+                f"issues={len(summary.issues)}"
+            ),
+        )
+        self.source_summary = summary
+        self.review_photos_button.setEnabled(True)
+        detail = f"{summary.usable_count} usable photo(s)"
+        if summary.unreadable_count:
+            detail += f" • {summary.unreadable_count} unreadable"
+        if summary.small_count:
+            detail += f" • {summary.small_count} will be enlarged"
+        if summary.duplicate_count:
+            detail += f" • {summary.duplicate_count} exact duplicate(s)"
+        if summary.blurry_count:
+            detail += f" • {summary.blurry_count} may be blurry"
+        if summary.near_duplicate_count:
+            detail += f" • {summary.near_duplicate_count} very similar"
         self.photo_summary.setText(detail)
+
+    def review_photo_checks(self) -> None:
+        summary = self.source_summary
+        if summary is None:
+            return
+        dialog = PhotoIssueDialog(summary, self)
+        if dialog.exec():
+            self._photo_folder_changed(summary.folder)
 
     def _preset_changed(self) -> None:
         preset = TrainingPreset(self.preset_combo.currentData())
         descriptions = {
             TrainingPreset.FAST: (
                 "Fast draft uses 900 training steps, rank 8, 768 px preparation, "
-                "and one validation strength."
+                "a no-LoRA baseline, and one validation strength."
             ),
             TrainingPreset.BALANCED: (
                 "Balanced uses 2,000 steps, rank 16, 1024 px preparation, and "
-                "three comparison strengths."
+                "a no-LoRA baseline plus three comparison strengths."
             ),
             TrainingPreset.QUALITY: (
                 "High quality uses 3,000 steps, rank 32, and a wider comparison "
@@ -1472,12 +1977,17 @@ class MainWindow(QMainWindow):
         self.diagnostics_layout.addWidget(_body("Working…"))
         self.start_button.setEnabled(False)
         self.prepare_button.setEnabled(False)
+        self.studio_log.info(
+            "readiness.check.started",
+            f"Checking project: {draft.project_name or '(unnamed)'}",
+        )
         self._run_worker(
-            lambda: self.service.readiness(settings, draft),
+            lambda: self.service.readiness(settings, draft, self.discovery),
             lambda result: self._readiness_finished_for(
                 request, settings, draft, result
             ),
             lambda message: self._readiness_failed_for(request, message),
+            operation="readiness.check",
         )
 
     def _readiness_finished_for(
@@ -1509,6 +2019,25 @@ class MainWindow(QMainWindow):
         report_items = report.items
         errors = sum(item.state == "error" for item in report_items)
         warnings = sum(item.state == "warning" for item in report_items)
+        self.studio_log.info(
+            "readiness.check.finished",
+            (
+                f"errors={errors}; warnings={warnings}; "
+                f"can_prepare={report.can_prepare}; "
+                f"can_run_full={report.can_run_full}"
+            ),
+        )
+        for item in report_items:
+            if item.state == "error":
+                self.studio_log.error_event(
+                    f"readiness.item.{item.code}",
+                    f"{item.title}: {item.detail}",
+                )
+            elif item.state == "warning":
+                self.studio_log.warning(
+                    f"readiness.item.{item.code}",
+                    f"{item.title}: {item.detail}",
+                )
         if not errors:
             self.readiness_summary.setText(
                 "Everything required for a full run is ready."
@@ -1525,12 +2054,19 @@ class MainWindow(QMainWindow):
             )
         self.start_button.setEnabled(report.can_run_full)
         self.prepare_button.setEnabled(report.can_prepare)
+        if report.prepared is not None and report.prepared.ready:
+            self.start_button.setText("Continue with training")
+            self.prepare_button.setText("Photos already prepared")
+        else:
+            self.start_button.setText("Start full LoRA run")
+            self.prepare_button.setText("Prepare photos only")
 
     def _readiness_failed_for(self, request: int, message: str) -> None:
         if request == self._readiness_request:
             self._readiness_failed(message)
 
     def _readiness_failed(self, message: str) -> None:
+        self.studio_log.error_event("readiness.check.failed", message)
         _layout_clear(self.diagnostics_layout)
         self.diagnostics_layout.addWidget(
             DiagnosticCard(
@@ -1547,7 +2083,9 @@ class MainWindow(QMainWindow):
         self.readiness_summary.setText("The setup check could not finish.")
 
     def _handle_diagnostic_action(self, item: ReadinessItem) -> None:
-        if item.code in {"project", "collision"}:
+        if item.action in {"Review prepared captions", "Review prepared files"}:
+            self.review_prepared_dataset()
+        elif item.code in {"project", "collision"}:
             self.show_page(NAV_PROJECT)
             self.project_name_edit.setFocus()
         elif item.code in {"trigger", "captions"}:
@@ -1558,31 +2096,75 @@ class MainWindow(QMainWindow):
                 self.trigger_edit.setFocus()
         elif item.code == "photos":
             self.show_page(NAV_PROJECT)
-            self.photo_drop._browse()
+            if self.source_summary is not None:
+                self.review_photo_checks()
+            else:
+                self.photo_drop._browse()
         elif item.code == "comfy":
             self.show_page(NAV_SETUP)
             self.open_comfy_desktop()
         elif item.code == "checkpoint":
             self.show_page(NAV_SETUP)
-            self.checkpoint_combo.setFocus()
-            self.checkpoint_combo.showPopup()
+            if item.action == "Confirm this is an SDXL base checkpoint":
+                self.confirm_sdxl_checkpoint()
+            else:
+                self.checkpoint_combo.setFocus()
+                self.checkpoint_combo.showPopup()
+        elif item.code == "connection":
+            self.show_page(NAV_SETUP)
+            self.installation_combo.setFocus()
+            if self.installation_combo.isVisible():
+                self.installation_combo.showPopup()
         elif item.code == "base_model":
             self.show_page(NAV_SETUP)
             self.choose_base_model()
         elif item.code == "lora_dir":
             self.show_page(NAV_SETUP)
-            self.choose_lora_dir()
+            if item.action == "Create LoRA folder":
+                self.create_verified_lora_folder()
+            else:
+                self.choose_lora_dir()
         elif item.code == "trainer":
             self.show_page(NAV_SETUP)
-            if "Python" in item.action:
-                self.choose_toolkit_python()
-            else:
-                self.choose_toolkit_dir()
+            self.show_trainer_help()
         elif item.code in {"storage", "training_storage"}:
             self.show_page(NAV_SETUP)
             self.choose_workspace_dir()
         elif item.code == "internal":
             self.run_readiness_checks()
+
+    def confirm_sdxl_checkpoint(self) -> None:
+        checkpoint = self.checkpoint_combo.currentText().strip()
+        if not checkpoint:
+            self.checkpoint_combo.setFocus()
+            self.checkpoint_combo.showPopup()
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("Confirm the SDXL base model")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText(f"Use “{checkpoint}” for both training and validation?")
+        box.setInformativeText(
+            "Only confirm if the model's download page says it is an SDXL base "
+            "checkpoint. Do not use an SD 1.5 model, an SDXL refiner, or a LoRA. "
+            "Using the wrong architecture wastes the training run."
+        )
+        confirm_button = box.addButton(
+            "Confirm SDXL base model",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        choose_button = box.addButton(
+            "Choose another model",
+            QMessageBox.ButtonRole.ActionRole,
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() is confirm_button:
+            self.sdxl_confirm_checkbox.setChecked(True)
+            self.save_current_settings(silent=True)
+            self.run_readiness_checks()
+        elif box.clickedButton() is choose_button:
+            self.checkpoint_combo.setFocus()
+            self.checkpoint_combo.showPopup()
 
     def start_pipeline(self, mode: str) -> None:
         if mode not in {"full", "prepare"}:
@@ -1646,9 +2228,34 @@ class MainWindow(QMainWindow):
         stage_label: str,
     ) -> None:
         self.pipeline_command = command
+        self.pipeline_pid = None
+        active_draft = self._validated_draft or self.draft
+        active_settings = self._validated_settings or self._collect_settings()
+        self._recovery_before_run = (
+            self.service.read_validation_recovery(
+                active_settings,
+                active_draft.project_name,
+            )
+            if active_draft is not None and active_draft.project_name
+            else None
+        )
+        self._pipeline_line_buffer = ""
+        self._pipeline_recent_output = ""
+        self._stop_training_progress(3)
+        self._trainer_stage_seen = False
+        self._run_failure_kind = "generic"
+        if command.mode != "validate":
+            self._installed_lora_name = None
         self.run_cancelled = False
         self._run_terminal_handled = False
         self._result_before = _artifact_snapshot(command.expected_result)
+        self.studio_log.info(
+            "pipeline.started",
+            (f"mode={command.mode}; expected_result={command.expected_result}"),
+        )
+        self.pages.setCurrentIndex(NAV_RUN)
+        for position, button in enumerate(self.nav_buttons):
+            button.setChecked(position == NAV_RUN)
         self.run_stack.setCurrentIndex(1)
         self.run_log.clear()
         self.run_stage_label.setText(stage_label)
@@ -1656,7 +2263,6 @@ class MainWindow(QMainWindow):
             "This uses the real project pipeline. Technical output is shown below "
             "if you need support."
         )
-        self.run_progress.setValue(3)
         self.cancel_button.setEnabled(True)
         self._show_recovery_actions(False)
         for button in self.nav_buttons:
@@ -1689,20 +2295,83 @@ class MainWindow(QMainWindow):
         )
         if not data:
             return
+        self._pipeline_recent_output = (self._pipeline_recent_output + data)[
+            -128 * 1024 :
+        ]
+        self.studio_log.pipeline_output(data)
         self.run_log.moveCursor(QTextCursor.MoveOperation.End)
         self.run_log.insertPlainText(data)
         self.run_log.ensureCursorVisible()
-        for line in data.splitlines():
-            progress = stage_from_log(line)
-            if progress is not None:
-                value, label = progress
-                self.run_progress.setValue(max(self.run_progress.value(), value))
+        combined = f"{self._pipeline_line_buffer}{data}"
+        self._pipeline_line_buffer = ""
+        for part in combined.splitlines(keepends=True):
+            if part.endswith(("\n", "\r")):
+                self._process_pipeline_line(part.rstrip("\r\n"))
+            else:
+                self._pipeline_line_buffer = part
+
+    def _process_pipeline_line(self, line: str) -> None:
+        progress = stage_from_log(line)
+        if progress is not None:
+            value, label = progress
+            if value == 42:
+                self._trainer_stage_seen = True
+                self._start_training_progress(label)
+            else:
+                self._stop_training_progress(
+                    max(self._last_determinate_progress, value)
+                )
                 self.run_stage_label.setText(label)
-            marker = "[pipeline] Copied LoRA -> "
-            if marker in line:
-                installed = Path(line.partition(marker)[2].strip()).name
-                if installed.casefold().endswith(".safetensors"):
-                    self._installed_lora_name = installed
+                if value > 42:
+                    self.run_detail_label.setText(
+                        "Training is complete. ComfyUI is installing and checking "
+                        "the LoRA now."
+                    )
+
+    def _start_training_progress(self, label: str) -> None:
+        """Show honest activity and elapsed time for a stage with no percentage."""
+
+        if not self._training_progress_active:
+            self._training_progress_active = True
+            self._training_elapsed_clock.start()
+            self._training_elapsed_timer.start()
+            self.run_progress.setRange(0, 0)
+        self.run_stage_label.setText(label)
+        self._update_training_elapsed()
+
+    def _update_training_elapsed(self) -> None:
+        if (
+            not self._training_progress_active
+            or not self._training_elapsed_clock.isValid()
+        ):
+            return
+        total_seconds = max(0, self._training_elapsed_clock.elapsed() // 1000)
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        elapsed = (
+            f"{hours}:{minutes:02d}:{seconds:02d}"
+            if hours
+            else f"{minutes:02d}:{seconds:02d}"
+        )
+        self.run_detail_label.setText(
+            f"Training is running • Elapsed {elapsed}. The moving bar means the "
+            "trainer is still working."
+        )
+
+    def _stop_training_progress(self, value: int | None = None) -> None:
+        """Return the progress bar to a concrete percentage for bounded stages."""
+
+        self._training_elapsed_timer.stop()
+        self._training_progress_active = False
+        if value is not None:
+            self._last_determinate_progress = max(0, min(100, value))
+        self.run_progress.setRange(0, 100)
+        self.run_progress.setValue(self._last_determinate_progress)
+
+    def _flush_pipeline_line_buffer(self) -> None:
+        if self._pipeline_line_buffer:
+            self._process_pipeline_line(self._pipeline_line_buffer)
+            self._pipeline_line_buffer = ""
 
     def cancel_pipeline(self) -> None:
         process = self.pipeline_process
@@ -1723,6 +2392,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
         if dialog.clickedButton() is not stop_button:
             return
+        self.studio_log.warning(
+            "pipeline.cancelled", "The user stopped the active run."
+        )
         self.run_cancelled = True
         self.cancel_button.setEnabled(False)
         self.run_stage_label.setText("Stopping safely…")
@@ -1761,19 +2433,74 @@ class MainWindow(QMainWindow):
             return
         if error == QProcess.ProcessError.Crashed and self.run_cancelled:
             return
+        self.studio_log.error_event(
+            "pipeline.process.error",
+            f"error={error.name}; detail={process.errorString()}",
+        )
         self.run_log.appendPlainText(
             f"\n[studio] Could not run the pipeline: {process.errorString()}"
         )
         if error == QProcess.ProcessError.FailedToStart:
+            self.pipeline_pid = None
             self._run_terminal_handled = True
+            self._stop_training_progress(0)
             self.cancel_button.setEnabled(False)
             self.run_stage_label.setText("The pipeline could not start")
             self.run_detail_label.setText(
                 "No work was started. Edit the setup or check again, then retry."
             )
-            self.run_progress.setValue(0)
             self._restore_navigation()
-            self._show_recovery_actions(True)
+            self._show_recovery_actions(True, "generic")
+
+    def _refresh_validation_recovery_after_run(self) -> ValidationRecovery | None:
+        draft = self._validated_draft or self.draft
+        if draft is None or not draft.project_name:
+            return None
+        settings = self._validated_settings or self._collect_settings()
+        try:
+            recovery = self.service.read_validation_recovery(
+                settings,
+                draft.project_name,
+            )
+        except ValueError:
+            return None
+        if (
+            recovery is None
+            or recovery.state != "validation_pending"
+            or recovery == self._recovery_before_run
+        ):
+            return None
+        self._pending_validation_recovery = recovery
+        self._installed_lora_name = recovery.lora_name
+        return recovery
+
+    def _classify_pipeline_failure(
+        self,
+        recovery: ValidationRecovery | None,
+    ) -> RunFailureKind:
+        """Map common real worker failures to one safe, direct recovery path."""
+
+        if recovery is not None:
+            return "validation"
+        output = self._pipeline_recent_output.casefold()
+        oom_markers = (
+            "cuda out of memory",
+            "torch.outofmemoryerror",
+            "cuda error: out of memory",
+        )
+        if self._trainer_stage_seen and any(marker in output for marker in oom_markers):
+            return "oom"
+        trainer_markers = (
+            "modulenotfounderror",
+            "no module named",
+            "importerror:",
+            "failed to import",
+        )
+        if self._trainer_stage_seen and any(
+            marker in output for marker in trainer_markers
+        ):
+            return "trainer"
+        return "generic"
 
     def _pipeline_finished(
         self,
@@ -1784,43 +2511,92 @@ class MainWindow(QMainWindow):
             return
         self._run_terminal_handled = True
         self._read_pipeline_output()
+        self._flush_pipeline_line_buffer()
+        self._stop_training_progress()
+        self.pipeline_pid = None
         self.cancel_button.setEnabled(False)
         self._restore_navigation()
         command = self.pipeline_command
         if command is None:
             return
+        recovery = self._refresh_validation_recovery_after_run()
         if self.run_cancelled:
+            self.studio_log.warning(
+                "pipeline.finished",
+                f"mode={command.mode}; result=cancelled; exit_code={exit_code}",
+            )
             self.run_stage_label.setText("Run stopped")
             self.run_detail_label.setText(
                 "Completed files were kept. Return to the review when you are ready."
             )
-            self.run_progress.setValue(0)
-            self._show_recovery_actions(True)
+            self._stop_training_progress(0)
+            self._show_recovery_actions(True, "generic")
             return
         if exit_code != 0:
-            self.run_stage_label.setText("This run needs attention")
-            self.run_detail_label.setText(
-                "Completed photos or checkpoints were kept. The technical details "
-                "below show the stage that failed; fix the setup item and retry."
+            self.studio_log.error_event(
+                "pipeline.finished",
+                f"mode={command.mode}; result=failed; exit_code={exit_code}",
             )
-            self.run_progress.setValue(0)
-            self._show_recovery_actions(True)
+            failure_kind = self._classify_pipeline_failure(recovery)
+            if failure_kind == "validation":
+                self.run_stage_label.setText(
+                    "LoRA installed; validation needs attention"
+                )
+                self.run_detail_label.setText(
+                    "Training is complete and the LoRA is safely installed. Open "
+                    "the selected ComfyUI instance, then use Retry validation only. "
+                    "Photos and training will not repeat."
+                )
+                self._stop_training_progress(78)
+            elif failure_kind == "oom":
+                self.run_stage_label.setText("GPU memory filled up")
+                self.run_detail_label.setText(
+                    "This training plan needed more GPU memory than was available. "
+                    "Use Fast & check again to lower memory use. Prepared photos and "
+                    "completed files are kept."
+                )
+                self._stop_training_progress(0)
+            elif failure_kind == "trainer":
+                self.run_stage_label.setText("Trainer needs repair")
+                self.run_detail_label.setText(
+                    "The selected ai-toolkit Python is missing a package it needs. "
+                    "Use Repair trainer for guided folder, Python, and PyTorch checks."
+                )
+                self._stop_training_progress(0)
+            else:
+                self.run_stage_label.setText("This run needs attention")
+                self.run_detail_label.setText(
+                    "Completed photos or checkpoints were kept. The technical details "
+                    "below show the stage that failed; fix the setup item and retry."
+                )
+                self._stop_training_progress(0)
+            self._show_recovery_actions(True, failure_kind)
             return
         result_after = _artifact_snapshot(command.expected_result)
         if result_after is None or result_after == self._result_before:
+            self.studio_log.error_event(
+                "pipeline.result.unverified",
+                f"Expected a new or changed result at: {command.expected_result}",
+            )
             self.run_stage_label.setText("Result could not be verified")
             self.run_detail_label.setText(
                 "The pipeline exited successfully, but it did not create or update "
                 f"the expected result at {command.expected_result}."
             )
-            self._show_recovery_actions(True)
+            self._show_recovery_actions(True, "generic")
             return
-        self.run_progress.setValue(100)
+        self._stop_training_progress(100)
+        self._pending_validation_recovery = None
+        self.studio_log.info(
+            "pipeline.finished",
+            f"mode={command.mode}; result=verified; path={command.expected_result}",
+        )
         self.run_stage_label.setText("Complete")
         self.run_detail_label.setText(
             "The result was verified on disk and is ready to review."
         )
-        self._show_result(command.expected_result)
+        record = self._record_run_result(command)
+        self._show_result(command.expected_result, record)
         QTimer.singleShot(450, lambda: self.show_page(NAV_RESULTS))
 
     def _restore_navigation(self) -> None:
@@ -1829,13 +2605,46 @@ class MainWindow(QMainWindow):
         self.nav_buttons[NAV_RUN].setEnabled(True)
         self.nav_buttons[NAV_RESULTS].setEnabled(self._latest_result is not None)
 
-    def _show_recovery_actions(self, visible: bool) -> None:
+    def _show_recovery_actions(
+        self,
+        visible: bool,
+        failure_kind: RunFailureKind | None = None,
+    ) -> None:
+        if failure_kind is not None:
+            self._run_failure_kind = failure_kind
+        kind = self._run_failure_kind
         self.edit_after_run_button.setVisible(visible)
         self.open_run_folder_button.setVisible(visible)
-        self.retry_after_run_button.setVisible(visible)
+        self.use_fast_after_run_button.setVisible(visible and kind == "oom")
+        self.repair_trainer_after_run_button.setVisible(visible and kind == "trainer")
+        self.open_desktop_after_run_button.setVisible(visible and kind == "validation")
+        self.retry_after_run_button.setVisible(visible and kind != "validation")
         self.retry_validation_button.setVisible(
             visible and self._installed_lora_name is not None
         )
+
+    def use_fast_after_oom(self) -> None:
+        """Apply the lower-memory plan and deliberately approve a safe rebuild."""
+
+        index = self.preset_combo.findData(TrainingPreset.FAST.value)
+        if index >= 0:
+            self.preset_combo.setCurrentIndex(index)
+        self.overwrite_checkbox.setChecked(True)
+        self.studio_log.info(
+            "pipeline.recovery.fast",
+            "The user selected the lower-memory Fast plan after a CUDA OOM.",
+        )
+        self._show_recovery_actions(False)
+        self.review_project()
+
+    def repair_trainer_after_failure(self) -> None:
+        """Open the same guided trainer repair used by setup diagnostics."""
+
+        self.studio_log.info(
+            "pipeline.recovery.trainer",
+            "The user opened guided trainer repair after a missing dependency.",
+        )
+        self.show_trainer_help()
 
     def retry_pipeline(self) -> None:
         self._show_recovery_actions(False)
@@ -1843,9 +2652,31 @@ class MainWindow(QMainWindow):
         self.run_readiness_checks()
 
     def retry_validation(self) -> None:
-        settings = self._validated_settings
-        draft = self._validated_draft
-        lora_name = self._installed_lora_name
+        recovery = self._pending_validation_recovery
+        settings: AppSettings | None
+        draft: ProjectDraft | None
+        lora_name: str | None
+        if recovery is not None:
+            settings = self._collect_settings()
+            current = self.service.read_validation_recovery(
+                settings,
+                recovery.project_name,
+            )
+            if current is None or current.state != "validation_pending":
+                self._show_error(
+                    "Installed LoRA could not be recovered",
+                    "The saved LoRA is no longer in the selected ComfyUI model "
+                    "library. Reconnect that library or start a new run.",
+                )
+                return
+            recovery = current
+            self._pending_validation_recovery = current
+            draft = self._draft_for_recovery(current)
+            lora_name = current.lora_name
+        else:
+            settings = self._validated_settings
+            draft = self._validated_draft
+            lora_name = self._installed_lora_name
         if settings is None or draft is None or lora_name is None:
             self._show_error(
                 "Validation cannot be retried yet",
@@ -1857,6 +2688,7 @@ class MainWindow(QMainWindow):
                 settings,
                 draft,
                 lora_name,
+                checkpoint=(recovery.checkpoint if recovery is not None else None),
             )
         except (TypeError, ValueError) as exc:
             self._show_error("Validation could not start", str(exc))
@@ -1877,10 +2709,73 @@ class MainWindow(QMainWindow):
         self._open_local_folder(folder)
 
     # ------------------------------------------------------------- result flow
-    def _show_result(self, result: Path) -> None:
+    def _record_run_result(self, command: PipelineCommand) -> RunResult:
+        draft = self._validated_draft or self.draft or self._build_draft()
+        mode: Literal["prepare", "full"] = (
+            "prepare" if command.mode == "prepare" else "full"
+        )
+        current_settings = self._collect_settings()
+        outcome = self.service.read_pipeline_outcome(
+            current_settings,
+            draft.project_name,
+        )
+        outcome_matches = (
+            outcome is not None
+            and self.service.project_path(outcome.result_path).resolve()
+            == command.expected_result.resolve()
+        )
+        record = RunResult(
+            project_name=draft.project_name,
+            mode=mode,
+            result_path=command.expected_result,
+            completed_at=(
+                outcome.completed_at
+                if outcome_matches and outcome is not None
+                else datetime.now(UTC).isoformat()
+            ),
+            trigger=(
+                outcome.trigger
+                if outcome_matches and outcome is not None
+                else draft.trigger
+            ),
+            preset=draft.preset,
+            checkpoint=(
+                outcome.checkpoint
+                if outcome_matches and outcome is not None
+                else current_settings.comfy_checkpoint
+            ),
+            lora_name=(
+                outcome.lora_name
+                if outcome_matches and outcome is not None
+                else self._installed_lora_name or ""
+            ),
+        )
+        self._installed_lora_name = record.lora_name or self._installed_lora_name
+        self.settings = replace(current_settings, last_result=record)
+        try:
+            save_settings(self.settings, self.settings_path)
+        except (OSError, TypeError, ValueError) as exc:
+            self.run_log.appendPlainText(
+                f"\n[studio] The verified result could not be added to history: {exc}"
+            )
+        return record
+
+    def _show_result(self, result: Path, record: RunResult | None = None) -> None:
         self._latest_result = result
+        if record is None and self.settings.last_result is not None:
+            stored_path = self.service.project_path(
+                self.settings.last_result.result_path
+            )
+            if stored_path == result:
+                record = self.settings.last_result
+        self._displayed_result_record = record
         self.nav_buttons[NAV_RESULTS].setEnabled(True)
         self.result_path_label.setText(str(result))
+        self.result_image.setStyleSheet("")
+        self.comfy_handoff_card.setVisible(False)
+        self.review_prepared_button.setVisible(False)
+        self.continue_training_button.setVisible(False)
+        self.open_full_grid_button.setVisible(False)
         if result.is_file() and result.suffix.lower() in {
             ".png",
             ".jpg",
@@ -1894,10 +2789,31 @@ class MainWindow(QMainWindow):
                     "Compare the generated validation grid, then continue in ComfyUI."
                 )
                 self.result_image.setAccessibleName("LoRA validation comparison grid")
+                self.open_full_grid_button.setVisible(True)
                 self.result_open_comfy_button.setVisible(True)
                 self.result_open_comfy_button.setEnabled(
                     self.comfy_status is not None and self.comfy_status.reachable
                 )
+                if record is not None:
+                    preferred_strength = (
+                        0.8
+                        if 0.8 in record.preset.validation_strengths
+                        else next(
+                            (
+                                value
+                                for value in record.preset.validation_strengths
+                                if value > 0
+                            ),
+                            1.0,
+                        )
+                    )
+                    self.result_details_label.setText(
+                        f"LoRA: {record.lora_name or 'See the result folder'}\n"
+                        f"Identity phrase: {record.trigger}\n"
+                        f"Base checkpoint: {record.checkpoint or 'Not recorded'}\n"
+                        f"Suggested starting strength: {preferred_strength:g}"
+                    )
+                    self.comfy_handoff_card.setVisible(True)
                 self.result_image.setPixmap(
                     pixmap.scaled(
                         920,
@@ -1910,16 +2826,18 @@ class MainWindow(QMainWindow):
         if result.is_dir():
             self.result_title_label.setText("Your photos are ready for training")
             self.result_subtitle_label.setText(
-                "Preparation is complete. Connect any missing training tools when "
-                "you are ready to create the LoRA."
+                "Review the prepared photos and captions here, then check the "
+                "remaining tools and continue without preparing everything again."
             )
             self.result_image.setAccessibleName("Prepared photo dataset status")
             self.result_open_comfy_button.setVisible(False)
+            self.review_prepared_button.setVisible(True)
+            self.continue_training_button.setVisible(True)
             self.result_image.setPixmap(QPixmap())
             self.result_image.setText(
                 "✓\n\nYour photos are prepared.\n\n"
-                "Connect the remaining training tools, then return to Review & run "
-                "for the full LoRA."
+                "Review captions in the studio, then continue to the full LoRA. "
+                "The prepared work will be reused."
             )
             self.result_image.setStyleSheet(
                 "font-size: 19px; color: #9ee7d7; padding: 30px;"
@@ -1927,12 +2845,99 @@ class MainWindow(QMainWindow):
         else:
             self.result_image.setText("The result is ready.")
 
+    def review_prepared_dataset(self) -> None:
+        draft = self.draft or self.settings.last_project
+        record = (
+            self._displayed_result_record
+            if self.pages.currentIndex() == NAV_RESULTS
+            else None
+        )
+        if record is not None and record.mode == "prepare":
+            result = self.service.project_path(record.result_path)
+            required_trigger = record.trigger
+        else:
+            if not draft.project_name:
+                return
+            result = (
+                self.service.project_path(self._collect_settings().datasets_dir)
+                / draft.project_name
+            )
+            required_trigger = draft.trigger
+        if not result.is_dir():
+            self._show_error(
+                "Prepared photos were not found",
+                f"The prepared project folder no longer exists:\n{result}",
+            )
+            return
+        if not required_trigger.strip():
+            self._show_error(
+                "Identity phrase is missing",
+                "Return to the project page and choose an identity phrase before "
+                "editing prepared captions.",
+            )
+            return
+        PreparedDatasetDialog(result, required_trigger, self).exec()
+        self._invalidate_readiness()
+
+    def continue_prepared_training(self) -> None:
+        record = self._displayed_result_record
+        if record is not None:
+            self.project_name_edit.setText(record.project_name)
+            self.trigger_edit.setText(record.trigger)
+            preset_index = self.preset_combo.findData(record.preset.value)
+            if preset_index >= 0:
+                self.preset_combo.setCurrentIndex(preset_index)
+        self.overwrite_checkbox.setChecked(False)
+        self.review_project()
+
+    def copy_result_setup(self) -> None:
+        record = self._displayed_result_record
+        if record is None:
+            return
+        preferred_strength = (
+            0.8
+            if 0.8 in record.preset.validation_strengths
+            else next(
+                (value for value in record.preset.validation_strengths if value > 0),
+                1.0,
+            )
+        )
+        QApplication.clipboard().setText(
+            "\n".join(
+                (
+                    f"LoRA: {record.lora_name}",
+                    f"Identity phrase: {record.trigger}",
+                    f"Base checkpoint: {record.checkpoint}",
+                    f"Starting strength: {preferred_strength:g}",
+                )
+            )
+        )
+        self.copy_result_setup_button.setText("Copied")
+        QTimer.singleShot(
+            1800,
+            lambda: self.copy_result_setup_button.setText("Copy setup"),
+        )
+
     def open_result_folder(self) -> None:
         result = self._latest_result
         if result is None:
             return
         folder = result if result.is_dir() else result.parent
         self._open_local_folder(folder)
+
+    def open_full_size_grid(self) -> None:
+        result = self._latest_result
+        if result is None or not result.is_file():
+            self._show_error(
+                "Comparison grid not found",
+                "The full-size comparison image is no longer available.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.resolve()))):
+            self._show_error(
+                "Could not open the comparison",
+                "Windows could not open the full-size image.",
+            )
 
     def _open_local_folder(self, folder: Path) -> None:
         if not folder.is_dir():
@@ -1946,6 +2951,19 @@ class MainWindow(QMainWindow):
                 "Windows could not open this location in File Explorer.",
             )
 
+    def open_logs_folder(self) -> None:
+        """Open the bounded local support trail without uploading any data."""
+
+        self.studio_log.flush()
+        if not self.studio_log.available:
+            detail = self.studio_log.error or "The log writer is unavailable."
+            self._show_error(
+                "Local logs are unavailable",
+                f"The studio could not create its local log folder.\n\n{detail}",
+            )
+            return
+        self._open_local_folder(self.studio_log.directory)
+
     def new_project(self) -> None:
         previous_name = self.draft.project_name if self.draft is not None else ""
         self.pipeline_process = None
@@ -1956,6 +2974,9 @@ class MainWindow(QMainWindow):
         self._validated_settings = None
         self._validated_draft = None
         self._installed_lora_name = None
+        self._pending_validation_recovery = None
+        self._recovery_before_run = None
+        self._pipeline_line_buffer = ""
         self.run_stack.setCurrentIndex(0)
         self.run_log.clear()
         self._show_recovery_actions(False)
@@ -1975,6 +2996,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- helpers
     def _show_error(self, title: str, message: str) -> None:
+        self.studio_log.error_event("ui.error", f"{title}: {message}")
         QMessageBox.critical(self, title, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
@@ -1992,6 +3014,10 @@ class MainWindow(QMainWindow):
                 return
             self.run_cancelled = True
             self._stop_process_tree(force=True)
+        self._closing = True
+        self._training_elapsed_timer.stop()
+        self.studio_log.info("session.closed", "MIVIM LoRA Studio closed.")
+        self.studio_log.close()
         event.accept()
 
 

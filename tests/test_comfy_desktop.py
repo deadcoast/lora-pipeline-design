@@ -151,29 +151,165 @@ def test_discovers_legacy_base_path_and_saved_port(tmp_path: Path) -> None:
     assert result.host_candidates[0] == "127.0.0.1:8123"
 
 
-def test_current_desktop_port_locks_are_prioritized(tmp_path: Path) -> None:
+def test_current_desktop_port_locks_are_prioritized(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(comfy_desktop, "_process_is_running", lambda _pid: True)
     desktop = tmp_path / "Comfy Desktop"
     _write_json(desktop / "settings.json", {})
     _write_json(
         desktop / "port-locks" / "port-8234.json",
-        {"port": 8234, "pid": 1234, "name": "Local instance"},
+        {
+            "pid": 1234,
+            "installationName": "Local instance",
+            "timestamp": 1_725_000_000_000,
+        },
     )
 
     result = comfy_desktop.discover_comfy_desktop(tmp_path)
 
     assert result.host_candidates[0] == "127.0.0.1:8234"
     assert result.warnings == ()
+    assert result.runtime_hints[0].installation_name == "Local instance"
 
 
-def test_mismatched_desktop_port_lock_is_ignored(tmp_path: Path) -> None:
+def test_selecting_an_instance_binds_its_runtime_and_private_model_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(comfy_desktop, "_process_is_running", lambda _pid: True)
+    appdata = tmp_path / "Roaming"
+    desktop = appdata / "Comfy Desktop"
+    install_a = tmp_path / "installs" / "a"
+    install_b = tmp_path / "installs" / "b"
+    private_a = tmp_path / "models-a"
+    private_b = tmp_path / "models-b"
+    for path in (
+        install_a / "ComfyUI",
+        install_b / "ComfyUI",
+        private_a / "loras",
+        private_a / "checkpoints",
+        private_b / "loras",
+        private_b / "checkpoints",
+    ):
+        path.mkdir(parents=True)
+    _write_json(desktop / "settings.json", {"modelsDirs": []})
+    _write_json(
+        desktop / "installations.json",
+        [
+            {
+                "id": "a",
+                "name": "Portrait A",
+                "sourceId": "standalone",
+                "installPath": str(install_a),
+                "useSharedModels": False,
+                "modelDirs": [str(private_a)],
+            },
+            {
+                "id": "b",
+                "name": "Portrait B",
+                "sourceId": "standalone",
+                "installPath": str(install_b),
+                "useSharedModels": False,
+                "modelDirs": [str(private_b)],
+                "modelDirsPrimary": str(private_b),
+            },
+        ],
+    )
+    _write_json(
+        desktop / "port-locks" / "port-8201.json",
+        {"pid": 101, "installationName": "Portrait A", "timestamp": 1000},
+    )
+    _write_json(
+        desktop / "port-locks" / "port-8202.json",
+        {"pid": 102, "installationName": "Portrait B", "timestamp": 2000},
+    )
+
+    discovered = comfy_desktop.discover_comfy_desktop(appdata)
+    selected = comfy_desktop.select_comfy_installation(discovered, "b")
+
+    assert selected.selected_installation is not None
+    assert selected.selected_installation.id == "b"
+    assert selected.host_candidates == ("127.0.0.1:8202",)
+    assert selected.model_roots[0].path == private_b
+    assert selected.model_roots[0].loras == private_b / "loras"
+    assert all(root.path != private_a for root in selected.model_roots)
+
+
+def test_incomplete_desktop_port_lock_is_ignored(tmp_path: Path) -> None:
     desktop = tmp_path / "Comfy Desktop"
     _write_json(desktop / "settings.json", {})
-    _write_json(desktop / "port-locks" / "port-8234.json", {"port": 9999})
+    _write_json(desktop / "port-locks" / "port-8234.json", {"pid": 1234})
 
     result = comfy_desktop.discover_comfy_desktop(tmp_path)
 
     assert "127.0.0.1:8234" not in result.host_candidates
-    assert any("mismatched" in warning for warning in result.warnings)
+    assert any("incomplete" in warning for warning in result.warnings)
+
+
+def test_stale_desktop_port_lock_is_never_a_runtime_candidate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(comfy_desktop, "_process_is_running", lambda _pid: False)
+    desktop = tmp_path / "Comfy Desktop"
+    _write_json(desktop / "settings.json", {})
+    _write_json(
+        desktop / "port-locks" / "port-8234.json",
+        {
+            "pid": 1234,
+            "installationName": "Closed instance",
+            "timestamp": 1_725_000_000_000,
+        },
+    )
+
+    result = comfy_desktop.discover_comfy_desktop(tmp_path)
+
+    assert result.runtime_hints == ()
+    assert "127.0.0.1:8234" not in result.host_candidates
+    assert any("stale Comfy port lock" in warning for warning in result.warnings)
+
+
+def test_discovers_current_extra_model_paths_for_selected_instance(
+    tmp_path: Path,
+) -> None:
+    appdata = tmp_path / "Roaming"
+    desktop = appdata / "Comfy Desktop"
+    install = tmp_path / "install"
+    comfyui = install / "ComfyUI"
+    extra = tmp_path / "external-models"
+    (comfyui / "models").mkdir(parents=True)
+    (extra / "checkpoints").mkdir(parents=True)
+    (extra / "loras").mkdir()
+    _write_json(desktop / "settings.json", {"modelsDirs": []})
+    _write_json(
+        desktop / "installations.json",
+        [
+            {
+                "id": "local",
+                "name": "Local",
+                "sourceId": "standalone",
+                "installPath": str(install),
+                "useSharedModels": False,
+            }
+        ],
+    )
+    (comfyui / "extra_model_paths.yaml").write_text(
+        "external:\n"
+        f"  base_path: {extra.as_posix()}\n"
+        "  checkpoints: checkpoints\n"
+        "  loras: loras\n",
+        encoding="utf-8",
+    )
+
+    result = comfy_desktop.discover_comfy_desktop(appdata)
+
+    extra_root = next(
+        root for root in result.model_roots if "extra_model_paths" in root.source
+    )
+    assert extra_root.checkpoints == extra / "checkpoints"
+    assert extra_root.loras == extra / "loras"
 
 
 def test_preserves_windows_paths_when_inspected_cross_platform(tmp_path: Path) -> None:

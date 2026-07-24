@@ -25,6 +25,7 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 from . import config
+from .dataset_pairs import scan_dataset_pairs
 from .io_utils import atomic_write_text
 
 TRAINING_PRESETS = ("fast", "balanced", "quality")
@@ -84,43 +85,18 @@ def _load_template(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 def _validate_dataset_pairs(dataset_dir: Path) -> int:
     """Validate the flat image/caption dataset that ai-toolkit will consume."""
-    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
-    images: dict[str, Path] = {}
-    captions: dict[str, Path] = {}
-
-    for path in dataset_dir.iterdir():
-        if not path.is_file():
-            continue
-        suffix = path.suffix.lower()
-        if suffix in image_exts:
-            if path.stem in images:
-                raise ValueError(
-                    f"Dataset {dataset_dir} has multiple images named {path.stem!r}."
-                )
-            images[path.stem] = path
-        elif suffix == ".txt":
-            captions[path.stem] = path
-
-    missing_captions = sorted(images.keys() - captions.keys())
-    missing_images = sorted(captions.keys() - images.keys())
-    if missing_captions or missing_images:
-        details: list[str] = []
-        if missing_captions:
-            details.append(
-                f"images without captions: {', '.join(missing_captions[:5])}"
-            )
-        if missing_images:
-            details.append(f"captions without images: {', '.join(missing_images[:5])}")
+    inventory = scan_dataset_pairs(dataset_dir)
+    problems = inventory.problem_messages()
+    if problems:
         raise ValueError(
-            f"Dataset {dataset_dir} has incomplete pairs ({'; '.join(details)})."
+            f"Dataset {dataset_dir} is not trainer-ready: {' '.join(problems)}"
         )
-    if not images:
+    if not inventory.pairs:
         raise ValueError(
             f"Dataset {dataset_dir} has no matching image + .txt caption pairs."
         )
 
-    for stem, image_path in images.items():
-        caption_path = captions[stem]
+    for image_path, caption_path in inventory.pairs:
         try:
             caption = caption_path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeError) as exc:
@@ -132,7 +108,7 @@ def _validate_dataset_pairs(dataset_dir: Path) -> int:
                 image.verify()
         except (OSError, UnidentifiedImageError) as exc:
             raise ValueError(f"Dataset image is invalid: {image_path} ({exc})") from exc
-    return len(images)
+    return len(inventory.pairs)
 
 
 def validate_sdxl_process(process: dict[str, Any], template: Path) -> None:

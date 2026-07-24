@@ -44,6 +44,33 @@ def _pipeline_args(**overrides: object) -> argparse.Namespace:
     return argparse.Namespace(**values)
 
 
+def test_doctor_uses_the_same_real_trainer_runtime_probe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    toolkit = tmp_path / "ai-toolkit"
+    toolkit.mkdir()
+    (toolkit / "run.py").write_text("", encoding="utf-8")
+    python = toolkit / "venv" / "Scripts" / "python.exe"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+    monkeypatch.setattr(doctor_module.config, "AI_TOOLKIT_DIR", str(toolkit))
+    monkeypatch.setattr(doctor_module.config, "AI_TOOLKIT_PYTHON", str(python))
+    called: list[Path] = []
+
+    def probe(executable: Path) -> tuple[bool, str]:
+        called.append(executable)
+        return True, "GPU kernel completed."
+
+    monkeypatch.setattr(doctor_module, "probe_trainer_runtime", probe)
+    results: list[doctor_module.CheckResult] = []
+
+    doctor_module.check_ai_toolkit(results)
+
+    assert called == [python]
+    assert any("Trainer CUDA verified" in message for _ok, _tag, message in results)
+
+
 def test_atomic_write_preserves_destination_on_replace_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -261,6 +288,26 @@ def test_materialize_rejects_invalid_dataset_pairs(tmp_path: Path) -> None:
         )
 
 
+def test_trainer_pair_validation_uses_the_same_exact_file_contract(
+    tmp_path: Path,
+) -> None:
+    dataset = tmp_path / "dataset"
+    dataset.mkdir()
+    Image.new("RGB", (32, 32), "white").save(dataset / "001.png")
+    Image.new("RGB", (32, 32), "white").save(dataset / "001.jpg")
+    (dataset / "001.txt").write_text("ohwx person\n", encoding="utf-8")
+    Image.new("RGB", (32, 32), "blue").save(dataset / "orphan.webp")
+    (dataset / "notes.txt").write_text("ohwx person\n", encoding="utf-8")
+    Image.new("RGB", (32, 32), "green").save(dataset / "animated.gif")
+
+    with pytest.raises(ValueError) as error:
+        train_module._validate_dataset_pairs(dataset)
+
+    message = str(error.value)
+    for filename in ("001.jpg", "001.png", "orphan.webp", "notes.txt", "animated.gif"):
+        assert filename in message
+
+
 def test_blip_loader_pins_the_model_revision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -362,7 +409,7 @@ def test_prepare_detects_source_content_changes_with_preserved_metadata(
         prepare_dataset.prepare(source, "subject_v1", size=32)
 
 
-def test_prepare_rejects_exact_duplicate_sources(
+def test_prepare_ignores_exact_duplicate_sources_without_changing_originals(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source = tmp_path / "source"
@@ -372,8 +419,12 @@ def test_prepare_rejects_exact_duplicate_sources(
     (source / "second.png").write_bytes(first.read_bytes())
     monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
 
-    with pytest.raises(ValueError, match="Duplicate source images"):
-        prepare_dataset.prepare(source, "subject_v1", size=32)
+    before = {path.name: path.read_bytes() for path in source.iterdir()}
+    prepared = prepare_dataset.prepare(source, "subject_v1", size=32)
+
+    assert len(list(prepared.glob("*.png"))) == 1
+    assert len(list(prepared.glob("*.txt"))) == 1
+    assert {path.name: path.read_bytes() for path in source.iterdir()} == before
 
 
 def test_failed_overwrite_preserves_the_previous_dataset(
@@ -500,6 +551,30 @@ def test_validate_rejects_an_invalid_seed() -> None:
         )
 
 
+def test_validation_grid_has_plain_language_axes_and_baseline_space(
+    tmp_path: Path,
+) -> None:
+    cells: list[Path] = []
+    for index in range(4):
+        path = tmp_path / f"cell-{index}.png"
+        Image.new("RGB", (24, 24), (index * 40, 80, 120)).save(path)
+        cells.append(path)
+    output = tmp_path / "grid.png"
+
+    validate_module._grid(
+        cells,
+        cols=2,
+        cell=32,
+        labels=["", "", "", ""],
+        out_path=output,
+        row_labels=["No LoRA · baseline", "LoRA strength 0.8"],
+        column_labels=["Portrait", "Outdoor"],
+    )
+
+    with Image.open(output) as grid:
+        assert grid.size == (324, 150)
+
+
 def test_comfy_output_filename_cannot_escape_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -587,6 +662,8 @@ def test_fast_pipeline_preset_defaults_photo_preparation_to_768(
         return tmp_path / "dataset"
 
     monkeypatch.setattr(pipeline_module.prep, "prepare", fake_prepare)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    monkeypatch.setattr(config, "RUN_CONFIGS_DIR", tmp_path / "configs")
 
     pipeline_module.run(
         _pipeline_args(
@@ -617,6 +694,7 @@ def test_pipeline_uses_only_a_new_checkpoint(
     monkeypatch.setattr(config, "COMFY_LORA_DIR", comfy_loras)
     monkeypatch.setattr(config, "DATASETS_DIR", datasets)
     monkeypatch.setattr(config, "GRIDS_DIR", grids)
+    monkeypatch.setattr(config, "RUN_CONFIGS_DIR", tmp_path / "configs")
 
     def fake_train(*_args: object, **_kwargs: object) -> int:
         (checkpoints / "subject_v1_02000.safetensors").write_bytes(b"weights")
@@ -635,6 +713,61 @@ def test_pipeline_uses_only_a_new_checkpoint(
 
     assert captured["lora"] == "subject_v1_02000.safetensors"
     assert (comfy_loras / captured["lora"]).read_bytes() == b"weights"
+    recovery = json.loads(
+        (tmp_path / "configs" / "subject_v1-recovery.json").read_text(encoding="utf-8")
+    )
+    assert recovery["schema_version"] == 1
+    assert recovery["state"] == "complete"
+    assert recovery["lora_name"] == captured["lora"]
+
+
+def test_pipeline_preserves_installed_lora_recovery_when_validation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lora_dir = tmp_path / "ComfyUI" / "models" / "loras"
+    lora_dir.mkdir(parents=True)
+    installed = lora_dir / "subject_v1.safetensors"
+    installed.write_bytes(b"trained weights")
+    run_configs = tmp_path / "configs"
+    grids = tmp_path / "grids"
+    monkeypatch.setattr(config, "COMFY_LORA_DIR", lora_dir)
+    monkeypatch.setattr(config, "RUN_CONFIGS_DIR", run_configs)
+    monkeypatch.setattr(config, "GRIDS_DIR", grids)
+    monkeypatch.setattr(config, "COMFY_SDXL_CKPT", "portraitXL.safetensors")
+    monkeypatch.setattr(
+        pipeline_module.validator,
+        "validate",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("simulated validation failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated validation failure"):
+        pipeline_module.run(
+            _pipeline_args(
+                skip_train=True,
+                lora=installed.name,
+                preset="balanced",
+            )
+        )
+
+    recovery = json.loads(
+        (run_configs / "subject_v1-recovery.json").read_text(encoding="utf-8")
+    )
+    assert recovery == {
+        "schema_version": 1,
+        "project_name": "subject_v1",
+        "state": "validation_pending",
+        "lora_name": installed.name,
+        "installed_lora_path": str(installed.resolve()),
+        "expected_grid_path": str((grids / "subject_v1_grid.png").resolve()),
+        "trigger": "ohwx person",
+        "preset": "balanced",
+        "checkpoint": "portraitXL.safetensors",
+        "updated_at": recovery["updated_at"],
+    }
+    assert not (run_configs / "subject_v1-result.json").exists()
 
 
 def test_pipeline_rejects_a_noop_command() -> None:

@@ -20,11 +20,13 @@ import re
 import sys
 import urllib.request
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+
+import yaml
 
 COMFY_DESKTOP_APP_ID = "com.todesktop.241012ess7yxs0e"
 """Windows Start-menu AppID used by the current Comfy Desktop release."""
@@ -63,6 +65,12 @@ class ComfyInstallation:
     version: str | None
     status: str | None
     last_launched_at: int | None
+    use_shared_models: bool = True
+    use_shared_input_output: bool = True
+    model_dirs: tuple[Path, ...] = ()
+    model_dirs_primary: Path | None = None
+    input_dir: Path | None = None
+    output_dir: Path | None = None
 
     @property
     def is_local(self) -> bool:
@@ -94,6 +102,16 @@ class ComfyLauncher:
 
 
 @dataclass(frozen=True, slots=True)
+class ComfyRuntimeHint:
+    """Identity-bearing runtime hint written by current Comfy Desktop."""
+
+    host: str
+    installation_name: str
+    pid: int
+    timestamp: int
+
+
+@dataclass(frozen=True, slots=True)
 class ComfyDesktopDiscovery:
     """Immutable snapshot of locally configured Comfy Desktop state."""
 
@@ -107,6 +125,9 @@ class ComfyDesktopDiscovery:
     host_candidates: tuple[str, ...]
     launcher: ComfyLauncher
     warnings: tuple[str, ...]
+    runtime_hints: tuple[ComfyRuntimeHint, ...] = ()
+    shared_model_roots: tuple[ComfyModelRoot, ...] = ()
+    legacy_model_roots: tuple[ComfyModelRoot, ...] = ()
 
     @property
     def detected(self) -> bool:
@@ -216,7 +237,26 @@ def _installation_from_json(
     install_path = _configured_path(value.get("installPath"), config_dir)
     if source_id.casefold() == "cloud":
         install_path = None
-    comfyui_path = install_path / "ComfyUI" if install_path is not None else None
+    comfyui_path: Path | None = None
+    if install_path is not None:
+        nested = install_path / "ComfyUI"
+        if _path_exists(nested / "models") or _path_is_file(nested / "main.py"):
+            comfyui_path = nested
+        elif _path_exists(install_path / "models") or _path_is_file(
+            install_path / "main.py"
+        ):
+            comfyui_path = install_path
+        else:
+            comfyui_path = nested
+
+    raw_model_dirs = value.get("modelDirs")
+    model_dirs: list[Path] = []
+    if isinstance(raw_model_dirs, Sequence) and not isinstance(raw_model_dirs, str):
+        for item in raw_model_dirs:
+            path = _configured_path(item, config_dir)
+            if path is not None:
+                model_dirs.append(path)
+    model_dirs_primary = _configured_path(value.get("modelDirsPrimary"), config_dir)
 
     version = (
         _string(value.get("comfyVersionTag"))
@@ -232,6 +272,12 @@ def _installation_from_json(
         version=version,
         status=_string(value.get("status")),
         last_launched_at=_integer(value.get("lastLaunchedAt")),
+        use_shared_models=value.get("useSharedModels") is not False,
+        use_shared_input_output=value.get("useSharedInputOutput") is not False,
+        model_dirs=tuple(model_dirs),
+        model_dirs_primary=model_dirs_primary,
+        input_dir=_configured_path(value.get("inputDir"), config_dir),
+        output_dir=_configured_path(value.get("outputDir"), config_dir),
     )
 
 
@@ -324,6 +370,186 @@ def _make_model_roots(
     return tuple(roots)
 
 
+def _extra_model_paths(
+    comfyui_path: Path | None,
+    installation_name: str,
+) -> tuple[ComfyModelRoot, ...]:
+    """Read model folders enabled by ComfyUI's ``extra_model_paths.yaml``.
+
+    This is deliberately read-only and conservative: only entries that define
+    both checkpoint and LoRA folders can become a pipeline destination.  An
+    invalid or future configuration shape is ignored so Desktop discovery can
+    still start normally.
+    """
+
+    if comfyui_path is None:
+        return ()
+    config_path = comfyui_path / "extra_model_paths.yaml"
+    if not _path_is_file(config_path):
+        return ()
+    try:
+        if config_path.stat().st_size > _CONFIG_SIZE_LIMIT:
+            return ()
+        value = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, yaml.YAMLError):
+        return ()
+    if not isinstance(value, Mapping):
+        return ()
+
+    def category_paths(
+        section: Mapping[object, object],
+        key: str,
+        base_path: Path,
+    ) -> tuple[Path, ...]:
+        raw = section.get(key)
+        values: Sequence[object]
+        if isinstance(raw, str):
+            values = tuple(line.strip() for line in raw.splitlines() if line.strip())
+        elif isinstance(raw, Sequence):
+            values = raw
+        else:
+            values = ()
+        paths: list[Path] = []
+        for item in values:
+            path = _configured_path(item, base_path)
+            if path is not None:
+                paths.append(path)
+        return tuple(paths)
+
+    roots: list[ComfyModelRoot] = []
+    seen: set[tuple[str, str]] = set()
+    for section_name, raw_section in value.items():
+        if not isinstance(raw_section, Mapping):
+            continue
+        base_path = (
+            _configured_path(raw_section.get("base_path"), config_path.parent)
+            or config_path.parent
+        )
+        checkpoints = category_paths(raw_section, "checkpoints", base_path)
+        loras = category_paths(raw_section, "loras", base_path)
+        for checkpoint_dir in checkpoints:
+            for lora_dir in loras:
+                key = (_path_key(checkpoint_dir), _path_key(lora_dir))
+                if key in seen:
+                    continue
+                seen.add(key)
+                try:
+                    common_path = Path(
+                        os.path.commonpath((str(checkpoint_dir), str(lora_dir)))
+                    )
+                except ValueError:
+                    common_path = base_path
+                roots.append(
+                    ComfyModelRoot(
+                        path=common_path,
+                        loras=lora_dir,
+                        checkpoints=checkpoint_dir,
+                        source=(
+                            f"{installation_name} extra_model_paths.yaml "
+                            f"({section_name})"
+                        ),
+                        exists=_path_exists(checkpoint_dir) or _path_exists(lora_dir),
+                    )
+                )
+    return tuple(roots)
+
+
+def _effective_model_roots(
+    installation: ComfyInstallation | None,
+    shared_roots: tuple[ComfyModelRoot, ...],
+    legacy_roots: tuple[ComfyModelRoot, ...],
+) -> tuple[ComfyModelRoot, ...]:
+    if installation is None:
+        return shared_roots or legacy_roots
+
+    own = (
+        _make_model_roots(((installation.comfyui_path / "models", installation.name),))
+        if installation.comfyui_path is not None
+        else ()
+    )
+    extra = _extra_model_paths(installation.comfyui_path, installation.name)
+    if installation.use_shared_models:
+        visible_own = (
+            own if any(root.exists for root in own) or not shared_roots else ()
+        )
+        candidates = (*shared_roots, *visible_own, *extra)
+    else:
+        external = _make_model_roots(
+            (path, f"{installation.name} extra models")
+            for path in installation.model_dirs
+        )
+        if installation.model_dirs_primary is not None:
+            primary_key = _path_key(installation.model_dirs_primary)
+            primary = tuple(
+                root for root in external if _path_key(root.path) == primary_key
+            )
+            remainder = tuple(root for root in external if root not in primary)
+            candidates = (*primary, *own, *remainder, *extra)
+        else:
+            candidates = (*own, *external, *extra)
+
+    unique: list[ComfyModelRoot] = []
+    seen: set[tuple[str, str]] = set()
+    for root in candidates:
+        key = (_path_key(root.checkpoints), _path_key(root.loras))
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return tuple(unique)
+
+
+def select_comfy_installation(
+    discovery: ComfyDesktopDiscovery,
+    installation_id: str,
+) -> ComfyDesktopDiscovery:
+    """Bind discovery paths and runtime hints to one explicit Desktop instance."""
+
+    selected = next(
+        (
+            installation
+            for installation in discovery.installations
+            if installation.id == installation_id and installation.is_local
+        ),
+        discovery.selected_installation,
+    )
+    if selected is None:
+        return discovery
+    matched_hosts = tuple(
+        hint.host
+        for hint in discovery.runtime_hints
+        if hint.installation_name.casefold() == selected.name.casefold()
+    )
+    # A selected Desktop installation is an identity boundary.  Falling back
+    # to another installation's live port can train into and validate against
+    # different model libraries without any obvious error for a casual user.
+    hosts = _deduplicate_hosts(matched_hosts)
+    input_dir = discovery.input_dir
+    output_dir = discovery.output_dir
+    if not selected.use_shared_input_output:
+        input_dir = selected.input_dir or (
+            selected.comfyui_path / "input"
+            if selected.comfyui_path is not None
+            else input_dir
+        )
+        output_dir = selected.output_dir or (
+            selected.comfyui_path / "output"
+            if selected.comfyui_path is not None
+            else output_dir
+        )
+    return replace(
+        discovery,
+        selected_installation=selected,
+        model_roots=_effective_model_roots(
+            selected,
+            discovery.shared_model_roots,
+            discovery.legacy_model_roots,
+        ),
+        input_dir=input_dir,
+        output_dir=output_dir,
+        host_candidates=hosts,
+    )
+
+
 def _normalise_local_host(value: object, default_port: int = 8188) -> str | None:
     raw = _string(value)
     if raw is None:
@@ -401,8 +627,11 @@ def _deduplicate_hosts(hosts: Iterable[str]) -> tuple[str, ...]:
     return tuple(result)
 
 
-def _port_lock_hosts(desktop_dir: Path, warnings: list[str]) -> tuple[str, ...]:
-    """Read current Desktop runtime hints without treating them as control state."""
+def _port_lock_hints(
+    desktop_dir: Path,
+    warnings: list[str],
+) -> tuple[ComfyRuntimeHint, ...]:
+    """Read current Desktop runtime identity without treating it as control state."""
 
     lock_dir = desktop_dir / "port-locks"
     if not _path_exists(lock_dir):
@@ -417,7 +646,7 @@ def _port_lock_hosts(desktop_dir: Path, warnings: list[str]) -> tuple[str, ...]:
         warnings.append(f"Could not inspect Comfy Desktop port locks: {exc}")
         return ()
 
-    hosts: list[str] = []
+    hints: list[ComfyRuntimeHint] = []
     for path in candidates:
         match = _PORT_LOCK_NAME.fullmatch(path.name)
         if match is None:
@@ -426,16 +655,76 @@ def _port_lock_hosts(desktop_dir: Path, warnings: list[str]) -> tuple[str, ...]:
         if not 1 <= port <= 65535:
             continue
         value = _read_json(path, warnings)
-        if value is not None and not isinstance(value, Mapping):
+        if not isinstance(value, Mapping):
             warnings.append(f"Ignored malformed Comfy port lock: {path.name}")
             continue
-        if isinstance(value, Mapping):
-            declared_port = _integer(value.get("port"))
-            if declared_port is not None and declared_port != port:
-                warnings.append(f"Ignored mismatched Comfy port lock: {path.name}")
-                continue
-        hosts.append(f"127.0.0.1:{port}")
-    return tuple(hosts)
+        pid = _integer(value.get("pid"))
+        installation_name = _string(value.get("installationName"))
+        timestamp = _integer(value.get("timestamp"))
+        if pid is None or pid <= 0 or installation_name is None or timestamp is None:
+            warnings.append(f"Ignored incomplete Comfy port lock: {path.name}")
+            continue
+        if not _process_is_running(pid):
+            warnings.append(f"Ignored stale Comfy port lock: {path.name}")
+            continue
+        hints.append(
+            ComfyRuntimeHint(
+                host=f"127.0.0.1:{port}",
+                installation_name=installation_name,
+                pid=pid,
+                timestamp=timestamp,
+            )
+        )
+    return tuple(hints)
+
+
+def _process_is_running(pid: int) -> bool:
+    """Return whether ``pid`` currently identifies a running local process."""
+
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if sys.platform == "win32":
+        # OpenProcess is read-only here; unlike os.kill(..., 0) on Windows it
+        # cannot accidentally terminate the process.
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information = 0x1000
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        )
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if not handle:
+            return False
+        kernel32.CloseHandle(handle)
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _port_lock_hosts(desktop_dir: Path, warnings: list[str]) -> tuple[str, ...]:
+    """Compatibility wrapper returning hosts from identity-bearing lock files."""
+
+    return tuple(hint.host for hint in _port_lock_hints(desktop_dir, warnings))
 
 
 def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery:
@@ -512,26 +801,34 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
     )
     selected = _selected_local_installation(installations, settings, last_session)
 
-    configured_roots: list[tuple[Path, str]] = [
+    shared_roots = _make_model_roots(
         (path, "Comfy Desktop settings")
         for path in _model_paths_from_settings(settings, desktop_dir)
-    ]
-    if selected is not None and selected.comfyui_path is not None:
-        selected_models = selected.comfyui_path / "models"
-        # Desktop 2 normally uses shared roots from settings.  Keep the
-        # installation-local convention as a fallback, but do not advertise a
-        # non-existent duplicate when shared roots are already configured.
-        if _path_exists(selected_models) or not configured_roots:
-            configured_roots.append((selected_models, "Selected installation"))
+    )
 
     legacy_base = _configured_path(
         legacy.get("basePath") or legacy.get("base_path"), legacy_dir
     )
-    if legacy_base is not None:
-        configured_roots.append((legacy_base / "models", "Legacy ComfyUI Desktop"))
+    legacy_roots = (
+        _make_model_roots(((legacy_base / "models", "Legacy ComfyUI Desktop"),))
+        if legacy_base is not None
+        else ()
+    )
+    effective_roots = _effective_model_roots(selected, shared_roots, legacy_roots)
 
     input_dir = _configured_path(settings.get("inputDir"), desktop_dir)
     output_dir = _configured_path(settings.get("outputDir"), desktop_dir)
+    if selected is not None and not selected.use_shared_input_output:
+        input_dir = selected.input_dir or (
+            selected.comfyui_path / "input"
+            if selected.comfyui_path is not None
+            else input_dir
+        )
+        output_dir = selected.output_dir or (
+            selected.comfyui_path / "output"
+            if selected.comfyui_path is not None
+            else output_dir
+        )
     if legacy_base is not None:
         input_dir = input_dir or _configured_path(
             legacy.get("inputDirectory") or legacy.get("inputDir"), legacy_dir
@@ -542,7 +839,8 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
         input_dir = input_dir or legacy_base / "input"
         output_dir = output_dir or legacy_base / "output"
 
-    saved_hosts: list[str] = list(_port_lock_hosts(desktop_dir, warnings))
+    runtime_hints = _port_lock_hints(desktop_dir, warnings)
+    saved_hosts: list[str] = [hint.host for hint in runtime_hints]
     for document in (settings, last_session, legacy):
         saved_hosts.extend(_saved_host_candidates(document))
     if selected is not None:
@@ -562,12 +860,15 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
         legacy_config_dir=legacy_dir if legacy_file_found else None,
         installations=installations,
         selected_installation=selected,
-        model_roots=_make_model_roots(configured_roots),
+        model_roots=effective_roots,
         input_dir=input_dir,
         output_dir=output_dir,
         host_candidates=_deduplicate_hosts(saved_hosts),
         launcher=_launcher(),
         warnings=tuple(warnings),
+        runtime_hints=runtime_hints,
+        shared_model_roots=shared_roots,
+        legacy_model_roots=legacy_roots,
     )
 
 
@@ -576,7 +877,7 @@ def _get_json(url: str, timeout: float) -> Any:
         url,
         headers={
             "Accept": "application/json",
-            "User-Agent": "MIVIM-LoRA-Studio/0.2",
+            "User-Agent": "MIVIM-LoRA-Studio/0.3",
         },
         method="GET",
     )
@@ -591,7 +892,7 @@ def _get_api_json(base_url: str, path: str, timeout: float) -> Any:
     modern_path = f"/api{path}"
     try:
         return _get_json(f"{base_url}{modern_path}", timeout)
-    except (OSError, HTTPError, URLError):
+    except (OSError, HTTPError, URLError, UnicodeError, json.JSONDecodeError):
         return _get_json(f"{base_url}{path}", timeout)
 
 

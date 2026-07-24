@@ -2,9 +2,11 @@
 
 Modules:
     desktop          - guided PySide6 desktop application
-    app_models       - typed UI-independent project and event models
+    app_models       - typed UI-independent project, settings, and result models
     app_service      - readiness checks and pipeline command construction
     app_settings     - versioned per-user settings persistence
+    dataset_review   - prepared-photo and caption review dialog
+    photo_review     - source-photo issue review dialog
     comfy_desktop    - read-only Comfy Desktop discovery and live model listing
     config           - loads .env and resolves paths
     prepare_dataset  - resize/convert/auto-orient images + write captions
@@ -27,8 +29,10 @@ if TYPE_CHECKING:
         comfy_client,
         comfy_desktop,
         config,
+        dataset_review,
         desktop,
         io_utils,
+        photo_review,
         pipeline,
         prepare_dataset,
         train,
@@ -43,8 +47,10 @@ __all__ = [
     "comfy_client",
     "comfy_desktop",
     "config",
+    "dataset_review",
     "desktop",
     "io_utils",
+    "photo_review",
     "pipeline",
     "prepare_dataset",
     "train",

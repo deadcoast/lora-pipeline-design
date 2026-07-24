@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 
 from . import config
 
@@ -32,7 +33,7 @@ class TrainingPreset(StrEnum):
     @property
     def description(self) -> str:
         return {
-            self.FAST: "A 900-step, rank-8 draft with one quick validation strength.",
+            self.FAST: "A 900-step, rank-8 draft with a baseline and one strength.",
             self.BALANCED: "Recommended 2,000-step, rank-16 identity training.",
             self.QUALITY: "A 3,000-step, rank-32 run with a wider validation sweep.",
         }[self]
@@ -44,9 +45,9 @@ class TrainingPreset(StrEnum):
     @property
     def validation_strengths(self) -> tuple[float, ...]:
         return {
-            self.FAST: (0.8,),
-            self.BALANCED: (0.6, 0.8, 1.0),
-            self.QUALITY: (0.5, 0.65, 0.8, 0.95, 1.1),
+            self.FAST: (0.0, 0.8),
+            self.BALANCED: (0.0, 0.6, 0.8, 1.0),
+            self.QUALITY: (0.0, 0.5, 0.65, 0.8, 0.95, 1.1),
         }[self]
 
 
@@ -99,14 +100,45 @@ class ProjectDraft:
         return self.normalized()
 
 
+@dataclass(frozen=True, slots=True)
+class RunResult:
+    """One verified desktop result that is safe to restore on next launch."""
+
+    project_name: str
+    mode: Literal["prepare", "full"]
+    result_path: Path
+    completed_at: str
+    trigger: str
+    preset: TrainingPreset
+    checkpoint: str = ""
+    lora_name: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationRecovery:
+    """Durable handoff state after training installed a LoRA but before validation."""
+
+    project_name: str
+    state: Literal["validation_pending", "complete"]
+    lora_name: str
+    installed_lora_path: Path
+    expected_grid_path: Path
+    trigger: str
+    preset: TrainingPreset
+    checkpoint: str
+    updated_at: str
+
+
 @dataclass(slots=True)
 class AppSettings:
     """Non-secret application settings persisted between desktop sessions."""
 
-    schema_version: int = 2
+    schema_version: int = 3
     comfy_host: str = "127.0.0.1:8188"
+    comfy_installation_id: str = ""
     comfy_lora_dir: Path | None = None
     comfy_checkpoint: str = "sd_xl_base_1.0.safetensors"
+    confirmed_sdxl_checkpoint: str = ""
     training_base_model: Path | None = None
     ai_toolkit_dir: Path | None = None
     ai_toolkit_python: Path | None = None
@@ -115,6 +147,7 @@ class AppSettings:
     grids_dir: Path = Path("outputs/grids")
     run_configs_dir: Path = Path("outputs/configs")
     last_project: ProjectDraft = field(default_factory=ProjectDraft)
+    last_result: RunResult | None = None
 
     def environment_overrides(self) -> dict[str, str]:
         """Build the exact, non-secret environment consumed by ``src.config``."""

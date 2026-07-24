@@ -4,9 +4,9 @@ needs BEFORE you spend time preparing data or training.
     python -m src.doctor
 
 It actually connects to your running ComfyUI, confirms the SDXL checkpoint is
-loadable, checks the LoRA folder is writable, and validates your ai-toolkit
-paths. Exits non-zero if anything critical is wrong, so you can wire it into a
-script. Nothing here needs a GPU.
+loadable, checks the LoRA folder is writable, and runs a real CUDA kernel in
+ai-toolkit's selected Python. Exits non-zero if anything critical is wrong, so
+you can wire it into a script.
 """
 
 from __future__ import annotations
@@ -26,6 +26,7 @@ import yaml
 from . import config
 from . import train as trainer
 from . import validate as validator
+from .app_service import probe_trainer_runtime
 
 OK, WARN, FAIL = "  [ok]  ", "  [warn]", "  [FAIL]"
 CheckResult = tuple[bool, str, str]
@@ -103,11 +104,13 @@ def check_ai_toolkit(results: list[CheckResult]) -> None:
         return
     d = Path(config.AI_TOOLKIT_DIR)
     run_py = d / "run.py"
+    toolkit_ready = False
     if not d.exists():
         results.append((False, FAIL, f"AI_TOOLKIT_DIR missing: {d}"))
     elif not run_py.exists():
         results.append((False, FAIL, f"ai-toolkit run.py missing at {run_py}"))
     else:
+        toolkit_ready = True
         results.append((True, OK, f"ai-toolkit found: {d}"))
     py = config.AI_TOOLKIT_PYTHON
     if not py or not _executable_exists(py):
@@ -116,6 +119,19 @@ def check_ai_toolkit(results: list[CheckResult]) -> None:
         )
     else:
         results.append((True, OK, f"ai-toolkit python: {py}"))
+        if toolkit_ready:
+            ready, detail = probe_trainer_runtime(Path(py))
+            results.append(
+                (
+                    ready,
+                    OK if ready else FAIL,
+                    (
+                        f"Trainer CUDA verified: {detail}"
+                        if ready
+                        else f"Trainer CUDA check failed: {detail}"
+                    ),
+                )
+            )
 
 
 def check_config_file(results: list[CheckResult], cfg: Path) -> None:

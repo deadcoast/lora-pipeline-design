@@ -19,15 +19,19 @@ Usage (from repo root):
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import config
 from . import prepare_dataset as prep
 from . import train as trainer
 from . import validate as validator
-from .io_utils import atomic_copy
+from .io_utils import atomic_copy, atomic_write_text
+
+RECOVERY_SCHEMA_VERSION = 1
 
 
 def _copy_lora_to_comfy(lora_path: Path) -> str:
@@ -73,6 +77,45 @@ def _checkpoint_snapshot(name: str) -> dict[Path, tuple[int, int]]:
     }
 
 
+def _validation_recovery_path(name: str) -> Path:
+    return config.RUN_CONFIGS_DIR / f"{name}-recovery.json"
+
+
+def _write_validation_recovery(
+    *,
+    name: str,
+    state: str,
+    lora_name: str,
+    installed_lora_path: Path,
+    trigger: str,
+    preset: str,
+    updated_at: str | None = None,
+) -> dict[str, object]:
+    """Atomically record the installed handoff before ComfyUI validation starts."""
+
+    if state not in {"validation_pending", "complete"}:
+        raise ValueError(f"Unsupported validation recovery state: {state}")
+    timestamp = updated_at or datetime.now(UTC).isoformat()
+    payload: dict[str, object] = {
+        "schema_version": RECOVERY_SCHEMA_VERSION,
+        "project_name": name,
+        "state": state,
+        "lora_name": lora_name,
+        "installed_lora_path": str(installed_lora_path.resolve()),
+        "expected_grid_path": str((config.GRIDS_DIR / f"{name}_grid.png").resolve()),
+        "trigger": trigger,
+        "preset": preset,
+        "checkpoint": config.COMFY_SDXL_CKPT,
+        "updated_at": timestamp,
+    }
+    destination = _validation_recovery_path(name)
+    atomic_write_text(
+        destination,
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+    )
+    return payload
+
+
 def run(args: argparse.Namespace) -> Path | None:
     name = config.validate_project_name(args.name)
     preset = getattr(args, "preset", "balanced")
@@ -86,6 +129,7 @@ def run(args: argparse.Namespace) -> Path | None:
     trigger = args.trigger
     dataset_dir = config.DATASETS_DIR / name
     before_training: dict[Path, tuple[int, int]] | None = None
+    installed_lora_name = ""
 
     if not args.skip_prep:
         if not args.src:
@@ -116,6 +160,7 @@ def run(args: argparse.Namespace) -> Path | None:
             )
 
     grid_path: Path | None = None
+    validation_recovery: dict[str, object] | None = None
     if not args.skip_validate:
         lora_name = args.lora
         if lora_name:
@@ -140,6 +185,23 @@ def run(args: argparse.Namespace) -> Path | None:
                     "Pass --lora <file> or verify the ai-toolkit output."
                 )
             lora_name = _copy_lora_to_comfy(candidates[0])
+        installed_lora_name = Path(lora_name).name
+        installed_lora_path = (
+            config.COMFY_LORA_DIR / installed_lora_name
+            if config.COMFY_LORA_DIR is not None
+            else Path(installed_lora_name)
+        )
+        validation_recovery = _write_validation_recovery(
+            name=name,
+            state="validation_pending",
+            lora_name=installed_lora_name,
+            installed_lora_path=installed_lora_path,
+            trigger=trigger,
+            preset=preset,
+        )
+        print(
+            f"[pipeline] Validation recovery saved -> {_validation_recovery_path(name)}"
+        )
 
         grid_path = validator.validate(
             lora=lora_name,
@@ -152,8 +214,40 @@ def run(args: argparse.Namespace) -> Path | None:
 
     if grid_path is not None:
         print(f"\n[pipeline] Complete. Review the grid: {grid_path}")
+        outcome_mode = "validate" if args.skip_train else "full"
+        result_path = grid_path
     else:
         print("\n[pipeline] Complete.")
+        outcome_mode = "prepare" if args.skip_train else "full"
+        result_path = dataset_dir if args.skip_train else config.CHECKPOINTS_DIR
+    outcome = {
+        "schema_version": 1,
+        "project_name": name,
+        "mode": outcome_mode,
+        "result_path": str(result_path.resolve()),
+        "trigger": trigger,
+        "preset": preset,
+        "checkpoint": config.COMFY_SDXL_CKPT,
+        "lora_name": installed_lora_name,
+        "completed_at": datetime.now(UTC).isoformat(),
+    }
+    atomic_write_text(
+        config.RUN_CONFIGS_DIR / f"{name}-result.json",
+        json.dumps(outcome, indent=2, ensure_ascii=False) + "\n",
+    )
+    if validation_recovery is not None:
+        _write_validation_recovery(
+            name=name,
+            state="complete",
+            lora_name=installed_lora_name,
+            installed_lora_path=Path(str(validation_recovery["installed_lora_path"])),
+            trigger=trigger,
+            preset=preset,
+        )
+        print(
+            "[pipeline] Validation recovery completed -> "
+            f"{_validation_recovery_path(name)}"
+        )
     return grid_path
 
 
@@ -180,7 +274,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         type=Path,
         help="Local SDXL checkpoint path passed to the trainer.",
     )
-    ap.add_argument("--strengths", type=float, nargs="+", default=[0.6, 0.8, 1.0])
+    ap.add_argument(
+        "--strengths",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.6, 0.8, 1.0],
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--lora", help="LoRA filename already visible to ComfyUI (skips auto-detect)."

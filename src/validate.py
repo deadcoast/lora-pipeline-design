@@ -23,7 +23,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 from . import config
 from .comfy_client import ComfyClient
@@ -38,6 +38,7 @@ DEFAULT_PROMPTS = [
     "{trigger}, black and white studio headshot, dramatic lighting",
     "{trigger}, smiling outdoors, natural daylight, sharp focus",
 ]
+DEFAULT_PROMPT_LABELS = ("Portrait", "City street", "Studio", "Outdoor")
 NEG = "lowres, bad anatomy, blurry, deformed, extra fingers, watermark, text"
 
 
@@ -150,6 +151,9 @@ def _grid(
     cell: int,
     labels: list[str],
     out_path: Path,
+    *,
+    row_labels: Sequence[str] = (),
+    column_labels: Sequence[str] = (),
 ) -> Path:
     if not images:
         raise ValueError("Cannot build a validation grid without images.")
@@ -158,23 +162,54 @@ def _grid(
     if len(labels) != len(images):
         raise ValueError("Each validation image must have exactly one label.")
     rows = (len(images) + cols - 1) // cols
-    pad, header = 8, 22
-    W = cols * cell + (cols + 1) * pad
-    H = rows * (cell + header) + (rows + 1) * pad
+    if row_labels and len(row_labels) != rows:
+        raise ValueError("Each validation row must have exactly one label.")
+    if column_labels and len(column_labels) != cols:
+        raise ValueError("Each validation column must have exactly one label.")
+    pad = 10
+    cell_header = 30 if any(labels) else 0
+    axis_top = 56 if column_labels else 0
+    axis_left = 230 if row_labels else 0
+    W = axis_left + cols * cell + (cols + 1) * pad
+    H = axis_top + rows * (cell + cell_header) + (rows + 1) * pad
     canvas = Image.new("RGB", (W, H), (24, 24, 27))
     draw = ImageDraw.Draw(canvas)
+    column_font = ImageFont.load_default(size=26)
+    row_font = ImageFont.load_default(size=24)
+    cell_font = ImageFont.load_default(size=18)
+    for column, label in enumerate(column_labels):
+        x = axis_left + pad + column * (cell + pad)
+        draw.text(
+            (x + 5, 13),
+            label[:28],
+            fill=(238, 238, 242),
+            font=column_font,
+        )
+    for row, label in enumerate(row_labels):
+        y = axis_top + pad + row * (cell + cell_header + pad)
+        draw.text(
+            (14, y + 9),
+            label[:24],
+            fill=(158, 231, 215),
+            font=row_font,
+        )
     for i, img_path in enumerate(images):
         r, c = divmod(i, cols)
-        x = pad + c * (cell + pad)
-        y = pad + r * (cell + header + pad)
+        x = axis_left + pad + c * (cell + pad)
+        y = axis_top + pad + r * (cell + cell_header + pad)
         with Image.open(img_path) as source:
             im = source.convert("RGB")
             im.thumbnail((cell, cell))
         image_x = x + (cell - im.width) // 2
-        image_y = y + header + (cell - im.height) // 2
+        image_y = y + cell_header + (cell - im.height) // 2
         canvas.paste(im, (image_x, image_y))
-        if i < len(labels):
-            draw.text((x + 2, y + 4), labels[i][:48], fill=(220, 220, 220))
+        if labels[i]:
+            draw.text(
+                (x + 3, y + 4),
+                labels[i][:48],
+                fill=(220, 220, 220),
+                font=cell_font,
+            )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     encoded = io.BytesIO()
     canvas.save(encoded, "PNG")
@@ -215,6 +250,11 @@ def validate(
         )
 
     formatted_prompts = [p.replace("{trigger}", trigger) for p in prompts]
+    prompt_labels = (
+        list(DEFAULT_PROMPT_LABELS)
+        if list(prompts) == DEFAULT_PROMPTS
+        else [f"Prompt {index + 1}" for index in range(len(prompts))]
+    )
     work_dir = config.GRIDS_DIR / run_name
     cells: list[Path] = []
     labels: list[str] = []
@@ -225,7 +265,7 @@ def validate(
             saved = client.run_and_save(graph, work_dir, prefix=f"s{s}_p{pi}_")
             if len(saved) == 1:
                 cells.append(saved[0])
-                labels.append(f"str {s} · p{pi}")
+                labels.append("")
                 print(f"  [ok] strength={s} prompt#{pi} -> {saved[0].name}")
             else:
                 raise RuntimeError(
@@ -245,6 +285,11 @@ def validate(
         cell=384,
         labels=labels,
         out_path=grid_path,
+        row_labels=[
+            "No LoRA · baseline" if strength == 0 else f"LoRA strength {strength:g}"
+            for strength in strengths
+        ],
+        column_labels=prompt_labels,
     )
     print(f"\n[validate] Grid written: {grid_path}")
     return grid_path
@@ -259,7 +304,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         required=True,
         help="LoRA filename as seen by ComfyUI (in models/loras).",
     )
-    ap.add_argument("--strengths", type=float, nargs="+", default=[0.6, 0.8, 1.0])
+    ap.add_argument(
+        "--strengths",
+        type=float,
+        nargs="+",
+        default=[0.0, 0.6, 0.8, 1.0],
+    )
     ap.add_argument("--trigger", default=config.DEFAULT_TRIGGER)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
