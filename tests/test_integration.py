@@ -4,6 +4,7 @@ actually works, with NO GPU, NO models, and NO real ComfyUI.
 It boots the mock ComfyUI (tests/mock_comfy.py) in a background process, then
 drives the REAL shipped code:
   * ComfyClient: queue -> websocket completion -> history -> view -> file
+  * ComfyClient: verified user-workflow publication through real HTTP routes
   * validate.validate(): full prompt x strength sweep -> stitched grid
   * doctor.run(): preflight checks against the (mock) server
 
@@ -18,6 +19,7 @@ import json
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -123,7 +125,21 @@ def main() -> int:
                 f"validate produced {len(cells)} cells / grid exists={grid.exists()}"
             )
 
-        # --- Test 3: doctor detects a reachable server + a real config problem ---
+        # --- Test 3: exact workflow publication and idempotent read-back ---
+        with tempfile.TemporaryDirectory(prefix="mivim-workflow-") as temporary:
+            workflow = Path(temporary) / "itest_use_in_comfyui.json"
+            workflow.write_text(
+                '{"version": 0.4, "nodes": []}\n',
+                encoding="utf-8",
+            )
+            publication = client.publish_workflow(workflow, user_id="default")
+            repeated = client.publish_workflow(workflow, user_id="default")
+        if publication.created and not repeated.created:
+            print(f"PASS: verified workflow publication -> {publication.relative_path}")
+        else:
+            failures.append("workflow publication was not verified and idempotent")
+
+        # --- Test 4: doctor detects a reachable server + a real config problem ---
         code = doctor.run()
         # AI_TOOLKIT_DIR is intentionally blank, so doctor MUST return non-zero.
         if code != 0:

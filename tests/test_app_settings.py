@@ -28,6 +28,8 @@ def test_settings_round_trip_is_versioned_and_keeps_path_semantics(
     settings = AppSettings(
         comfy_host="127.0.0.1:9000",
         comfy_installation_id="portrait-desktop",
+        comfy_user_installation_id="portrait-desktop",
+        comfy_user_id="profile-a",
         comfy_lora_dir=Path("D:/Comfy Shared/models/loras"),
         comfy_checkpoint="realistic.safetensors",
         confirmed_sdxl_checkpoint="realistic.safetensors",
@@ -46,6 +48,7 @@ def test_settings_round_trip_is_versioned_and_keeps_path_semantics(
             workflow_path=Path("D:/MIVIM/grids/family_portrait_use_in_comfyui.json"),
             workflow_fingerprint="sha256:verified-workflow",
             comfy_installation_id="portrait-desktop",
+            comfy_installation_name="Portrait Desktop",
             comfy_host="127.0.0.1:9000",
             installed_lora_path=Path(
                 "D:/Comfy Shared/models/loras/family_portrait.safetensors"
@@ -56,6 +59,12 @@ def test_settings_round_trip_is_versioned_and_keeps_path_semantics(
             ),
             checkpoint_fingerprint="sha256:verified-checkpoint",
             starting_strength=0.8,
+            published_workflow_path=(
+                "workflows/MIVIM/family_portrait_use_in_comfyui.json"
+            ),
+            published_workflow_fingerprint="sha256:verified-workflow",
+            workflow_user_id="profile-a",
+            workflow_user_name="Portraits",
         ),
         last_project=ProjectDraft(
             project_name="family_portrait",
@@ -115,6 +124,29 @@ def test_version_one_settings_migrate_without_losing_existing_paths(
     assert loaded.comfy_host == "127.0.0.1:9000"
     assert loaded.datasets_dir == Path("D:/MIVIM/datasets")
     assert loaded.training_base_model is None
+
+
+def test_version_four_settings_migrate_to_profile_aware_handoff(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": 4,
+                "comfy_host": "127.0.0.1:8299",
+                "comfy_installation_id": "portrait-desktop",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_settings(path)
+
+    assert loaded.schema_version == SETTINGS_SCHEMA_VERSION
+    assert loaded.comfy_installation_id == "portrait-desktop"
+    assert loaded.comfy_user_installation_id == ""
+    assert loaded.comfy_user_id == ""
 
 
 def test_load_settings_keeps_valid_fields_and_defaults_invalid_fields(

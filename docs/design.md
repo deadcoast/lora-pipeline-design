@@ -23,11 +23,13 @@ The default journey is:
 4. Resolve readiness failures through user-facing actions.
 5. Review prepared thumbnails and edit captions when preparation is separated.
 6. Monitor or stop the real pipeline.
-7. Review the verified baseline grid and copy the exact setup into ComfyUI.
+7. Review the verified baseline grid and add the exact workflow to ComfyUI.
 
 Comfy Desktop state is read-only discovery input. The studio stores its own
 approved connection and workspace settings, validates the live local API, and
 never modifies Desktop's installation registry or managed application files.
+Publishing a result uses ComfyUI's supported profile-scoped user-data API,
+never a guessed Desktop filesystem path.
 
 ---
 
@@ -284,10 +286,12 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 - LoRA installation writes a versioned recovery record before validation starts.
   If validation fails or the studio closes, the next launch restores a
   validation-only retry and never repeats completed preparation or training.
-  Recovery is attempt-bound to the original Desktop installation, host, LoRA
-  and checkpoint paths/fingerprints, strengths, seed, and validation signature.
-  Startup and Retry hash large models outside the GUI thread and keep Retry
-  disabled until they match.
+  Recovery is attempt-bound to the original Desktop installation, LoRA and
+  checkpoint paths/fingerprints, strengths, seed, and validation signature.
+  The launch-time host is recorded as execution evidence, while a later dynamic
+  port is accepted only after the durable installation and model identities
+  match. Startup and Retry hash large models outside the GUI thread and keep
+  Retry disabled until they match.
 - Validation includes a no-LoRA baseline and plain-language prompt/strength
   axes. Each verified cell is resumable from an attempt-isolated atomic
   manifest only when the full signature, including both model identities,
@@ -296,7 +300,10 @@ Ship each milestone before starting the next — it keeps failures isolated to o
   identity phrase, checkpoint, tested default strength nearest 0.8, and an
   editable core-node Workflow JSON v0.4. The PNG separately embeds the exact
   API prompt and equivalent UI workflow. Model hashing and result-action gates
-  run outside the GUI thread.
+  run outside the GUI thread. The Results page publishes the verified JSON
+  through ComfyUI's profile-scoped user-data API, preserves conflicting files
+  with content-fingerprinted names, reads the saved bytes back, and retains a
+  manual JSON fallback.
 - Training configs are reusable templates; the orchestrator injects each run's
   name, dataset path, selected Comfy Desktop checkpoint file, output path, and
   selected preset before launching ai-toolkit.
@@ -314,6 +321,8 @@ Ship each milestone before starting the next — it keeps failures isolated to o
   model-root set, exact checkpoint file, and LoRA destination—even when only
   one installation exists. Missing ownership or a path outside those effective
   roots blocks a full run instead of falling through to another instance.
+  Missing saved IDs remain visibly unavailable until the user chooses, and
+  duplicate instance names block runtime matching rather than guessing.
 - A missing LoRA directory can be created from the GUI only when it exactly
   matches the selected Desktop instance's verified model-root declaration; the
   repair never creates arbitrary or parent paths.

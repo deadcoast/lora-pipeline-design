@@ -12,6 +12,7 @@ not need to edit ``.env`` or understand its implementation details.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import subprocess
@@ -58,6 +59,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -96,7 +98,12 @@ from .app_settings import (
     save_settings,
     with_user_storage_defaults,
 )
-from .comfy_client import ComfyClient, PromptCancellationResult
+from .comfy_client import (
+    ComfyClient,
+    ComfyUserProfile,
+    PromptCancellationResult,
+    WorkflowPublication,
+)
 from .comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
@@ -137,6 +144,15 @@ def _file_stat_identity(path: Path) -> tuple[int, int]:
 
     stat = path.stat()
     return stat.st_size, stat.st_mtime_ns
+
+
+def _file_bytes_fingerprint(data: bytes) -> str:
+    """Return the same immutable-file fingerprint used by result records."""
+
+    digest = hashlib.sha256()
+    digest.update(b"mivim-file-v1\0")
+    digest.update(data)
+    return f"sha256:{digest.hexdigest()}"
 
 
 def _layout_clear(layout: QVBoxLayout | QGridLayout) -> None:
@@ -479,6 +495,11 @@ class MainWindow(QMainWindow):
         self._source_request = 0
         self._readiness_request = 0
         self._desktop_poll_remaining = 0
+        self._workflow_publish_request = 0
+        self._pending_workflow_publish: RunResult | None = None
+        self._published_workflow: tuple[RunResult, WorkflowPublication] | None = None
+        self._workflow_publish_busy = False
+        self._workflow_publish_retry_requires_refresh = False
 
         self.setWindowTitle(f"MIVIM LoRA Studio {__version__}")
         self.setWindowIcon(_app_icon())
@@ -491,7 +512,7 @@ class MainWindow(QMainWindow):
         self._restore_last_result()
         self._restore_validation_recovery()
         self._connect_form_invalidation()
-        QTimer.singleShot(80, self.refresh_setup)
+        self._single_shot(80, self.refresh_setup)
 
     # ------------------------------------------------------------------ shell
     def _build_ui(self) -> None:
@@ -1147,8 +1168,21 @@ class MainWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         handoff_text.addWidget(self.result_details_label)
+        self.workflow_handoff_status_label = _hint("")
+        self.workflow_handoff_status_label.setObjectName("workflowHandoffStatus")
+        self.workflow_handoff_status_label.setWordWrap(True)
+        self.workflow_handoff_status_label.setVisible(False)
+        handoff_text.addWidget(self.workflow_handoff_status_label)
         handoff_layout.addLayout(handoff_text, 1)
-        self.open_ready_workflow_button = _button("Show ready workflow")
+        self.publish_workflow_button = _button(
+            "Add to ComfyUI",
+            "primaryButton",
+        )
+        self.publish_workflow_button.setObjectName("publishWorkflowButton")
+        self.publish_workflow_button.clicked.connect(self.add_ready_workflow_to_comfyui)
+        self.publish_workflow_button.setVisible(False)
+        handoff_layout.addWidget(self.publish_workflow_button)
+        self.open_ready_workflow_button = _button("Show JSON file")
         self.open_ready_workflow_button.setObjectName("openReadyWorkflowButton")
         self.open_ready_workflow_button.clicked.connect(self.open_ready_workflow)
         self.open_ready_workflow_button.setVisible(False)
@@ -1247,9 +1281,37 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(failed)
         self.thread_pool.start(worker)
 
+    def _single_shot(self, delay_ms: int, callback: Callable[[], None]) -> None:
+        """Run a delayed UI callback only while this window still exists."""
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+
+        def invoke() -> None:
+            timer.deleteLater()
+            if not self._closing:
+                callback()
+
+        timer.timeout.connect(invoke)
+        timer.start(max(0, delay_ms))
+
     def refresh_setup(self) -> None:
         self._setup_request += 1
         request = self._setup_request
+        if self._workflow_publish_busy:
+            # A discovery refresh changes the runtime generation.  An in-flight
+            # upload may still finish remotely, but its callback must not update
+            # this UI as though it used the newly discovered instance/port.
+            self._workflow_publish_request += 1
+            self._workflow_publish_busy = False
+            self._workflow_publish_retry_requires_refresh = False
+            self.publish_workflow_button.setEnabled(False)
+            self.publish_workflow_button.setText("Checking connection…")
+            self.workflow_handoff_status_label.setText(
+                "The ComfyUI connection changed while the workflow was being "
+                "added. MIVIM is checking the current Desktop instance before "
+                "you retry."
+            )
         self.retry_comfy_button.setEnabled(False)
         self.setup_logs_button.setVisible(False)
         self.comfy_badge.setText("CHECKING")
@@ -1287,7 +1349,7 @@ class MainWindow(QMainWindow):
             return
         if self._collect_settings() != original:
             self.retry_comfy_button.setEnabled(True)
-            QTimer.singleShot(0, self.refresh_setup)
+            self._single_shot(0, self.refresh_setup)
             return
         settings, discovery, status = cast(
             tuple[AppSettings, ComfyDesktopDiscovery, ComfyApiStatus],
@@ -1306,6 +1368,8 @@ class MainWindow(QMainWindow):
             )
             is None
         )
+        displayed = self._displayed_result_record
+        verified = self._verified_result_identity
         local_installations = tuple(
             installation
             for installation in discovery.installations
@@ -1317,7 +1381,39 @@ class MainWindow(QMainWindow):
         self.open_desktop_button.setEnabled(
             discovery.launcher.supported or not local_installations
         )
-        if status.reachable:
+        local_ids = {installation.id for installation in local_installations}
+        unavailable_selection = bool(settings.comfy_installation_id) and (
+            settings.comfy_installation_id not in local_ids
+        )
+        selected_installation = discovery.selected_installation
+        selected_name = (
+            selected_installation.name if selected_installation is not None else ""
+        )
+        ambiguous_runtime_identity = (
+            selected_installation is not None
+            and sum(
+                installation.name.casefold() == selected_name.casefold()
+                for installation in local_installations
+            )
+            > 1
+        )
+        if unavailable_selection:
+            self.comfy_badge.setText("CHOOSE INSTANCE")
+            state = "warning"
+            self.comfy_summary_label.setText(
+                "The Comfy Desktop installation used last time is no longer "
+                "registered. Choose another instance explicitly; MIVIM did not "
+                "connect to a substitute."
+            )
+        elif ambiguous_runtime_identity:
+            self.comfy_badge.setText("RENAME INSTANCES")
+            state = "warning"
+            self.comfy_summary_label.setText(
+                f"More than one Desktop installation is named "
+                f'"{selected_name}". Rename one in Comfy Desktop so '
+                "MIVIM can identify the correct running instance safely."
+            )
+        elif status.reachable:
             self.comfy_badge.setText("CONNECTED")
             state = "ready"
             self.comfy_summary_label.setText(
@@ -1360,9 +1456,29 @@ class MainWindow(QMainWindow):
         self.save_current_settings(silent=True)
         if status.reachable:
             self._desktop_poll_remaining = 0
+            if self._pending_workflow_publish == self._displayed_result_record:
+                self._single_shot(0, self.add_ready_workflow_to_comfyui)
         elif self._desktop_poll_remaining > 0:
             self._desktop_poll_remaining -= 1
-            QTimer.singleShot(5000, self.refresh_setup)
+            self._single_shot(5000, self.refresh_setup)
+        elif self._pending_workflow_publish is not None:
+            self._pending_workflow_publish = None
+            self.publish_workflow_button.setText("Retry add to ComfyUI")
+            self.publish_workflow_button.setEnabled(
+                verified is not None
+                and verified[0] == displayed
+                and self._result_comfy_context_issue(displayed) is None
+            )
+            self.workflow_handoff_status_label.setText(
+                "LoRA ready; workflow not added yet. Launch the original "
+                "ComfyUI instance, then retry."
+            )
+        if (
+            displayed is not None
+            and self._pending_workflow_publish is None
+            and not self._workflow_publish_busy
+        ):
+            self._render_workflow_handoff_state(displayed)
 
     def _setup_failed_for(self, request: int, message: str) -> None:
         if request == self._setup_request:
@@ -1390,8 +1506,17 @@ class MainWindow(QMainWindow):
             if self.discovery is not None
             else ()
         )
+        local_ids = {installation.id for installation in local_installations}
+        unavailable_selection = bool(self.settings.comfy_installation_id) and (
+            self.settings.comfy_installation_id not in local_ids
+        )
         with QSignalBlocker(self.installation_combo):
             self.installation_combo.clear()
+            if unavailable_selection:
+                self.installation_combo.addItem(
+                    "Original instance unavailable — choose another",
+                    self.settings.comfy_installation_id,
+                )
             for installation in local_installations:
                 label = installation.name + (
                     f"  ·  {installation.version}" if installation.version else ""
@@ -1402,7 +1527,7 @@ class MainWindow(QMainWindow):
             )
             if selected_index >= 0:
                 self.installation_combo.setCurrentIndex(selected_index)
-        show_instance_picker = len(local_installations) > 1
+        show_instance_picker = len(local_installations) > 1 or unavailable_selection
         self.installation_label.setVisible(show_instance_picker)
         self.installation_combo.setVisible(show_instance_picker)
 
@@ -1761,7 +1886,7 @@ class MainWindow(QMainWindow):
         )
         self._invalidate_readiness()
         self.refresh_setup()
-        QTimer.singleShot(0, self.run_readiness_checks)
+        self._single_shot(0, self.run_readiness_checks)
 
     def choose_base_model(self) -> None:
         start = self.base_model_edit.text().strip()
@@ -1913,14 +2038,17 @@ class MainWindow(QMainWindow):
             "Comfy Desktop is opening. The studio will check the local instance again."
         )
         self._desktop_poll_remaining = 18
-        QTimer.singleShot(3000, self.refresh_setup)
+        self._single_shot(3000, self.refresh_setup)
 
     def open_result_comfy_desktop(self) -> None:
         issue = self._result_comfy_context_issue(self._displayed_result_record)
         if issue is not None:
-            self._show_error("Reconnect the original ComfyUI setup", issue)
-            return
+            self.show_page(NAV_SETUP)
         self.open_comfy_desktop()
+        if issue is not None and self._desktop_poll_remaining > 0:
+            self.comfy_summary_label.setText(
+                f"{issue} Comfy Desktop is opening so you can reconnect it."
+            )
 
     def _start_result_identity_verification(self, record: RunResult) -> None:
         """Hash restored model files off the GUI thread before handoff actions."""
@@ -1940,6 +2068,7 @@ class MainWindow(QMainWindow):
                     _file_stat_identity(lora_path) == cached[1]
                     and _file_stat_identity(checkpoint_path) == cached[2]
                 ):
+                    self._render_workflow_handoff_state(record)
                     return
             except OSError:
                 pass
@@ -1948,6 +2077,7 @@ class MainWindow(QMainWindow):
         self._verified_result_identity = None
         self._result_identity_failure = None
         self.result_open_comfy_button.setEnabled(False)
+        self._render_workflow_handoff_state(record)
 
         def verify() -> tuple[tuple[int, int], tuple[int, int]]:
             if (
@@ -2002,6 +2132,7 @@ class MainWindow(QMainWindow):
                 and self.comfy_status.reachable
                 and self._result_comfy_context_issue(record) is None
             )
+            self._render_workflow_handoff_state(record)
             self.studio_log.info(
                 "result.models.verified",
                 f"project={record.project_name}",
@@ -2032,56 +2163,105 @@ class MainWindow(QMainWindow):
         self._verified_result_identity = None
         self._result_identity_failure = (record, message)
         self.result_open_comfy_button.setEnabled(False)
+        self._render_workflow_handoff_state(record)
         self.studio_log.warning(
             "result.models.unverified",
             f"project={record.project_name}; detail={message}",
         )
 
-    def _result_comfy_context_issue(self, record: RunResult | None) -> str | None:
+    def _result_comfy_setup_issue(self, record: RunResult | None) -> str | None:
+        """Explain why a result is not bound to one current Desktop instance."""
+
         if record is None or record.mode != "full":
             return None
+        installation_id = record.comfy_installation_id.strip()
+        installation_name = self._result_installation_name(record)
+        if not installation_id:
+            return (
+                "This result does not record which Comfy Desktop installation "
+                "created it. Open Connect and select the original instance before "
+                "adding the workflow."
+            )
         current = self._collect_settings()
-        if record.comfy_installation_id != current.comfy_installation_id.strip():
+        if installation_id != current.comfy_installation_id.strip():
             return (
                 "This result belongs to another Comfy Desktop installation. "
-                "Reconnect that installation before opening the workflow."
+                f'Open Connect and select "{installation_name}" before adding or '
+                "opening the workflow in ComfyUI."
             )
-        live_host = (
-            self.comfy_status.host
-            if self.comfy_status is not None and self.comfy_status.reachable
-            else None
-        )
-        if live_host is not None and record.comfy_host != live_host:
+        if self.discovery is None:
             return (
-                "The running ComfyUI address does not match the instance used for "
-                "this result. Reconnect the original Desktop installation."
+                "MIVIM has not checked the original Comfy Desktop installation "
+                "yet. Open Connect and check the connection before adding the "
+                "workflow."
+            )
+        selected = self.discovery.selected_installation
+        original = next(
+            (
+                installation
+                for installation in self.discovery.installations
+                if installation.is_local and installation.id == installation_id
+            ),
+            None,
+        )
+        if original is None:
+            return (
+                f'The original Comfy Desktop installation "{installation_name}" '
+                "is no longer registered. Open Connect and restore or explicitly "
+                "replace that instance."
+            )
+        if selected is None or selected.id != installation_id:
+            return (
+                f'The original Comfy Desktop installation "{installation_name}" '
+                "is not selected. Open Connect and select it before adding the "
+                "workflow."
             )
         if (
-            record.installed_lora_path is None
-            or not record.installed_lora_path.is_file()
+            sum(
+                installation.is_local
+                and installation.name.casefold() == selected.name.casefold()
+                for installation in self.discovery.installations
+            )
+            > 1
         ):
-            return "The LoRA is missing from the ComfyUI installation used by this run."
-        if (
+            return (
+                f'More than one Desktop installation is named "{selected.name}". '
+                "Rename one in Comfy Desktop, then check the connection again."
+            )
+        if record.installed_lora_path is not None and (
             current.comfy_lora_dir is None
             or record.installed_lora_path.resolve().parent
             != self.service.project_path(current.comfy_lora_dir).resolve()
         ):
             return (
                 "The selected ComfyUI model library is not the one that received "
-                "this LoRA. Reconnect the original installation."
+                "this LoRA. Open Connect and restore the original installation."
             )
-        if record.checkpoint_path is None or not record.checkpoint_path.is_file():
-            return "The SDXL checkpoint used for this result is missing."
-        if (
+        if record.checkpoint_path is not None and (
             current.training_base_model is None
             or self.service.project_path(current.training_base_model).resolve()
             != record.checkpoint_path.resolve()
             or current.comfy_checkpoint.strip() != record.checkpoint
         ):
             return (
-                "A different SDXL checkpoint is selected. Reconnect the exact "
-                "checkpoint used for this result."
+                "A different SDXL checkpoint is selected. Open Connect and restore "
+                "the exact checkpoint used for this result."
             )
+        return None
+
+    def _result_comfy_context_issue(self, record: RunResult | None) -> str | None:
+        setup_issue = self._result_comfy_setup_issue(record)
+        if setup_issue is not None:
+            return setup_issue
+        if record is None or record.mode != "full":
+            return None
+        if (
+            record.installed_lora_path is None
+            or not record.installed_lora_path.is_file()
+        ):
+            return "The LoRA is missing from the ComfyUI installation used by this run."
+        if record.checkpoint_path is None or not record.checkpoint_path.is_file():
+            return "The SDXL checkpoint used for this result is missing."
         failure = self._result_identity_failure
         if failure is not None and failure[0] == record:
             return (
@@ -2109,6 +2289,86 @@ class MainWindow(QMainWindow):
                 "validation before using this workflow."
             )
         return None
+
+    def _render_workflow_handoff_state(self, record: RunResult) -> None:
+        """Keep the Results action and guidance aligned with the exact blocker."""
+
+        if (
+            self._displayed_result_record != record
+            or record.mode != "full"
+            or self._workflow_publish_busy
+            or self._pending_workflow_publish is not None
+        ):
+            return
+        setup_issue = self._result_comfy_setup_issue(record)
+        if setup_issue is not None:
+            self.publish_workflow_button.setText("Fix in Connect")
+            self.publish_workflow_button.setEnabled(True)
+            self.workflow_handoff_status_label.setText(
+                f"Cannot add this workflow yet. {setup_issue}"
+            )
+            return
+
+        failure = self._result_identity_failure
+        if failure is not None and failure[0] == record:
+            self.publish_workflow_button.setText("Check files again")
+            self.publish_workflow_button.setEnabled(True)
+            self.workflow_handoff_status_label.setText(
+                f"Cannot add this workflow yet. {failure[1]} Restore the original "
+                "files, then choose Check files again."
+            )
+            return
+
+        verified = self._verified_result_identity
+        if verified is None or verified[0] != record:
+            self.publish_workflow_button.setText("Checking model files…")
+            self.publish_workflow_button.setEnabled(False)
+            self.workflow_handoff_status_label.setText(
+                "Checking the exact LoRA and checkpoint before enabling the "
+                "ComfyUI handoff…"
+            )
+            return
+
+        context_issue = self._result_comfy_context_issue(record)
+        if context_issue is not None:
+            self.publish_workflow_button.setText("Check files again")
+            self.publish_workflow_button.setEnabled(True)
+            self.workflow_handoff_status_label.setText(
+                f"Cannot add this workflow yet. {context_issue}"
+            )
+            return
+
+        if (
+            record.published_workflow_path
+            and record.published_workflow_fingerprint == record.workflow_fingerprint
+        ):
+            workflow_name = (
+                record.workflow_path.stem
+                if record.workflow_path is not None
+                else record.project_name
+            )
+            profile_note = (
+                f" for profile {record.workflow_user_name}"
+                if record.workflow_user_name
+                else ""
+            )
+            self.publish_workflow_button.setText("Check in ComfyUI")
+            self.workflow_handoff_status_label.setText(
+                f"Previously added {workflow_name} under Workflows → MIVIM"
+                f"{profile_note}. Check that it is still available before opening "
+                "ComfyUI."
+            )
+        else:
+            self.publish_workflow_button.setText(
+                "Retry add to ComfyUI"
+                if self._workflow_publish_retry_requires_refresh
+                else "Add to ComfyUI"
+            )
+            self.workflow_handoff_status_label.setText(
+                "Add the verified JSON to Local User Workflows. MIVIM will not "
+                "overwrite an existing workflow."
+            )
+        self.publish_workflow_button.setEnabled(True)
 
     def open_comfy_ui(self) -> None:
         context_issue = self._result_comfy_context_issue(self._displayed_result_record)
@@ -2160,11 +2420,15 @@ class MainWindow(QMainWindow):
         self.comfy_status = None
         self.open_comfy_button.setEnabled(False)
         self.result_open_comfy_button.setEnabled(False)
+        self._workflow_publish_request += 1
+        self._workflow_publish_busy = False
+        self._pending_workflow_publish = None
+        self.publish_workflow_button.setEnabled(False)
         self._invalidate_readiness()
 
     def _installation_changed(self, *_args: object) -> None:
         self._connection_changed()
-        QTimer.singleShot(0, self.refresh_setup)
+        self._single_shot(0, self.refresh_setup)
 
     def _checkpoint_changed(self, checkpoint: str) -> None:
         confirmed = self.settings.confirmed_sdxl_checkpoint
@@ -2829,7 +3093,7 @@ class MainWindow(QMainWindow):
         owned_prompt = self._owned_comfy_prompt
         if owned_prompt is None:
             self._stop_process_tree(force=False)
-            QTimer.singleShot(
+            self._single_shot(
                 3500,
                 lambda: self._force_stop_pipeline_for_attempt(process, command),
             )
@@ -2902,7 +3166,7 @@ class MainWindow(QMainWindow):
             )
             return
         self._owned_prompt_cancelled(result)
-        QTimer.singleShot(
+        self._single_shot(
             3500,
             lambda: self._force_stop_pipeline_for_attempt(process, command),
         )
@@ -3272,7 +3536,7 @@ class MainWindow(QMainWindow):
             "The result was verified on disk and is ready to review."
         )
         self._show_result(command.expected_result, record)
-        QTimer.singleShot(450, lambda: self.show_page(NAV_RESULTS))
+        self._single_shot(450, lambda: self.show_page(NAV_RESULTS))
 
     def _restore_navigation(self) -> None:
         self.nav_buttons[NAV_SETUP].setEnabled(True)
@@ -3581,6 +3845,18 @@ class MainWindow(QMainWindow):
                 + ", ".join(mismatches)
                 + " for this run."
             )
+        installation_name = (
+            next(
+                (
+                    installation.name
+                    for installation in self.discovery.installations
+                    if installation.id == outcome.comfy_installation_id
+                ),
+                "",
+            )
+            if self.discovery is not None
+            else ""
+        )
         record = RunResult(
             project_name=draft.project_name,
             mode=mode,
@@ -3594,6 +3870,7 @@ class MainWindow(QMainWindow):
             workflow_path=outcome.workflow_path,
             workflow_fingerprint=workflow_fingerprint,
             comfy_installation_id=outcome.comfy_installation_id,
+            comfy_installation_name=installation_name,
             comfy_host=outcome.comfy_host,
             installed_lora_path=outcome.installed_lora_path,
             lora_fingerprint=outcome.lora_fingerprint,
@@ -3619,6 +3896,7 @@ class MainWindow(QMainWindow):
 
     def _show_result(self, result: Path, record: RunResult | None = None) -> None:
         self._latest_result = result
+        previous_record = self._displayed_result_record
         if record is None and self.settings.last_result is not None:
             stored_path = self.service.project_path(
                 self.settings.last_result.result_path
@@ -3626,6 +3904,17 @@ class MainWindow(QMainWindow):
             if stored_path == result:
                 record = self.settings.last_result
         self._displayed_result_record = record
+        if previous_record != record:
+            self._workflow_publish_request += 1
+            self._workflow_publish_busy = False
+            self._workflow_publish_retry_requires_refresh = False
+        if (
+            self._published_workflow is not None
+            and self._published_workflow[0] != record
+        ):
+            self._published_workflow = None
+        if self._pending_workflow_publish != record:
+            self._pending_workflow_publish = None
         self.nav_buttons[NAV_RESULTS].setEnabled(True)
         self.result_path_label.setText(str(result))
         self.result_path_label.setCursorPosition(0)
@@ -3636,6 +3925,10 @@ class MainWindow(QMainWindow):
         self.continue_training_button.setVisible(False)
         self.open_full_grid_button.setVisible(False)
         self.open_ready_workflow_button.setVisible(False)
+        self.publish_workflow_button.setVisible(False)
+        self.publish_workflow_button.setEnabled(False)
+        self.publish_workflow_button.setText("Add to ComfyUI")
+        self.workflow_handoff_status_label.setVisible(False)
         self.result_open_desktop_button.setVisible(False)
         if result.is_file() and result.suffix.lower() in {
             ".png",
@@ -3664,6 +3957,10 @@ class MainWindow(QMainWindow):
                         and bool(record.workflow_fingerprint)
                     )
                     self.open_ready_workflow_button.setVisible(workflow_ready)
+                    self.publish_workflow_button.setVisible(workflow_ready)
+                    self.workflow_handoff_status_label.setVisible(workflow_ready)
+                    if workflow_ready:
+                        self._render_workflow_handoff_state(record)
                     self.result_open_desktop_button.setVisible(True)
                     self.result_details_label.setText(
                         f"LoRA: {record.lora_name or 'See the result folder'}\n"
@@ -3672,7 +3969,7 @@ class MainWindow(QMainWindow):
                         f"Tested starting strength: {record.starting_strength:g}\n"
                         "Ready workflow: "
                         f"{record.workflow_path.name if record.workflow_path else 'Not recorded'}\n"
-                        "Drag the JSON into ComfyUI or use Workflow → Open."
+                        "Use the guided action here, or fall back to Workflow → Open."
                     )
                     self.comfy_handoff_card.setVisible(True)
                 self.result_image.set_source_pixmap(pixmap)
@@ -3747,13 +4044,518 @@ class MainWindow(QMainWindow):
         self.overwrite_checkbox.setChecked(False)
         self.review_project()
 
-    def copy_result_setup(self) -> None:
+    def _ready_workflow_for_handoff(self, record: RunResult | None) -> Path | None:
+        workflow = record.workflow_path if record is not None else None
+        if (
+            record is None
+            or workflow is None
+            or not workflow.is_file()
+            or not record.workflow_fingerprint
+        ):
+            self._show_error(
+                "Ready workflow not found",
+                "The ComfyUI workflow is no longer available. Retry validation to "
+                "recreate it without retraining.",
+            )
+            return None
+        try:
+            fingerprint = artifact_fingerprint(workflow)
+        except (FileNotFoundError, OSError, ValueError):
+            fingerprint = ""
+        if fingerprint != record.workflow_fingerprint:
+            self._show_error(
+                "Ready workflow changed",
+                "This workflow no longer matches the verified validation result. "
+                "Retry validation to recreate the safe version.",
+            )
+            return None
+        return workflow
+
+    def _ready_workflow_snapshot(
+        self,
+        record: RunResult,
+    ) -> tuple[str, bytes] | None:
+        """Read and verify the exact immutable bytes that will be uploaded."""
+
+        workflow = record.workflow_path
+        if (
+            workflow is None
+            or not workflow.is_file()
+            or workflow.is_symlink()
+            or not record.workflow_fingerprint
+        ):
+            self._show_error(
+                "Ready workflow not found",
+                "The ComfyUI workflow is no longer available. Retry validation to "
+                "recreate it without retraining.",
+            )
+            return None
+        try:
+            data = workflow.read_bytes()
+        except OSError as exc:
+            self._show_error(
+                "Ready workflow could not be read",
+                f"{exc}\n\nRetry validation to recreate the safe workflow.",
+            )
+            return None
+        if _file_bytes_fingerprint(data) != record.workflow_fingerprint:
+            self._show_error(
+                "Ready workflow changed",
+                "This workflow no longer matches the verified validation result. "
+                "Retry validation to recreate the safe version.",
+            )
+            return None
+        return workflow.name, data
+
+    def _result_installation_name(self, record: RunResult) -> str:
+        if record.comfy_installation_name:
+            return record.comfy_installation_name
+        if self.discovery is not None:
+            match = next(
+                (
+                    installation
+                    for installation in self.discovery.installations
+                    if installation.id == record.comfy_installation_id
+                ),
+                None,
+            )
+            if match is not None:
+                return match.name
+        return "the original local instance"
+
+    def _workflow_publish_is_current(
+        self,
+        request: int,
+        setup_request: int,
+        record: RunResult,
+        host: str,
+    ) -> bool:
+        """Return whether an async handoff still targets its exact runtime."""
+
+        status = self.comfy_status
+        selected = (
+            self.discovery.selected_installation if self.discovery is not None else None
+        )
+        return (
+            request == self._workflow_publish_request
+            and setup_request == self._setup_request
+            and self._displayed_result_record == record
+            and self._collect_settings().comfy_installation_id
+            == record.comfy_installation_id
+            and selected is not None
+            and selected.id == record.comfy_installation_id
+            and status is not None
+            and status.reachable
+            and status.host == host
+        )
+
+    def _open_result_connect_repair(self, record: RunResult, issue: str) -> None:
+        """Take a blocked Results handoff directly to a fresh Connect check."""
+
+        self.studio_log.warning(
+            "workflow.publish.blocked",
+            f"project={record.project_name}; detail={issue}",
+        )
+        self.show_page(NAV_SETUP)
+        self.comfy_summary_label.setText(issue)
+        self._single_shot(0, self.refresh_setup)
+
+    def add_ready_workflow_to_comfyui(self) -> None:
+        """Publish the verified UI workflow through ComfyUI's user-data API."""
+
         record = self._displayed_result_record
-        if record is None:
+        published = self._published_workflow
+        if published is not None and published[0] == record:
+            self.open_comfy_ui()
+            return
+        setup_issue = self._result_comfy_setup_issue(record)
+        if record is not None and setup_issue is not None:
+            self._open_result_connect_repair(record, setup_issue)
+            return
+        identity_failure = self._result_identity_failure
+        if (
+            record is not None
+            and identity_failure is not None
+            and identity_failure[0] == record
+        ):
+            self._start_result_identity_verification(record)
             return
         context_issue = self._result_comfy_context_issue(record)
         if context_issue is not None:
-            self._show_error("Reconnect the original ComfyUI setup", context_issue)
+            if (
+                record is not None
+                and record.installed_lora_path is not None
+                and record.checkpoint_path is not None
+            ):
+                self._start_result_identity_verification(record)
+            else:
+                self._show_error(
+                    "Result files need attention",
+                    f"{context_issue}\n\nRetry validation to recreate this handoff.",
+                )
+            return
+        if record is None:
+            return
+
+        if self._workflow_publish_retry_requires_refresh:
+            self._workflow_publish_retry_requires_refresh = False
+            self._pending_workflow_publish = record
+            self.publish_workflow_button.setEnabled(False)
+            self.publish_workflow_button.setText("Refreshing connection…")
+            self.workflow_handoff_status_label.setText(
+                "Checking the current Comfy Desktop runtime and port before retrying…"
+            )
+            self.refresh_setup()
+            return
+
+        status = self.comfy_status
+        host = status.host if status is not None and status.reachable else None
+        if host is None:
+            self._pending_workflow_publish = record
+            self.publish_workflow_button.setEnabled(False)
+            self.publish_workflow_button.setText("Waiting for ComfyUI…")
+            self.workflow_handoff_status_label.setText(
+                "Comfy Desktop is opening. Launch "
+                f"{self._result_installation_name(record)}; MIVIM will finish "
+                "adding the workflow automatically."
+            )
+            self.open_comfy_desktop()
+            if self._desktop_poll_remaining <= 0:
+                self._pending_workflow_publish = None
+                self.publish_workflow_button.setText("Retry add to ComfyUI")
+                self.publish_workflow_button.setEnabled(True)
+                self.workflow_handoff_status_label.setText(
+                    "LoRA ready; workflow not added yet. Open the original "
+                    "ComfyUI instance, then retry."
+                )
+            return
+
+        workflow_snapshot = self._ready_workflow_snapshot(record)
+        if workflow_snapshot is None:
+            return
+        workflow_name, workflow_data = workflow_snapshot
+        self._pending_workflow_publish = None
+        self._workflow_publish_request += 1
+        request = self._workflow_publish_request
+        setup_request = self._setup_request
+        self._workflow_publish_busy = True
+        self.publish_workflow_button.setEnabled(False)
+        self.publish_workflow_button.setText("Checking profiles…")
+        self.workflow_handoff_status_label.setText(
+            "Checking which ComfyUI profile should receive the workflow…"
+        )
+
+        def load_profiles() -> tuple[ComfyUserProfile, ...]:
+            return ComfyClient(host=host, timeout=10.0).list_user_profiles()
+
+        self._run_worker(
+            load_profiles,
+            lambda result: self._workflow_profiles_loaded(
+                request,
+                setup_request,
+                record,
+                workflow_name,
+                workflow_data,
+                host,
+                result,
+            ),
+            lambda message: self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                message,
+            ),
+            operation="workflow.profiles",
+        )
+
+    def _workflow_profiles_loaded(
+        self,
+        request: int,
+        setup_request: int,
+        record: RunResult,
+        workflow_name: str,
+        workflow_data: bytes,
+        host: str,
+        result: object,
+    ) -> None:
+        if not self._workflow_publish_is_current(
+            request,
+            setup_request,
+            record,
+            host,
+        ):
+            return
+        context_issue = self._result_comfy_context_issue(record)
+        if context_issue is not None:
+            self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                context_issue,
+            )
+            return
+        if not isinstance(result, tuple) or not all(
+            isinstance(item, ComfyUserProfile) for item in result
+        ):
+            self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                "ComfyUI returned an unexpected user-profile list.",
+            )
+            return
+        profiles = cast(tuple[ComfyUserProfile, ...], result)
+        if not profiles:
+            self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                "ComfyUI has no regular profile that can receive this workflow.",
+            )
+            return
+
+        if len(profiles) == 1:
+            profile = profiles[0]
+        else:
+            saved_user = (
+                self.settings.comfy_user_id
+                if self.settings.comfy_user_installation_id
+                == record.comfy_installation_id
+                else record.workflow_user_id
+            )
+            selected_index = next(
+                (
+                    index
+                    for index, candidate in enumerate(profiles)
+                    if candidate.id == saved_user
+                ),
+                0,
+            )
+            duplicate_names = {
+                candidate.name.casefold()
+                for candidate in profiles
+                if sum(
+                    other.name.casefold() == candidate.name.casefold()
+                    for other in profiles
+                )
+                > 1
+            }
+            profile_choices = [
+                (
+                    f"{candidate.name} — {candidate.id}"
+                    if candidate.name.casefold() in duplicate_names
+                    else candidate.name
+                )
+                for candidate in profiles
+            ]
+            selected_name, accepted = QInputDialog.getItem(
+                self,
+                "Choose a ComfyUI profile",
+                "Which ComfyUI profile should receive this workflow?",
+                profile_choices,
+                selected_index,
+                False,
+            )
+            if not accepted:
+                self._workflow_publish_busy = False
+                self.publish_workflow_button.setText("Add to ComfyUI")
+                self.publish_workflow_button.setEnabled(True)
+                self.workflow_handoff_status_label.setText(
+                    "Nothing was changed. Choose Add to ComfyUI when you are ready."
+                )
+                self.studio_log.info(
+                    "workflow.publish.cancelled",
+                    f"project={record.project_name}",
+                )
+                return
+            try:
+                profile = profiles[profile_choices.index(selected_name)]
+            except ValueError:
+                self._workflow_publish_failed(
+                    request,
+                    setup_request,
+                    record,
+                    "The selected ComfyUI profile is no longer available.",
+                )
+                return
+
+        if not self._workflow_publish_is_current(
+            request,
+            setup_request,
+            record,
+            host,
+        ):
+            return
+
+        self.settings = replace(
+            self._collect_settings(),
+            comfy_user_installation_id=record.comfy_installation_id,
+            comfy_user_id=profile.id,
+        )
+        self.save_current_settings(silent=True)
+        self.publish_workflow_button.setText("Adding…")
+        self.workflow_handoff_status_label.setText(
+            f"Adding the verified workflow to {profile.name}…"
+        )
+
+        def publish() -> WorkflowPublication:
+            if (
+                request != self._workflow_publish_request
+                or setup_request != self._setup_request
+            ):
+                raise RuntimeError(
+                    "The ComfyUI connection changed before the upload started."
+                )
+            return ComfyClient(host=host, timeout=15.0).publish_workflow_bytes(
+                workflow_name,
+                workflow_data,
+                user_id=profile.id,
+                expected_fingerprint=record.workflow_fingerprint,
+            )
+
+        self._run_worker(
+            publish,
+            lambda publication: self._workflow_published(
+                request,
+                setup_request,
+                record,
+                host,
+                publication,
+            ),
+            lambda message: self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                message,
+            ),
+            operation="workflow.publish",
+        )
+
+    def _workflow_published(
+        self,
+        request: int,
+        setup_request: int,
+        record: RunResult,
+        host: str,
+        result: object,
+    ) -> None:
+        if not self._workflow_publish_is_current(
+            request,
+            setup_request,
+            record,
+            host,
+        ):
+            return
+        if not isinstance(result, WorkflowPublication):
+            self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                "ComfyUI returned an unexpected publication result.",
+            )
+            return
+        if result.fingerprint != record.workflow_fingerprint:
+            self._workflow_publish_failed(
+                request,
+                setup_request,
+                record,
+                "The published workflow did not match the verified local JSON.",
+            )
+            return
+
+        published_record = replace(
+            record,
+            comfy_installation_name=self._result_installation_name(record),
+            published_workflow_path=result.relative_path,
+            published_workflow_fingerprint=result.fingerprint,
+            workflow_user_id=result.profile.id,
+            workflow_user_name=result.profile.name,
+        )
+        verified = self._verified_result_identity
+        if verified is not None and verified[0] == record:
+            self._verified_result_identity = (
+                published_record,
+                verified[1],
+                verified[2],
+            )
+        self._displayed_result_record = published_record
+        self._published_workflow = (published_record, result)
+        self._workflow_publish_busy = False
+        self._workflow_publish_retry_requires_refresh = False
+        self._pending_workflow_publish = None
+        self._persist_run_result(published_record)
+        self.publish_workflow_button.setText("Open ComfyUI")
+        self.publish_workflow_button.setEnabled(True)
+        workflow_name = (
+            record.workflow_path.stem
+            if record.workflow_path is not None
+            else record.project_name
+        )
+        collision_note = (
+            " A protected alternate name was used because the fingerprinted "
+            "name had been changed in ComfyUI."
+            if result.renamed
+            else ""
+        )
+        if result.created:
+            receipt = (
+                f"Added {workflow_name} to Workflows → MIVIM for profile "
+                f"{result.profile.name}."
+            )
+        else:
+            receipt = (
+                f"{workflow_name} is already available in Workflows → MIVIM for "
+                "profile "
+                f"{result.profile.name}; the verified copy matched exactly."
+            )
+        self.workflow_handoff_status_label.setText(
+            f"{receipt}{collision_note} If ComfyUI was already open, click Refresh "
+            "in Workflows."
+        )
+        self.studio_log.info(
+            "workflow.publish.finished",
+            (
+                f"project={record.project_name}; host={host}; "
+                f"path={result.relative_path}; created={result.created}"
+            ),
+        )
+
+    def _workflow_publish_failed(
+        self,
+        request: int,
+        setup_request: int,
+        record: RunResult,
+        message: str,
+    ) -> None:
+        if (
+            request != self._workflow_publish_request
+            or setup_request != self._setup_request
+            or self._displayed_result_record != record
+        ):
+            return
+        self._workflow_publish_busy = False
+        self._workflow_publish_retry_requires_refresh = True
+        self._pending_workflow_publish = None
+        self.publish_workflow_button.setText("Retry add to ComfyUI")
+        self.publish_workflow_button.setEnabled(
+            self._result_comfy_context_issue(record) is None
+        )
+        self.workflow_handoff_status_label.setText(
+            "LoRA ready; workflow not added yet. Retry, or use Show JSON file."
+        )
+        self.studio_log.warning(
+            "workflow.publish.failed",
+            f"project={record.project_name}; detail={message}",
+        )
+        self._show_error(
+            "LoRA is ready; workflow was not added",
+            f"{message}\n\nNothing was overwritten. Retry, or use Show JSON file "
+            "and Workflow → Open in ComfyUI.",
+        )
+
+    def copy_result_setup(self) -> None:
+        record = self._displayed_result_record
+        if record is None:
             return
         QApplication.clipboard().setText(
             "\n".join(
@@ -3771,7 +4573,7 @@ class MainWindow(QMainWindow):
             )
         )
         self.copy_result_setup_button.setText("Copied")
-        QTimer.singleShot(
+        self._single_shot(
             1800,
             lambda: self.copy_result_setup_button.setText("Copy setup"),
         )
@@ -3799,35 +4601,25 @@ class MainWindow(QMainWindow):
 
     def open_ready_workflow(self) -> None:
         record = self._displayed_result_record
-        workflow = record.workflow_path if record is not None else None
-        context_issue = self._result_comfy_context_issue(record)
-        if context_issue is not None:
-            self._show_error("Reconnect the original ComfyUI setup", context_issue)
+        workflow = self._ready_workflow_for_handoff(record)
+        if workflow is not None:
+            self._show_local_file(workflow)
+
+    def _show_local_file(self, path: Path) -> None:
+        if not path.is_file():
+            self._show_error("File not found", f"The file no longer exists:\n{path}")
             return
-        if (
-            record is None
-            or workflow is None
-            or not workflow.is_file()
-            or not record.workflow_fingerprint
-        ):
-            self._show_error(
-                "Ready workflow not found",
-                "The ComfyUI workflow is no longer available. Retry validation to "
-                "recreate it without retraining.",
-            )
+        resolved = path.resolve()
+        if sys.platform == "win32":
+            try:
+                subprocess.Popen(
+                    ["explorer.exe", f"/select,{resolved}"],
+                    close_fds=True,
+                )
+            except OSError as exc:
+                self._show_error("Could not show the file", str(exc))
             return
-        try:
-            fingerprint = artifact_fingerprint(workflow)
-        except (FileNotFoundError, OSError, ValueError):
-            fingerprint = ""
-        if fingerprint != record.workflow_fingerprint:
-            self._show_error(
-                "Ready workflow changed",
-                "This workflow no longer matches the verified validation result. "
-                "Retry validation to recreate the safe version.",
-            )
-            return
-        self._open_local_folder(workflow.parent)
+        self._open_local_folder(resolved.parent)
 
     def _open_local_folder(self, folder: Path) -> None:
         if not folder.is_dir():
@@ -3858,6 +4650,7 @@ class MainWindow(QMainWindow):
         previous_name = self.draft.project_name if self.draft is not None else ""
         self._result_identity_request += 1
         self._recovery_check_request += 1
+        self._workflow_publish_request += 1
         self.pipeline_process = None
         self.pipeline_command = None
         self.pipeline_pid = None
@@ -3874,6 +4667,9 @@ class MainWindow(QMainWindow):
         self._displayed_result_record = None
         self._verified_result_identity = None
         self._result_identity_failure = None
+        self._pending_workflow_publish = None
+        self._published_workflow = None
+        self._workflow_publish_busy = False
         self._pipeline_line_buffer = ""
         self.run_stack.setCurrentIndex(0)
         self.run_log.clear()

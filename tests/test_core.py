@@ -1009,6 +1009,13 @@ def test_project_name_rejects_path_traversal() -> None:
         config.validate_project_name("../outside")
 
 
+def test_project_name_rejects_names_too_long_for_generated_windows_files() -> None:
+    with pytest.raises(ValueError, match="80 characters or fewer"):
+        config.validate_project_name("a" * (config.MAX_PROJECT_NAME_LENGTH + 1))
+
+    assert config.validate_project_name("a" * config.MAX_PROJECT_NAME_LENGTH)
+
+
 @pytest.mark.parametrize("name", ["CON", "con.txt", "person."])
 def test_project_name_rejects_windows_reserved_names(name: str) -> None:
     with pytest.raises(ValueError, match="Windows directory"):

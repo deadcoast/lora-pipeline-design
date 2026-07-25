@@ -1244,17 +1244,6 @@ class ApplicationService:
                 "This LoRA belongs to a different Comfy Desktop installation. "
                 "Return to Connection and select the installation used for training."
             )
-        current_host = (
-            settings.comfy_host.strip()
-            .removeprefix("http://")
-            .removeprefix("https://")
-            .rstrip("/")
-        )
-        if recovery.comfy_host != current_host:
-            return (
-                "This retry belongs to a different ComfyUI address. Return to "
-                "Connection and reconnect the original Desktop instance."
-            )
         configured_lora_dir = settings.comfy_lora_dir
         if configured_lora_dir is None:
             return (
@@ -1368,22 +1357,29 @@ class ApplicationService:
             for installation in found.installations
             if installation.is_local
         )
-        selected_id = settings.comfy_installation_id
-        if local_installations and not any(
-            item.id == selected_id for item in local_installations
-        ):
+        selected_id = settings.comfy_installation_id.strip()
+        selected_installation = next(
+            (item for item in local_installations if item.id == selected_id),
+            None,
+        )
+        selection_unavailable = bool(selected_id) and selected_installation is None
+        if not selected_id:
             if found.selected_installation is not None:
                 selected_id = found.selected_installation.id
             elif len(local_installations) == 1:
                 selected_id = local_installations[0].id
-            else:
-                selected_id = ""
         if selected_id:
             found = select_comfy_installation(found, selected_id)
 
         host_candidates = tuple(found.host_candidates)
         requested_host = _normalise_host(settings.comfy_host)
-        if found.selected_installation is not None:
+        ordered_hosts: tuple[str, ...]
+        if selection_unavailable:
+            # Preserve the durable ID and stop here. Silently substituting the
+            # current or only Desktop installation crosses a model-library
+            # identity boundary.
+            ordered_hosts = ()
+        elif found.selected_installation is not None:
             # Identity-bearing port locks are the only safe way to associate a
             # live API with a selected Desktop installation.  Never continue
             # probing generic ports that may belong to another installation.

@@ -512,15 +512,43 @@ def select_comfy_installation(
             for installation in discovery.installations
             if installation.id == installation_id and installation.is_local
         ),
-        discovery.selected_installation,
+        None,
     )
     if selected is None:
-        return discovery
-    matched_hosts = tuple(
-        hint.host
-        for hint in discovery.runtime_hints
-        if hint.installation_name.casefold() == selected.name.casefold()
+        return replace(
+            discovery,
+            selected_installation=None,
+            model_roots=(),
+            input_dir=None,
+            output_dir=None,
+            host_candidates=(),
+        )
+
+    same_named_installations = tuple(
+        installation
+        for installation in discovery.installations
+        if installation.is_local
+        and installation.name.casefold() == selected.name.casefold()
     )
+    matched_hosts = (
+        tuple(
+            hint.host
+            for hint in discovery.runtime_hints
+            if hint.installation_name.casefold() == selected.name.casefold()
+        )
+        if len(same_named_installations) == 1
+        else ()
+    )
+    warnings = discovery.warnings
+    if len(same_named_installations) > 1:
+        warnings = (
+            *warnings,
+            (
+                f'Multiple Comfy Desktop installations are named "{selected.name}". '
+                "Their running ports cannot be distinguished safely; rename one "
+                "installation in Comfy Desktop."
+            ),
+        )
     # A selected Desktop installation is an identity boundary.  Falling back
     # to another installation's live port can train into and validate against
     # different model libraries without any obvious error for a casual user.
@@ -549,6 +577,7 @@ def select_comfy_installation(
         input_dir=input_dir,
         output_dir=output_dir,
         host_candidates=hosts,
+        warnings=warnings,
     )
 
 

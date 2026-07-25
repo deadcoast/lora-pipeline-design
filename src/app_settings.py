@@ -14,7 +14,7 @@ from typing import Any
 from .app_models import AppSettings, ProjectDraft, RunResult, TrainingPreset
 from .io_utils import atomic_write_text
 
-SETTINGS_SCHEMA_VERSION = 4
+SETTINGS_SCHEMA_VERSION = 5
 DATA_DIR_OVERRIDE = "MIVIM_LORA_PIPELINE_DATA_DIR"
 _APPLICATION_DIRECTORY = Path("MIVIM") / "LoRA Pipeline"
 
@@ -184,6 +184,11 @@ def _run_result_from_json(value: object) -> RunResult | None:
             "",
             allow_empty=True,
         ),
+        comfy_installation_name=_text(
+            value.get("comfy_installation_name"),
+            "",
+            allow_empty=True,
+        ),
         comfy_host=_text(value.get("comfy_host"), "", allow_empty=True),
         installed_lora_path=_path(value.get("installed_lora_path"), None),
         lora_fingerprint=_text(
@@ -198,6 +203,26 @@ def _run_result_from_json(value: object) -> RunResult | None:
             allow_empty=True,
         ),
         starting_strength=starting_strength,
+        published_workflow_path=_text(
+            value.get("published_workflow_path"),
+            "",
+            allow_empty=True,
+        ),
+        published_workflow_fingerprint=_text(
+            value.get("published_workflow_fingerprint"),
+            "",
+            allow_empty=True,
+        ),
+        workflow_user_id=_text(
+            value.get("workflow_user_id"),
+            "",
+            allow_empty=True,
+        ),
+        workflow_user_name=_text(
+            value.get("workflow_user_name"),
+            "",
+            allow_empty=True,
+        ),
     )
 
 
@@ -209,7 +234,7 @@ def _settings_from_json(value: object) -> AppSettings:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in {1, 2, 3, SETTINGS_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, SETTINGS_SCHEMA_VERSION}
     ):
         return defaults
 
@@ -219,6 +244,16 @@ def _settings_from_json(value: object) -> AppSettings:
         comfy_installation_id=_text(
             value.get("comfy_installation_id"),
             defaults.comfy_installation_id,
+            allow_empty=True,
+        ),
+        comfy_user_installation_id=_text(
+            value.get("comfy_user_installation_id"),
+            defaults.comfy_user_installation_id,
+            allow_empty=True,
+        ),
+        comfy_user_id=_text(
+            value.get("comfy_user_id"),
+            defaults.comfy_user_id,
             allow_empty=True,
         ),
         comfy_lora_dir=_path(
@@ -309,12 +344,17 @@ def _run_result_to_json(result: RunResult | None) -> dict[str, object] | None:
         "workflow_path": _path_for_json(result.workflow_path),
         "workflow_fingerprint": result.workflow_fingerprint,
         "comfy_installation_id": result.comfy_installation_id,
+        "comfy_installation_name": result.comfy_installation_name,
         "comfy_host": result.comfy_host,
         "installed_lora_path": _path_for_json(result.installed_lora_path),
         "lora_fingerprint": result.lora_fingerprint,
         "checkpoint_path": _path_for_json(result.checkpoint_path),
         "checkpoint_fingerprint": result.checkpoint_fingerprint,
         "starting_strength": result.starting_strength,
+        "published_workflow_path": result.published_workflow_path,
+        "published_workflow_fingerprint": result.published_workflow_fingerprint,
+        "workflow_user_id": result.workflow_user_id,
+        "workflow_user_name": result.workflow_user_name,
     }
 
 
@@ -324,6 +364,8 @@ def _settings_to_json(settings: AppSettings) -> dict[str, object]:
         "schema_version": SETTINGS_SCHEMA_VERSION,
         "comfy_host": settings.comfy_host,
         "comfy_installation_id": settings.comfy_installation_id,
+        "comfy_user_installation_id": settings.comfy_user_installation_id,
+        "comfy_user_id": settings.comfy_user_id,
         "comfy_lora_dir": _path_for_json(settings.comfy_lora_dir),
         "comfy_checkpoint": settings.comfy_checkpoint,
         "confirmed_sdxl_checkpoint": settings.confirmed_sdxl_checkpoint,

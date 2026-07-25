@@ -49,6 +49,9 @@ You can also launch it directly:
   exists, then binds that instance's runtime port, model roots, checkpoint, and
   LoRA destination as one connection. It never falls through to another
   instance's runtime when the selected instance is offline.
+- Preserves a missing saved instance as **Original instance unavailable** until
+  the user explicitly chooses another. Duplicate Desktop display names are
+  blocked because current runtime locks cannot distinguish them safely.
 - Probes only explicit loopback addresses; it never scans the network.
 - Lists the checkpoints and LoRAs reported by the running ComfyUI API.
 - Resolves the selected checkpoint back to its local Desktop model file so
@@ -150,9 +153,16 @@ unsupported image files are named before Start can launch a process.
 - Shows and copies the exact LoRA filename, identity phrase, base checkpoint,
   ready-workflow path, and tested default strength nearest 0.8.
 - Hashes the exact LoRA and checkpoint in the background before enabling
-  handoff actions, then requires the same Desktop installation, host, and model
-  paths. The studio opens the workflow folder or ComfyUI; the user still drags
-  in the PNG/JSON or uses **Workflow → Open**.
+  handoff actions, then requires the same Desktop installation and model paths.
+  A normal Desktop restart may use a new dynamic port without invalidating that
+  durable identity.
+- Adds the exact verified JSON to the selected ComfyUI user profile through the
+  supported user-data API under **Workflows → MIVIM**. Existing workflows are
+  never overwritten: each new file has a content-fingerprinted name, identical
+  bytes are accepted as already added, and every write is read back before
+  approval.
+- Keeps **Show JSON file** and **Workflow → Open** as a visible fallback. If the
+  Workflows sidebar was already open, the app tells the user to click Refresh.
 
 ## Required external tools
 

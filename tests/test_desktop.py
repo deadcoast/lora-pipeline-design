@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import tomllib
+from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
 
@@ -34,13 +35,18 @@ from src.app_models import (
 )
 from src.app_service import ApplicationService, PipelineCommand
 from src.app_settings import load_settings, save_settings
-from src.comfy_client import PromptCancellationResult
+from src.comfy_client import (
+    ComfyUserProfile,
+    PromptCancellationResult,
+    WorkflowPublication,
+)
 from src.comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
     ComfyInstallation,
     ComfyLauncher,
     ComfyModelRoot,
+    ComfyRuntimeHint,
 )
 from src.dataset_review import PreparedDatasetDialog
 from src.desktop import NAV_RESULTS, NAV_RUN, MainWindow, _build_parser
@@ -117,6 +123,145 @@ def _wait_for_initial_setup(qtbot, window: MainWindow) -> None:
         lambda: window.comfy_badge.text() != "CHECKING",
         timeout=5_000,
     )
+
+
+def _result_desktop_discovery(
+    root: Path,
+    *,
+    installation_id: str = "desktop-a",
+    installation_name: str = "Portrait Desktop",
+) -> ComfyDesktopDiscovery:
+    installation = ComfyInstallation(
+        id=installation_id,
+        name=installation_name,
+        source_id="standalone",
+        install_path=root,
+        comfyui_path=root,
+        version="test",
+        status="installed",
+        last_launched_at=1,
+        use_shared_models=False,
+    )
+    model_root = ComfyModelRoot(
+        path=root / "models",
+        loras=root / "models" / "loras",
+        checkpoints=root / "models" / "checkpoints",
+        source=installation_name,
+        exists=True,
+    )
+    return ComfyDesktopDiscovery(
+        config_dir=root,
+        legacy_config_dir=None,
+        installations=(installation,),
+        selected_installation=installation,
+        model_roots=(model_root,),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=(),
+        launcher=ComfyLauncher("Comfy Desktop", "test", "", (), False),
+        warnings=(),
+    )
+
+
+def _ready_full_result(
+    root: Path,
+    *,
+    installation_id: str = "desktop-a",
+    installation_name: str = "Portrait Desktop",
+) -> tuple[AppSettings, RunResult, Path]:
+    grid = root / "portrait_grid.png"
+    Image.new("RGB", (64, 64), "blue").save(grid)
+    workflow = root / "portrait_v1_use_in_comfyui.json"
+    workflow.write_text('{"version": 0.4, "nodes": []}\n', encoding="utf-8")
+    lora = root / "models" / "loras" / "portrait.safetensors"
+    lora.parent.mkdir(parents=True)
+    lora.write_bytes(b"lora")
+    checkpoint = root / "models" / "checkpoints" / "sdxl.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    record = RunResult(
+        project_name="portrait_v1",
+        mode="full",
+        result_path=grid,
+        completed_at="2026-07-24T12:00:00+00:00",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+        checkpoint=checkpoint.name,
+        lora_name=lora.name,
+        result_fingerprint=artifact_fingerprint(grid),
+        workflow_path=workflow,
+        workflow_fingerprint=artifact_fingerprint(workflow),
+        comfy_installation_id=installation_id,
+        comfy_installation_name=installation_name,
+        comfy_host="127.0.0.1:8188",
+        installed_lora_path=lora,
+        lora_fingerprint=artifact_fingerprint(lora),
+        checkpoint_path=checkpoint,
+        checkpoint_fingerprint=artifact_fingerprint(checkpoint),
+    )
+    settings = AppSettings(
+        comfy_installation_id=installation_id,
+        comfy_lora_dir=lora.parent,
+        comfy_checkpoint=checkpoint.name,
+        training_base_model=checkpoint,
+        last_result=record,
+    )
+    return settings, record, workflow
+
+
+def _open_online_result_window(
+    qtbot,
+    root: Path,
+    monkeypatch,
+    *,
+    host: str = "127.0.0.1:8188",
+) -> tuple[MainWindow, RunResult, Path, _FixedDiscoveryService]:
+    settings, record, workflow = _ready_full_result(root)
+    discovery = replace(
+        _result_desktop_discovery(root),
+        runtime_hints=(
+            ComfyRuntimeHint(
+                host=host,
+                installation_name="Portrait Desktop",
+                pid=1234,
+                timestamp=1,
+            ),
+        ),
+    )
+    service = _FixedDiscoveryService(root=root, discovery=discovery)
+
+    def reachable_status(
+        hosts: Sequence[str],
+        **_kwargs,
+    ) -> ComfyApiStatus:
+        candidates = tuple(hosts)
+        selected_host = candidates[0] if candidates else None
+        return ComfyApiStatus(
+            selected_host is not None,
+            selected_host,
+            (record.checkpoint,),
+            (record.lora_name,),
+            None if selected_host is not None else "offline",
+        )
+
+    monkeypatch.setattr(app_service, "probe_comfy_api", reachable_status)
+    window = MainWindow(
+        settings=settings,
+        settings_path=root / "settings.json",
+        service=service,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitUntil(
+        lambda: (
+            window._verified_result_identity is not None
+            and window._verified_result_identity[0] == record
+            and window.comfy_status is not None
+            and window.comfy_status.reachable
+        ),
+        timeout=5_000,
+    )
+    return window, record, workflow, service
 
 
 def test_user_can_prepare_photos_through_the_actual_desktop_pipeline(
@@ -589,6 +734,61 @@ def test_verified_missing_comfy_lora_folder_has_safe_gui_repair(
     assert not outside.exists()
     assert errors
     assert errors[-1][0] == "LoRA folder was not created"
+
+
+def test_unavailable_saved_desktop_requires_an_explicit_user_choice(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    current = ComfyInstallation(
+        id="current",
+        name="Current Desktop",
+        source_id="standalone",
+        install_path=tmp_path / "current",
+        comfyui_path=tmp_path / "current" / "ComfyUI",
+        version="v0.28.2",
+        status="installed",
+        last_launched_at=1,
+    )
+    discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=(current,),
+        selected_installation=current,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=("127.0.0.1:8188",),
+        launcher=ComfyLauncher("", "", "", (), False),
+        warnings=(),
+    )
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(
+            False,
+            None,
+            (),
+            (),
+            "offline",
+        ),
+    )
+    window = MainWindow(
+        settings=AppSettings(comfy_installation_id="original"),
+        settings_path=tmp_path / "settings.json",
+        service=_FixedDiscoveryService(root=tmp_path, discovery=discovery),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+
+    assert window.settings.comfy_installation_id == "original"
+    assert window.comfy_badge.text() == "CHOOSE INSTANCE"
+    assert "did not connect to a substitute" in window.comfy_summary_label.text()
+    assert not window.installation_combo.isHidden()
+    assert window.installation_combo.currentData() == "original"
+    assert "Original instance unavailable" in window.installation_combo.currentText()
 
 
 def test_failed_pipeline_start_has_visible_recovery_actions(
@@ -1757,11 +1957,15 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
             last_result=record,
         ),
         settings_path=tmp_path / "settings.json",
-        service=_OfflineLocalService(root=tmp_path),
+        service=_FixedDiscoveryService(
+            root=tmp_path,
+            discovery=_result_desktop_discovery(tmp_path),
+        ),
     )
     qtbot.addWidget(window)
     window.show()
     opened: list[Path] = []
+    launched: list[list[str]] = []
 
     def capture_opened_path(url: QUrl) -> bool:
         opened.append(Path(url.toLocalFile()))
@@ -1771,13 +1975,28 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
         "src.desktop.QDesktopServices.openUrl",
         capture_opened_path,
     )
+    monkeypatch.setattr("src.desktop.sys.platform", "win32")
+    monkeypatch.setattr(
+        "src.desktop.subprocess.Popen",
+        lambda command, **_kwargs: launched.append(command),
+    )
     qtbot.waitUntil(
         lambda: (
             window._verified_result_identity is not None
             and window._verified_result_identity[0] == record
+            and window.discovery is not None
+            and window.discovery.selected_installation is not None
         ),
         timeout=5_000,
     )
+    window.comfy_status = ComfyApiStatus(
+        True,
+        "127.0.0.1:8299",
+        (checkpoint.name,),
+        (lora.name,),
+        None,
+    )
+    assert window._result_comfy_context_issue(record) is None
 
     assert "portrait_v1_000002000.safetensors" in window.result_details_label.text()
     assert "ohwx person" in window.result_details_label.text()
@@ -1792,7 +2011,8 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
         window.open_ready_workflow_button,
         Qt.MouseButton.LeftButton,
     )
-    assert opened == [grid, workflow.parent]
+    assert opened == [grid]
+    assert launched == [["explorer.exe", f"/select,{workflow.resolve()}"]]
     qtbot.mouseClick(
         window.copy_result_setup_button,
         Qt.MouseButton.LeftButton,
@@ -1801,6 +2021,13 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
     assert "LoRA: portrait_v1_000002000.safetensors" in copied
     assert "Starting strength: 0.8" in copied
     assert str(workflow) in copied
+    copy_reset_timers = [
+        timer
+        for timer in window.findChildren(QTimer)
+        if timer.isSingleShot() and timer.interval() == 1800
+    ]
+    assert len(copy_reset_timers) == 1
+    assert copy_reset_timers[0].parent() is window
     window.installation_combo.clear()
     window.installation_combo.addItem("Other Desktop", "desktop-b")
     assert "another Comfy Desktop installation" in (
@@ -1816,8 +2043,474 @@ def test_result_handoff_exposes_and_copies_the_exact_comfyui_setup(
         window.open_ready_workflow_button,
         Qt.MouseButton.LeftButton,
     )
-    assert opened == [grid, workflow.parent]
-    assert errors and errors[-1][0] == "Reconnect the original ComfyUI setup"
+    assert opened == [grid]
+    assert launched == [
+        ["explorer.exe", f"/select,{workflow.resolve()}"],
+        ["explorer.exe", f"/select,{workflow.resolve()}"],
+    ]
+    assert not errors
+
+
+def test_result_adds_and_verifies_workflow_through_the_user_facing_button(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    grid = tmp_path / "portrait_grid.png"
+    Image.new("RGB", (64, 64), "blue").save(grid)
+    workflow = tmp_path / "portrait_v1_use_in_comfyui.json"
+    workflow.write_text('{"version": 0.4, "nodes": []}\n', encoding="utf-8")
+    lora = tmp_path / "models" / "loras" / "portrait.safetensors"
+    lora.parent.mkdir(parents=True)
+    lora.write_bytes(b"lora")
+    checkpoint = tmp_path / "models" / "checkpoints" / "sdxl.safetensors"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"checkpoint")
+    record = RunResult(
+        project_name="portrait_v1",
+        mode="full",
+        result_path=grid,
+        completed_at="2026-07-24T12:00:00+00:00",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+        checkpoint=checkpoint.name,
+        lora_name=lora.name,
+        result_fingerprint=artifact_fingerprint(grid),
+        workflow_path=workflow,
+        workflow_fingerprint=artifact_fingerprint(workflow),
+        comfy_installation_id="desktop-a",
+        comfy_installation_name="Portrait Desktop",
+        comfy_host="127.0.0.1:8188",
+        installed_lora_path=lora,
+        lora_fingerprint=artifact_fingerprint(lora),
+        checkpoint_path=checkpoint,
+        checkpoint_fingerprint=artifact_fingerprint(checkpoint),
+    )
+    window = MainWindow(
+        settings=AppSettings(
+            comfy_installation_id="desktop-a",
+            comfy_lora_dir=lora.parent,
+            comfy_checkpoint=checkpoint.name,
+            training_base_model=checkpoint,
+            last_result=record,
+        ),
+        settings_path=tmp_path / "settings.json",
+        service=_FixedDiscoveryService(
+            root=tmp_path,
+            discovery=_result_desktop_discovery(tmp_path),
+        ),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitUntil(
+        lambda: (
+            window._verified_result_identity is not None
+            and window._verified_result_identity[0] == record
+            and window.discovery is not None
+            and window.discovery.selected_installation is not None
+        ),
+        timeout=5_000,
+    )
+    profile = ComfyUserProfile("profile-a", "Portraits")
+    other_profile = ComfyUserProfile("profile-b", "Other work")
+    publication = WorkflowPublication(
+        relative_path="workflows/MIVIM/portrait_v1_use_in_comfyui.json",
+        profile=profile,
+        fingerprint=record.workflow_fingerprint,
+        created=True,
+        renamed=False,
+    )
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.list_user_profiles",
+        lambda _client: (other_profile, profile),
+    )
+    monkeypatch.setattr(
+        "src.desktop.QInputDialog.getItem",
+        lambda *_args, **_kwargs: (profile.name, True),
+    )
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.publish_workflow_bytes",
+        lambda _client, _name, data, *, user_id, expected_fingerprint: (
+            publication
+            if user_id == profile.id
+            and data == workflow.read_bytes()
+            and expected_fingerprint == record.workflow_fingerprint
+            else None
+        ),
+    )
+    opened_desktop: list[bool] = []
+
+    def open_desktop() -> None:
+        opened_desktop.append(True)
+        window._desktop_poll_remaining = 18
+
+    monkeypatch.setattr(window, "open_comfy_desktop", open_desktop)
+
+    assert window.publish_workflow_button.isEnabled()
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    assert opened_desktop == [True]
+    assert window._pending_workflow_publish == record
+    assert window.publish_workflow_button.text() == "Waiting for ComfyUI…"
+    assert "Portrait Desktop" in window.workflow_handoff_status_label.text()
+
+    window.comfy_status = ComfyApiStatus(
+        True,
+        "127.0.0.1:8299",
+        (checkpoint.name,),
+        (lora.name,),
+        None,
+    )
+    window.add_ready_workflow_to_comfyui()
+    qtbot.waitUntil(lambda: window._published_workflow is not None, timeout=5_000)
+
+    published_record = window._displayed_result_record
+    assert published_record is not None
+    assert published_record.published_workflow_path == publication.relative_path
+    assert published_record.workflow_user_id == profile.id
+    assert window.settings.last_result == published_record
+    assert window.settings.comfy_user_installation_id == "desktop-a"
+    assert window.settings.comfy_user_id == profile.id
+    assert window.publish_workflow_button.text() == "Open ComfyUI"
+    assert "click Refresh in Workflows" in window.workflow_handoff_status_label.text()
+
+
+def test_result_block_explains_missing_original_and_opens_connect(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    settings, _record, _workflow = _ready_full_result(tmp_path)
+    replacement = _result_desktop_discovery(
+        tmp_path / "replacement",
+        installation_id="desktop-b",
+        installation_name="Replacement Desktop",
+    )
+    window = MainWindow(
+        settings=settings,
+        settings_path=tmp_path / "settings.json",
+        service=_FixedDiscoveryService(root=tmp_path, discovery=replacement),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    profile_requests: list[bool] = []
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.list_user_profiles",
+        lambda _client: profile_requests.append(True),
+    )
+
+    assert window.publish_workflow_button.text() == "Fix in Connect"
+    assert window.publish_workflow_button.isEnabled()
+    guidance = window.workflow_handoff_status_label.text()
+    assert "original Comfy Desktop installation" in guidance
+    assert "no longer registered" in guidance
+
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    assert window.pages.currentIndex() == 0
+    assert profile_requests == []
+
+
+def test_result_check_files_again_revalidates_restored_model(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window, record, _workflow, _service = _open_online_result_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+    )
+    assert record.installed_lora_path is not None
+    record.installed_lora_path.write_bytes(b"changed weights")
+    window._render_workflow_handoff_state(record)
+    assert window.publish_workflow_button.text() == "Check files again"
+
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window._result_identity_failure is not None
+            and window._result_identity_failure[0] == record
+        ),
+        timeout=5_000,
+    )
+    assert window.publish_workflow_button.text() == "Check files again"
+
+    record.installed_lora_path.write_bytes(b"lora")
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(
+        lambda: (
+            window._verified_result_identity is not None
+            and window._verified_result_identity[0] == record
+            and window.publish_workflow_button.text() == "Add to ComfyUI"
+        ),
+        timeout=5_000,
+    )
+
+
+def test_workflow_retry_rediscovers_dynamic_port_and_reports_exact_match(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window, record, workflow, service = _open_online_result_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+    )
+    profile = ComfyUserProfile("profile-a", "Portraits")
+    profile_hosts: list[str] = []
+    publish_hosts: list[str] = []
+    errors: list[tuple[str, str]] = []
+
+    def load_profiles(client) -> tuple[ComfyUserProfile, ...]:
+        profile_hosts.append(client.host)
+        if len(profile_hosts) == 1:
+            raise RuntimeError("the old Desktop port closed")
+        return (profile,)
+
+    fingerprint = record.workflow_fingerprint.removeprefix("sha256:")
+    publication = WorkflowPublication(
+        relative_path=(
+            f"workflows/MIVIM/portrait_v1_use_in_comfyui--{fingerprint}.json"
+        ),
+        profile=profile,
+        fingerprint=record.workflow_fingerprint,
+        created=False,
+        renamed=False,
+    )
+
+    def publish(
+        client,
+        name: str,
+        data: bytes,
+        *,
+        user_id: str,
+        expected_fingerprint: str,
+    ) -> WorkflowPublication:
+        publish_hosts.append(client.host)
+        assert name == workflow.name
+        assert data == workflow.read_bytes()
+        assert user_id == profile.id
+        assert expected_fingerprint == record.workflow_fingerprint
+        return publication
+
+    monkeypatch.setattr("src.desktop.ComfyClient.list_user_profiles", load_profiles)
+    monkeypatch.setattr("src.desktop.ComfyClient.publish_workflow_bytes", publish)
+    monkeypatch.setattr(
+        window,
+        "_show_error",
+        lambda title, message: errors.append((title, message)),
+    )
+
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(
+        lambda: window._workflow_publish_retry_requires_refresh,
+        timeout=5_000,
+    )
+    assert profile_hosts == ["127.0.0.1:8188"]
+    assert errors
+
+    service.fixed_discovery = replace(
+        service.fixed_discovery,
+        runtime_hints=(
+            ComfyRuntimeHint(
+                host="127.0.0.1:8299",
+                installation_name="Portrait Desktop",
+                pid=5678,
+                timestamp=2,
+            ),
+        ),
+    )
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(lambda: window._published_workflow is not None, timeout=5_000)
+
+    assert profile_hosts == ["127.0.0.1:8188", "127.0.0.1:8299"]
+    assert publish_hosts == ["127.0.0.1:8299"]
+    published_record = window._displayed_result_record
+    assert published_record is not None
+    assert published_record.workflow_user_name == profile.name
+    assert window.settings.last_result == published_record
+    receipt = window.workflow_handoff_status_label.text()
+    assert "already available in Workflows → MIVIM" in receipt
+    assert "profile Portraits" in receipt
+    assert fingerprint not in receipt
+
+
+def test_duplicate_profile_names_are_disambiguated_and_mapped_by_choice(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window, record, _workflow, _service = _open_online_result_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+    )
+    first = ComfyUserProfile("personal", "Portraits")
+    second = ComfyUserProfile("studio", "Portraits")
+    selected_users: list[str] = []
+    shown_choices: list[str] = []
+    publication = WorkflowPublication(
+        relative_path="workflows/MIVIM/portrait.json",
+        profile=second,
+        fingerprint=record.workflow_fingerprint,
+        created=True,
+        renamed=False,
+    )
+
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.list_user_profiles",
+        lambda _client: (first, second),
+    )
+
+    def choose_profile(*args, **_kwargs) -> tuple[str, bool]:
+        choices = list(args[3])
+        shown_choices.extend(choices)
+        return choices[1], True
+
+    def publish(
+        _client,
+        _name: str,
+        _data: bytes,
+        *,
+        user_id: str,
+        expected_fingerprint: str,
+    ) -> WorkflowPublication:
+        assert expected_fingerprint == record.workflow_fingerprint
+        selected_users.append(user_id)
+        return publication
+
+    monkeypatch.setattr("src.desktop.QInputDialog.getItem", choose_profile)
+    monkeypatch.setattr("src.desktop.ComfyClient.publish_workflow_bytes", publish)
+
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(lambda: window._published_workflow is not None, timeout=5_000)
+
+    assert shown_choices == ["Portraits — personal", "Portraits — studio"]
+    assert selected_users == ["studio"]
+    assert window.settings.comfy_user_id == "studio"
+
+
+def test_profile_callback_from_an_old_runtime_generation_is_ignored(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window, _record, _workflow, _service = _open_online_result_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+    )
+    started = threading.Event()
+    release = threading.Event()
+    publish_calls: list[bool] = []
+
+    def delayed_profiles(_client) -> tuple[ComfyUserProfile, ...]:
+        started.set()
+        assert release.wait(timeout=5)
+        return (ComfyUserProfile("default", "Default"),)
+
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.list_user_profiles",
+        delayed_profiles,
+    )
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.publish_workflow_bytes",
+        lambda *_args, **_kwargs: publish_calls.append(True),
+    )
+
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(started.is_set, timeout=5_000)
+    window.refresh_setup()
+    release.set()
+    qtbot.waitUntil(
+        lambda: window.comfy_badge.text() != "CHECKING",
+        timeout=5_000,
+    )
+    qtbot.wait(100)
+
+    assert publish_calls == []
+    assert window._published_workflow is None
+    assert window.publish_workflow_button.text() != "Open ComfyUI"
+
+
+def test_upload_receipt_from_an_old_runtime_generation_is_ignored(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window, record, _workflow, _service = _open_online_result_window(
+        qtbot,
+        tmp_path,
+        monkeypatch,
+    )
+    profile = ComfyUserProfile("default", "Default")
+    started = threading.Event()
+    release = threading.Event()
+    publication = WorkflowPublication(
+        relative_path="workflows/MIVIM/portrait.json",
+        profile=profile,
+        fingerprint=record.workflow_fingerprint,
+        created=True,
+        renamed=False,
+    )
+
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.list_user_profiles",
+        lambda _client: (profile,),
+    )
+
+    def delayed_publish(*_args, **_kwargs) -> WorkflowPublication:
+        started.set()
+        assert release.wait(timeout=5)
+        return publication
+
+    monkeypatch.setattr(
+        "src.desktop.ComfyClient.publish_workflow_bytes",
+        delayed_publish,
+    )
+
+    qtbot.mouseClick(
+        window.publish_workflow_button,
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(started.is_set, timeout=5_000)
+    window.refresh_setup()
+    release.set()
+    qtbot.waitUntil(
+        lambda: window.comfy_badge.text() != "CHECKING",
+        timeout=5_000,
+    )
+    qtbot.wait(100)
+
+    assert window._published_workflow is None
+    assert window.settings.last_result is not None
+    assert not window.settings.last_result.published_workflow_path
+    assert window.publish_workflow_button.text() != "Open ComfyUI"
 
 
 def test_release_version_matches_project_and_is_visible(

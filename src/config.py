@@ -46,6 +46,7 @@ def _optional_path(key: str) -> Path | None:
 
 
 _PROJECT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+MAX_PROJECT_NAME_LENGTH = 80
 _WINDOWS_RESERVED_NAMES = {
     "AUX",
     "CON",
@@ -59,6 +60,10 @@ DEFAULT_TRIGGER = "ohwx person"
 
 def validate_project_name(name: str) -> str:
     """Validate names that are used as local dataset and output directories."""
+    if len(name) > MAX_PROJECT_NAME_LENGTH:
+        raise ValueError(
+            f"Project name must be {MAX_PROJECT_NAME_LENGTH} characters or fewer."
+        )
     if not _PROJECT_NAME.fullmatch(name):
         raise ValueError(
             "Project name must start with a letter or number and contain only "

@@ -237,6 +237,92 @@ def test_selecting_an_instance_binds_its_runtime_and_private_model_root(
     assert all(root.path != private_a for root in selected.model_roots)
 
 
+def test_duplicate_desktop_names_never_bind_an_ambiguous_runtime_port(
+    tmp_path: Path,
+) -> None:
+    install_a = comfy_desktop.ComfyInstallation(
+        id="a",
+        name="ComfyUI",
+        source_id="standalone",
+        install_path=tmp_path / "a",
+        comfyui_path=tmp_path / "a" / "ComfyUI",
+        version=None,
+        status="installed",
+        last_launched_at=1,
+    )
+    install_b = comfy_desktop.ComfyInstallation(
+        id="b",
+        name="ComfyUI",
+        source_id="standalone",
+        install_path=tmp_path / "b",
+        comfyui_path=tmp_path / "b" / "ComfyUI",
+        version=None,
+        status="installed",
+        last_launched_at=2,
+    )
+    discovery = comfy_desktop.ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=(install_a, install_b),
+        selected_installation=install_a,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=("127.0.0.1:8201",),
+        launcher=comfy_desktop.ComfyLauncher("", "", "", (), False),
+        warnings=(),
+        runtime_hints=(
+            comfy_desktop.ComfyRuntimeHint(
+                "127.0.0.1:8201",
+                "ComfyUI",
+                101,
+                1000,
+            ),
+        ),
+    )
+
+    selected = comfy_desktop.select_comfy_installation(discovery, "b")
+
+    assert selected.selected_installation == install_b
+    assert selected.host_candidates == ()
+    assert any("cannot be distinguished safely" in item for item in selected.warnings)
+
+
+def test_unknown_desktop_id_never_falls_back_to_the_current_installation(
+    tmp_path: Path,
+) -> None:
+    installation = comfy_desktop.ComfyInstallation(
+        id="current",
+        name="Current",
+        source_id="standalone",
+        install_path=tmp_path / "current",
+        comfyui_path=tmp_path / "current" / "ComfyUI",
+        version=None,
+        status="installed",
+        last_launched_at=1,
+    )
+    discovery = comfy_desktop.ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=(installation,),
+        selected_installation=installation,
+        model_roots=(),
+        input_dir=tmp_path / "input",
+        output_dir=tmp_path / "output",
+        host_candidates=("127.0.0.1:8188",),
+        launcher=comfy_desktop.ComfyLauncher("", "", "", (), False),
+        warnings=(),
+    )
+
+    selected = comfy_desktop.select_comfy_installation(discovery, "missing")
+
+    assert selected.selected_installation is None
+    assert selected.host_candidates == ()
+    assert selected.model_roots == ()
+    assert selected.input_dir is None
+    assert selected.output_dir is None
+
+
 def test_incomplete_desktop_port_lock_is_ignored(tmp_path: Path) -> None:
     desktop = tmp_path / "Comfy Desktop"
     _write_json(desktop / "settings.json", {})

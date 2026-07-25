@@ -16,12 +16,14 @@ Only stdlib + websocket-client are required.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
 import urllib.parse
 import urllib.request
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -40,6 +42,38 @@ CancellationStatus = Literal[
     "ownership_unverified",
 ]
 TARGETED_INTERRUPT_MIN_VERSION = (0, 3, 56)
+_LOCAL_COMFY_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_WORKFLOW_UPLOAD_LIMIT = 20 * 1024 * 1024
+_WORKFLOW_COLLISION_LIMIT = 100
+
+
+@dataclass(frozen=True, slots=True)
+class ComfyUserProfile:
+    """One regular ComfyUI user-data profile."""
+
+    id: str
+    name: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowPublication:
+    """Verified result of publishing one workflow to ComfyUI user storage."""
+
+    relative_path: str
+    profile: ComfyUserProfile
+    fingerprint: str
+    created: bool
+    renamed: bool
+
+
+class _ComfyRequestError(RuntimeError):
+    """HTTP failure that preserves the response status for safe recovery."""
+
+    def __init__(self, path: str, status: int, detail: str) -> None:
+        self.path = path
+        self.status = status
+        self.detail = detail
+        super().__init__(f"ComfyUI request {path} failed with HTTP {status}: {detail}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,24 +102,42 @@ class ComfyClient:
         self.client_id = str(uuid.uuid4())
 
     # ---- low-level HTTP ----
-    def _http_bytes(self, path: str, payload: dict[str, Any] | None = None) -> bytes:
+    def _request_bytes(
+        self,
+        path: str,
+        *,
+        data: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> bytes:
+        """Send one HTTP request while preserving status-bearing failures."""
+
         url = f"http://{self.host}{path}"
-        data = json.dumps(payload).encode() if payload is not None else None
         req = urllib.request.Request(
-            url, data=data, headers={"Content-Type": "application/json"}
+            url,
+            data=data,
+            headers=dict(headers or {}),
         )
         try:
             with urllib.request.urlopen(req, timeout=min(self.timeout, 30.0)) as resp:
                 body = resp.read()
         except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"ComfyUI request {path} failed with HTTP {exc.code}: "
-                f"{detail or exc.reason}"
+            detail = exc.read(2048).decode("utf-8", errors="replace").strip()
+            raise _ComfyRequestError(
+                path,
+                exc.code,
+                detail or str(exc.reason),
             ) from exc
         except (OSError, URLError) as exc:
             raise RuntimeError(f"ComfyUI request {path} failed: {exc}") from exc
         return body
+
+    def _http_bytes(self, path: str, payload: dict[str, Any] | None = None) -> bytes:
+        data = json.dumps(payload).encode() if payload is not None else None
+        return self._request_bytes(
+            path,
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
 
     def _http_json(
         self, path: str, payload: dict[str, Any] | None = None
@@ -104,6 +156,308 @@ class ComfyClient:
     def _post_json(self, path: str, payload: dict[str, Any]) -> None:
         """POST JSON to an endpoint whose successful response may be empty."""
         self._http_bytes(path, payload)
+
+    def _require_loopback_host(self) -> None:
+        """Reject workflow writes unless the configured server is loopback-only."""
+
+        if "://" in self.host:
+            raise ValueError(
+                "Workflows require a local ComfyUI address without a URL scheme."
+            )
+        candidate = f"http://{self.host}"
+        try:
+            parsed = urllib.parse.urlsplit(candidate)
+            hostname = parsed.hostname.casefold() if parsed.hostname else ""
+            port = parsed.port or 8188
+        except ValueError as exc:
+            raise ValueError("ComfyUI has an invalid local address.") from exc
+        if (
+            parsed.scheme.casefold() != "http"
+            or hostname not in _LOCAL_COMFY_HOSTS
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in {"", "/"}
+            or not 1 <= port <= 65535
+        ):
+            raise ValueError(
+                "Workflows can only be added to a verified local ComfyUI address."
+            )
+
+    def _user_api_request(
+        self,
+        path: str,
+        *,
+        data: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+    ) -> bytes:
+        """Use the current ``/api`` route with a legacy-prefix fallback."""
+
+        last_not_found: _ComfyRequestError | None = None
+        for prefix in ("/api", ""):
+            request_path = f"{prefix}{path}"
+            try:
+                return self._request_bytes(
+                    request_path,
+                    data=data,
+                    headers=headers,
+                )
+            except _ComfyRequestError as exc:
+                if exc.status == 404 and prefix:
+                    last_not_found = exc
+                    continue
+                raise
+        if last_not_found is not None:
+            raise last_not_found
+        raise RuntimeError("ComfyUI user-data request did not run.")
+
+    def list_user_profiles(self) -> tuple[ComfyUserProfile, ...]:
+        """Return regular user-data profiles without guessing among them."""
+
+        self._require_loopback_host()
+        body = self._user_api_request("/users")
+        try:
+            value = json.loads(body)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"ComfyUI returned invalid user-profile data: {exc}"
+            ) from exc
+        if not isinstance(value, Mapping):
+            raise TypeError("ComfyUI returned invalid user-profile data.")
+
+        raw_users = value.get("users")
+        if raw_users is None:
+            return (ComfyUserProfile("default", "Default"),)
+        if not isinstance(raw_users, Mapping):
+            raise TypeError("ComfyUI returned an invalid user-profile list.")
+
+        profiles = tuple(
+            sorted(
+                (
+                    ComfyUserProfile(user_id.strip(), name.strip())
+                    for raw_id, raw_name in raw_users.items()
+                    if isinstance(raw_id, str)
+                    and isinstance(raw_name, str)
+                    and (user_id := raw_id.strip())
+                    and (name := raw_name.strip())
+                    and not user_id.startswith("__")
+                    and len(user_id) <= 256
+                    and len(name) <= 256
+                    and not any(
+                        ord(character) < 32 or ord(character) == 127
+                        for character in f"{user_id}{name}"
+                    )
+                ),
+                key=lambda profile: (profile.name.casefold(), profile.id),
+            )
+        )
+        if not profiles:
+            raise RuntimeError(
+                "ComfyUI has no regular user profile that can receive this workflow."
+            )
+        return profiles
+
+    @staticmethod
+    def _workflow_fingerprint(data: bytes) -> str:
+        digest = hashlib.sha256()
+        digest.update(b"mivim-file-v1\0")
+        digest.update(data)
+        return f"sha256:{digest.hexdigest()}"
+
+    @staticmethod
+    def _workflow_candidate(
+        name: str,
+        fingerprint: str,
+        collision: int,
+    ) -> str:
+        path = Path(name)
+        content_id = fingerprint.removeprefix("sha256:")
+        if collision == 1:
+            marker = content_id
+        else:
+            marker = f"{content_id}-{collision}"
+        return f"workflows/MIVIM/{path.stem} [{marker}]{path.suffix}"
+
+    @staticmethod
+    def _encoded_user_path(relative_path: str) -> str:
+        return urllib.parse.quote(relative_path, safe="")
+
+    def _read_user_file(
+        self,
+        relative_path: str,
+        profile: ComfyUserProfile,
+    ) -> bytes:
+        encoded = self._encoded_user_path(relative_path)
+        return self._user_api_request(
+            f"/userdata/{encoded}",
+            headers={"Comfy-User": profile.id},
+        )
+
+    def publish_workflow(
+        self,
+        workflow_path: Path,
+        *,
+        user_id: str,
+        expected_fingerprint: str | None = None,
+    ) -> WorkflowPublication:
+        """Publish one path snapshot without rereading it during the upload."""
+
+        self._require_loopback_host()
+        if workflow_path.is_symlink():
+            raise ValueError("The ready workflow cannot be a symbolic link.")
+        try:
+            data = workflow_path.read_bytes()
+        except OSError as exc:
+            raise RuntimeError(f"The ready workflow could not be read: {exc}") from exc
+        return self.publish_workflow_bytes(
+            workflow_path.name,
+            data,
+            user_id=user_id,
+            expected_fingerprint=expected_fingerprint,
+        )
+
+    def publish_workflow_bytes(
+        self,
+        workflow_name: str,
+        data: bytes,
+        *,
+        user_id: str,
+        expected_fingerprint: str | None = None,
+    ) -> WorkflowPublication:
+        """Publish and verify an immutable UI-workflow byte snapshot.
+
+        Every new upload path includes the snapshot's content fingerprint. This
+        makes concurrent uploads of different workflow bytes target different
+        files even when ComfyUI's ``overwrite=false`` existence check and write
+        are not one atomic operation.
+        """
+
+        self._require_loopback_host()
+        if (
+            not isinstance(workflow_name, str)
+            or Path(workflow_name).name != workflow_name
+            or Path(workflow_name).suffix.casefold() != ".json"
+            or workflow_name != workflow_name.strip()
+            or any(ord(character) < 32 for character in workflow_name)
+        ):
+            raise ValueError("The ready workflow does not have a safe JSON filename.")
+        if not isinstance(data, bytes):
+            raise TypeError("The ready workflow snapshot must be immutable bytes.")
+        if not data:
+            raise ValueError("The ready workflow is empty.")
+        if len(data) > _WORKFLOW_UPLOAD_LIMIT:
+            raise ValueError("The ready workflow is unexpectedly large.")
+        try:
+            workflow = json.loads(data)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"The ready workflow is not valid JSON: {exc}") from exc
+        if not isinstance(workflow, Mapping):
+            raise TypeError("The ready workflow must contain a JSON object.")
+
+        fingerprint = self._workflow_fingerprint(data)
+        if expected_fingerprint is not None and fingerprint != expected_fingerprint:
+            raise ValueError(
+                "The ready workflow snapshot no longer matches its verified result."
+            )
+
+        profiles = self.list_user_profiles()
+        profile = next((item for item in profiles if item.id == user_id), None)
+        if profile is None:
+            raise ValueError(
+                "That ComfyUI profile is no longer available. Choose a profile again."
+            )
+
+        headers = {
+            "Comfy-User": profile.id,
+            "Content-Type": "application/json",
+        }
+
+        # MIVIM 0.5 initially used the unsuffixed filename. Reuse an exact legacy
+        # publication, but never create a new one: differently-contented concurrent
+        # uploads could otherwise race inside ComfyUI's check-then-write handler.
+        legacy_path = f"workflows/MIVIM/{workflow_name}"
+        try:
+            legacy_data = self._read_user_file(legacy_path, profile)
+        except _ComfyRequestError as exc:
+            if exc.status != 404:
+                raise
+        else:
+            if legacy_data == data:
+                return WorkflowPublication(
+                    relative_path=legacy_path,
+                    profile=profile,
+                    fingerprint=fingerprint,
+                    created=False,
+                    renamed=False,
+                )
+
+        for collision in range(1, _WORKFLOW_COLLISION_LIMIT + 1):
+            relative_path = self._workflow_candidate(
+                workflow_name,
+                fingerprint,
+                collision,
+            )
+            encoded = self._encoded_user_path(relative_path)
+            upload_path = f"/userdata/{encoded}?overwrite=false&full_info=true"
+            try:
+                self._user_api_request(
+                    upload_path,
+                    data=data,
+                    headers=headers,
+                )
+            except _ComfyRequestError as exc:
+                if exc.status != 409:
+                    raise
+                try:
+                    existing = self._read_user_file(relative_path, profile)
+                except _ComfyRequestError as read_exc:
+                    if read_exc.status == 404:
+                        continue
+                    raise
+                if existing == data:
+                    return WorkflowPublication(
+                        relative_path=relative_path,
+                        profile=profile,
+                        fingerprint=fingerprint,
+                        created=False,
+                        renamed=collision > 1,
+                    )
+                continue
+            except RuntimeError as upload_error:
+                # A dropped response can happen after ComfyUI atomically saved the
+                # file. Read it back before asking a casual user to retry.
+                try:
+                    saved = self._read_user_file(relative_path, profile)
+                except RuntimeError:
+                    raise upload_error
+                if saved != data:
+                    raise
+                return WorkflowPublication(
+                    relative_path=relative_path,
+                    profile=profile,
+                    fingerprint=fingerprint,
+                    created=True,
+                    renamed=collision > 1,
+                )
+
+            saved = self._read_user_file(relative_path, profile)
+            if saved != data:
+                raise RuntimeError(
+                    "ComfyUI saved different workflow contents; the handoff was stopped."
+                )
+            return WorkflowPublication(
+                relative_path=relative_path,
+                profile=profile,
+                fingerprint=fingerprint,
+                created=True,
+                renamed=collision > 1,
+            )
+
+        raise RuntimeError(
+            "ComfyUI already has too many workflows with this name. "
+            "Rename the MIVIM project before trying again."
+        )
 
     def is_up(self) -> bool:
         try:

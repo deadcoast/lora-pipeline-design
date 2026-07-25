@@ -855,6 +855,8 @@ def test_validation_recovery_v2_rejects_changed_installation_or_model_bytes(
 
     assert recovery is not None
     assert service.validation_recovery_issue(settings, recovery) is None
+    changed_port = replace(settings, comfy_host="127.0.0.1:8299")
+    assert service.validation_recovery_issue(changed_port, recovery) is None
     changed_installation = replace(settings, comfy_installation_id="desktop-b")
     assert "different Comfy Desktop installation" in (
         service.validation_recovery_issue(changed_installation, recovery) or ""
@@ -1045,6 +1047,52 @@ def test_temporary_discovery_failure_preserves_known_installation_identity(
 
     assert settings.comfy_installation_id == "known-desktop"
     assert settings.training_base_model == checkpoint
+
+
+def test_setup_preserves_an_unavailable_instance_id_without_substitution(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    current = ComfyInstallation(
+        id="current",
+        name="Current Desktop",
+        source_id="standalone",
+        install_path=tmp_path / "current",
+        comfyui_path=tmp_path / "current" / "ComfyUI",
+        version=None,
+        status="installed",
+        last_launched_at=1,
+    )
+    discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=(current,),
+        selected_installation=current,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=("127.0.0.1:8188",),
+        launcher=ComfyLauncher("", "", "", (), False),
+        warnings=(),
+    )
+    probed: list[tuple[str, ...]] = []
+
+    def probe(hosts, **_kwargs):
+        probed.append(tuple(hosts))
+        return ComfyApiStatus(False, None, (), (), "offline")
+
+    monkeypatch.setattr(app_service, "probe_comfy_api", probe)
+
+    settings, context, status = ApplicationService(root=tmp_path).setup_snapshot(
+        AppSettings(comfy_installation_id="original"),
+        discovery,
+    )
+
+    assert settings.comfy_installation_id == "original"
+    assert context.selected_installation is None
+    assert context.host_candidates == ()
+    assert probed == [()]
+    assert not status.reachable
 
 
 def test_setup_never_borrows_python_from_a_different_selected_toolkit(

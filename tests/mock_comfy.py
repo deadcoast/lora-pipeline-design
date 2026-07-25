@@ -8,6 +8,9 @@ no GPU, no models, no real ComfyUI. Implements the endpoints the pipeline uses:
   WS   /ws                                     (execution progress -> done signal)
   GET  /history/{prompt_id}                    (outputs -> images)
   GET  /view                                   (image bytes)
+  GET  /api/users                              (user-data profile)
+  POST /api/userdata/{file}                    (save a local workflow)
+  GET  /api/userdata/{file}                    (verify a local workflow)
 
 Run standalone:  python -m tests.mock_comfy   (serves on 127.0.0.1:8765)
 """
@@ -87,6 +90,32 @@ async def view(request):
     return web.Response(body=buf.getvalue(), content_type="image/png")
 
 
+async def users(request):
+    return web.json_response({"storage": "server", "migrated": True})
+
+
+async def save_user_data(request):
+    relative_path = request.match_info["file"]
+    user_id = request.headers.get("Comfy-User", "default")
+    key = (user_id, relative_path)
+    if (
+        request.query.get("overwrite", "true") == "false"
+        and key in request.app["user_data"]
+    ):
+        return web.Response(status=409, text="File already exists")
+    request.app["user_data"][key] = await request.read()
+    return web.json_response({"path": relative_path})
+
+
+async def read_user_data(request):
+    relative_path = request.match_info["file"]
+    user_id = request.headers.get("Comfy-User", "default")
+    body = request.app["user_data"].get((user_id, relative_path))
+    if body is None:
+        return web.Response(status=404)
+    return web.Response(body=body, content_type="application/json")
+
+
 async def ws_handler(request):
     ws = web.WebSocketResponse()
     await ws.prepare(request)
@@ -103,6 +132,7 @@ async def ws_handler(request):
 def make_app():
     app = web.Application()
     app["jobs"] = {}
+    app["user_data"] = {}
     app.add_routes(
         [
             web.get("/system_stats", system_stats),
@@ -111,6 +141,9 @@ def make_app():
             web.get("/history/{pid}", history),
             web.get("/view", view),
             web.get("/ws", ws_handler),
+            web.get("/api/users", users),
+            web.post("/api/userdata/{file:.*}", save_user_data),
+            web.get("/api/userdata/{file:.*}", read_user_data),
         ]
     )
     return app
