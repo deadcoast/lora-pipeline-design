@@ -85,6 +85,8 @@ from .app_models import (
 from .app_service import (
     ApplicationService,
     PipelineCommand,
+    ReadinessAction,
+    ReadinessActionKind,
     ReadinessItem,
     ReadinessReport,
     SourceSummary,
@@ -112,10 +114,21 @@ from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
 from .io_utils import artifact_fingerprint
 from .photo_review import PhotoIssueDialog
+from .process_control import (
+    DESKTOP_OWNER_MUTEX_ENV,
+    DesktopOwnerLifetime,
+)
 from .studio_logging import StudioLog, log_directory_for
 
 NAV_SETUP, NAV_PROJECT, NAV_RUN, NAV_RESULTS = range(4)
-RunFailureKind = Literal["generic", "oom", "trainer", "validation"]
+RunFailureKind = Literal[
+    "busy",
+    "comfy_busy",
+    "generic",
+    "oom",
+    "trainer",
+    "validation",
+]
 
 
 def _artifact_snapshot(path: Path) -> tuple[tuple[str, int, int], ...] | None:
@@ -314,7 +327,7 @@ class PhotoDropZone(QFrame):
         layout.addSpacing(5)
         layout.addWidget(self.browse_button, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-    def _browse(self) -> None:
+    def _browse(self) -> bool:
         selected = QFileDialog.getExistingDirectory(
             self,
             "Choose training photo folder",
@@ -323,6 +336,8 @@ class PhotoDropZone(QFrame):
         )
         if selected:
             self.set_folder(Path(selected))
+            return True
+        return False
 
     def set_folder(self, folder: Path) -> None:
         self.setProperty("hasPath", True)
@@ -415,10 +430,10 @@ class DiagnosticCard(QFrame):
         layout.addLayout(text, 1)
         if item.action:
             if action_callback is None:
-                action: QWidget = _hint(item.action)
+                action: QWidget = _hint(item.action.label)
             else:
-                button = _button(item.action)
-                button.setAccessibleName(f"{item.title}: {item.action}")
+                button = _button(item.action.label)
+                button.setAccessibleName(f"{item.title}: {item.action.label}")
                 button.clicked.connect(lambda: action_callback(item))
                 action = button
             action.setMaximumWidth(260)
@@ -436,6 +451,7 @@ class MainWindow(QMainWindow):
         service: ApplicationService | None = None,
     ) -> None:
         super().__init__()
+        self._desktop_owner_lifetime = DesktopOwnerLifetime()
         self.settings_path = settings_path or default_settings_path()
         loaded_settings = settings or load_settings(self.settings_path)
         self.settings = with_user_storage_defaults(
@@ -495,6 +511,10 @@ class MainWindow(QMainWindow):
         self._source_request = 0
         self._readiness_request = 0
         self._desktop_poll_remaining = 0
+        self._return_to_readiness_when_connected = False
+        self._return_to_readiness_after_installation = False
+        self._return_to_readiness_after_setup = False
+        self._return_to_readiness_after_checkpoint = False
         self._workflow_publish_request = 0
         self._pending_workflow_publish: RunResult | None = None
         self._published_workflow: tuple[RunResult, WorkflowPublication] | None = None
@@ -1375,11 +1395,15 @@ class MainWindow(QMainWindow):
             for installation in discovery.installations
             if installation.is_local
         )
+        desktop_detected = discovery.detected
         self.open_desktop_button.setText(
-            "Open Comfy Desktop" if local_installations else "Install Comfy Desktop"
+            "Open Comfy Desktop"
+            if local_installations or desktop_detected
+            else "Install Comfy Desktop"
         )
         self.open_desktop_button.setEnabled(
-            discovery.launcher.supported or not local_installations
+            discovery.launcher.supported
+            or not (local_installations or desktop_detected)
         )
         local_ids = {installation.id for installation in local_installations}
         unavailable_selection = bool(settings.comfy_installation_id) and (
@@ -1428,6 +1452,14 @@ class MainWindow(QMainWindow):
                 f"Found {len(local_installations)} local installation(s). "
                 "Open Comfy Desktop and launch the one you want to use."
             )
+        elif desktop_detected:
+            self.comfy_badge.setText("CREATE INSTANCE")
+            state = "warning"
+            self.comfy_summary_label.setText(
+                "Comfy Desktop is installed, but it does not have a local "
+                "ComfyUI instance yet. Open Desktop and finish creating or "
+                "selecting one."
+            )
         else:
             self.comfy_badge.setText("NOT FOUND")
             state = "error"
@@ -1456,11 +1488,21 @@ class MainWindow(QMainWindow):
         self.save_current_settings(silent=True)
         if status.reachable:
             self._desktop_poll_remaining = 0
-            if self._pending_workflow_publish == self._displayed_result_record:
+            if self._return_to_readiness_when_connected:
+                self._return_to_readiness_when_connected = False
+                self._single_shot(0, self.review_project)
+            elif self._pending_workflow_publish == self._displayed_result_record:
                 self._single_shot(0, self.add_ready_workflow_to_comfyui)
         elif self._desktop_poll_remaining > 0:
             self._desktop_poll_remaining -= 1
             self._single_shot(5000, self.refresh_setup)
+        elif self._return_to_readiness_when_connected:
+            self._return_to_readiness_when_connected = False
+            self.comfy_summary_label.setText(
+                self.comfy_summary_label.text()
+                + " MIVIM did not detect a running instance yet; launch it in "
+                "Desktop, then choose Retry."
+            )
         elif self._pending_workflow_publish is not None:
             self._pending_workflow_publish = None
             self.publish_workflow_button.setText("Retry add to ComfyUI")
@@ -1479,6 +1521,9 @@ class MainWindow(QMainWindow):
             and not self._workflow_publish_busy
         ):
             self._render_workflow_handoff_state(displayed)
+        if self._return_to_readiness_after_setup:
+            self._return_to_readiness_after_setup = False
+            self._single_shot(0, self.review_project)
 
     def _setup_failed_for(self, request: int, message: str) -> None:
         if request == self._setup_request:
@@ -1486,6 +1531,8 @@ class MainWindow(QMainWindow):
 
     def _setup_failed(self, message: str) -> None:
         self.studio_log.error_event("setup.check.failed", message)
+        self._return_to_readiness_when_connected = False
+        self._return_to_readiness_after_setup = False
         self.retry_comfy_button.setEnabled(True)
         self.setup_logs_button.setVisible(True)
         self.comfy_badge.setText("CHECK FAILED")
@@ -1584,6 +1631,11 @@ class MainWindow(QMainWindow):
             self.model_hint.setText(
                 f"{len(names)} model(s) reported by the running ComfyUI instance."
             )
+        elif self.comfy_status is not None and not self.comfy_status.reachable:
+            self.model_hint.setText(
+                "Connect a running local ComfyUI instance, then choose Retry to "
+                "load its model list."
+            )
         else:
             self.model_hint.setText(
                 "No checkpoint is currently visible. Add an SDXL model in ComfyUI."
@@ -1595,8 +1647,9 @@ class MainWindow(QMainWindow):
             )
             if len(matches) > 1:
                 self.model_hint.setText(
-                    f"{len(matches)} local files share this checkpoint name. "
-                    "Choose the exact file below before training."
+                    f"ComfyUI will use its first matching file: {matches[0]}. "
+                    f"{len(matches) - 1} lower-priority same-named copy or copies "
+                    "will be ignored."
                 )
 
     def _populate_last_project(self) -> None:
@@ -1846,7 +1899,7 @@ class MainWindow(QMainWindow):
         if not silent:
             self.setup_save_note.setText(f"Saved for this user: {saved}")
 
-    def choose_lora_dir(self) -> None:
+    def choose_lora_dir(self) -> bool:
         start = self.lora_dir_edit.text().strip() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -1857,8 +1910,10 @@ class MainWindow(QMainWindow):
         if selected:
             self.lora_dir_edit.setText(selected)
             self._invalidate_readiness()
+            return True
+        return False
 
-    def create_verified_lora_folder(self) -> None:
+    def create_verified_lora_folder(self) -> bool:
         """Create only the missing LoRA directory proven by selected discovery."""
 
         settings = self._collect_settings()
@@ -1869,7 +1924,7 @@ class MainWindow(QMainWindow):
                 "The selected Comfy Desktop model location could not be verified. "
                 "Refresh the connection or choose its existing LoRA folder.",
             )
-            return
+            return False
         try:
             target.mkdir(parents=False, exist_ok=False)
         except OSError as exc:
@@ -1877,7 +1932,7 @@ class MainWindow(QMainWindow):
                 "LoRA folder was not created",
                 f"Windows could not create the verified folder:\n{target}\n\n{exc}",
             )
-            return
+            return False
         self.lora_dir_edit.setText(str(target))
         self.save_current_settings(silent=True)
         self.studio_log.info(
@@ -1885,10 +1940,9 @@ class MainWindow(QMainWindow):
             f"Created the selected Desktop instance's LoRA folder: {target}",
         )
         self._invalidate_readiness()
-        self.refresh_setup()
-        self._single_shot(0, self.run_readiness_checks)
+        return True
 
-    def choose_base_model(self) -> None:
+    def choose_base_model(self) -> bool:
         start = self.base_model_edit.text().strip()
         if not start:
             start = str(Path.home())
@@ -1902,8 +1956,10 @@ class MainWindow(QMainWindow):
             self.base_model_edit.setText(selected)
             self.base_model_edit.setCursorPosition(0)
             self._invalidate_readiness()
+            return True
+        return False
 
-    def choose_toolkit_dir(self) -> None:
+    def choose_toolkit_dir(self) -> bool:
         start = self.toolkit_dir_edit.text().strip() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -1912,7 +1968,7 @@ class MainWindow(QMainWindow):
             QFileDialog.Option.ShowDirsOnly,
         )
         if not selected:
-            return
+            return False
         folder = Path(selected)
         self.toolkit_dir_edit.setText(str(folder))
         self.toolkit_python_edit.clear()
@@ -1926,8 +1982,9 @@ class MainWindow(QMainWindow):
                 self.toolkit_python_edit.setText(str(python))
                 break
         self._invalidate_readiness()
+        return True
 
-    def choose_toolkit_python(self) -> None:
+    def choose_toolkit_python(self) -> bool:
         start = self.toolkit_python_edit.text().strip()
         if not start:
             start = self.toolkit_dir_edit.text().strip() or str(Path.home())
@@ -1941,6 +1998,8 @@ class MainWindow(QMainWindow):
             self.toolkit_python_edit.setText(selected)
             self.toolkit_python_edit.setCursorPosition(0)
             self._invalidate_readiness()
+            return True
+        return False
 
     def show_trainer_help(self) -> None:
         box = QMessageBox(self)
@@ -1978,9 +2037,11 @@ class MainWindow(QMainWindow):
         box.exec()
         clicked = box.clickedButton()
         if clicked is choose_folder:
-            self.choose_toolkit_dir()
+            if self.choose_toolkit_dir():
+                self._complete_readiness_repair()
         elif clicked is choose_python:
-            self.choose_toolkit_python()
+            if self.choose_toolkit_python():
+                self._complete_readiness_repair()
         elif clicked is toolkit_guide:
             QDesktopServices.openUrl(QUrl("https://github.com/ostris/ai-toolkit"))
         elif clicked is pytorch_guide:
@@ -1988,7 +2049,7 @@ class MainWindow(QMainWindow):
         elif clicked is check_again:
             self.review_project()
 
-    def choose_workspace_dir(self) -> None:
+    def choose_workspace_dir(self) -> bool:
         start = self.workspace_dir_edit.text().strip() or str(Path.home())
         selected = QFileDialog.getExistingDirectory(
             self,
@@ -2000,8 +2061,10 @@ class MainWindow(QMainWindow):
             self.workspace_dir_edit.setText(selected)
             self.workspace_dir_edit.setCursorPosition(0)
             self._invalidate_readiness()
+            return True
+        return False
 
-    def open_comfy_desktop(self) -> None:
+    def open_comfy_desktop(self) -> bool:
         local_installations = (
             tuple(
                 installation
@@ -2011,17 +2074,23 @@ class MainWindow(QMainWindow):
             if self.discovery is not None
             else ()
         )
-        if not local_installations:
-            QDesktopServices.openUrl(
+        desktop_detected = self.discovery is not None and self.discovery.detected
+        if not local_installations and not desktop_detected:
+            if not QDesktopServices.openUrl(
                 QUrl("https://docs.comfy.org/installation/desktop/windows")
-            )
-            return
+            ):
+                self._show_error(
+                    "Could not open the install guide",
+                    "Open https://docs.comfy.org/installation/desktop/windows "
+                    "in your browser.",
+                )
+            return False
         if self.discovery is None or not self.discovery.launcher.supported:
             self._show_error(
                 "Comfy Desktop is not available",
                 "Windows could not resolve the Comfy Desktop Start Menu application.",
             )
-            return
+            return False
         launcher = self.discovery.launcher
         try:
             subprocess.Popen(
@@ -2033,12 +2102,13 @@ class MainWindow(QMainWindow):
             )
         except OSError as exc:
             self._show_error("Could not open Comfy Desktop", str(exc))
-            return
+            return False
         self.comfy_summary_label.setText(
             "Comfy Desktop is opening. The studio will check the local instance again."
         )
         self._desktop_poll_remaining = 18
         self._single_shot(3000, self.refresh_setup)
+        return True
 
     def open_result_comfy_desktop(self) -> None:
         issue = self._result_comfy_context_issue(self._displayed_result_record)
@@ -2428,6 +2498,10 @@ class MainWindow(QMainWindow):
 
     def _installation_changed(self, *_args: object) -> None:
         self._connection_changed()
+        if self._return_to_readiness_after_installation:
+            self._return_to_readiness_after_installation = False
+            self._return_to_readiness_after_setup = True
+            self.save_current_settings(silent=True)
         self._single_shot(0, self.refresh_setup)
 
     def _checkpoint_changed(self, checkpoint: str) -> None:
@@ -2446,6 +2520,9 @@ class MainWindow(QMainWindow):
         elif current and Path(current).name.casefold() != selected_name:
             self.base_model_edit.clear()
         self._invalidate_readiness()
+        if self._return_to_readiness_after_checkpoint and checkpoint.strip():
+            self._return_to_readiness_after_checkpoint = False
+            self._single_shot(0, self.review_project)
 
     def _invalidate_readiness(self, *_args: object) -> None:
         self._readiness_request += 1
@@ -2551,13 +2628,15 @@ class MainWindow(QMainWindow):
             detail += f" • {summary.near_duplicate_count} very similar"
         self.photo_summary.setText(detail)
 
-    def review_photo_checks(self) -> None:
+    def review_photo_checks(self) -> bool:
         summary = self.source_summary
         if summary is None:
-            return
+            return False
         dialog = PhotoIssueDialog(summary, self)
         if dialog.exec():
             self._photo_folder_changed(summary.folder)
+            return True
+        return False
 
     def _preset_changed(self) -> None:
         preset = TrainingPreset(self.preset_combo.currentData())
@@ -2666,6 +2745,13 @@ class MainWindow(QMainWindow):
     def _readiness_finished(self, result: object) -> None:
         report = cast(ReadinessReport, result)
         self.readiness_report = report
+        if (
+            report.source is not None
+            and self.source_folder is not None
+            and report.source.folder == self.source_folder
+        ):
+            self.source_summary = report.source
+            self.review_photos_button.setEnabled(True)
         _layout_clear(self.diagnostics_layout)
         for item in report.items:
             self.diagnostics_layout.addWidget(
@@ -2730,62 +2816,152 @@ class MainWindow(QMainWindow):
                     "Readiness check",
                     "error",
                     message,
-                    "Retry the check",
+                    ReadinessAction(
+                        ReadinessActionKind.RETRY_READINESS,
+                        "Retry the check",
+                    ),
                 ),
                 self._handle_diagnostic_action,
             )
         )
         self.readiness_summary.setText("The setup check could not finish.")
 
+    def _complete_readiness_repair(self) -> None:
+        """Persist a successful repair and verify the real path again."""
+
+        self.review_project()
+
+    def _next_available_project_name(self, current: str) -> str:
+        """Return the next simple version whose complete artifact namespace is empty."""
+
+        candidate = current
+        settings = self._collect_settings()
+        for _attempt in range(100):
+            candidate = self._increment_project_name(candidate)
+            artifacts = self.service.project_artifacts(settings, candidate)
+            if artifacts.dataset is None and not artifacts.has_non_dataset_outputs:
+                return candidate
+        return self._increment_project_name(current)
+
+    def _open_current_comfy_ui(self) -> bool:
+        """Open the checked live API without applying a restored-result identity gate."""
+
+        status = self.comfy_status
+        if status is None or not status.reachable or not status.host:
+            self._show_error(
+                "ComfyUI is not connected",
+                "Start the selected local instance and choose Retry before opening it.",
+            )
+            return False
+        if not QDesktopServices.openUrl(QUrl(f"http://{status.host}")):
+            self._show_error(
+                "Could not open ComfyUI",
+                "Windows could not open the local ComfyUI address in a browser.",
+            )
+            return False
+        return True
+
+    def open_storage_settings(self) -> bool:
+        """Open the Windows storage cleanup surface; never disguise a folder picker."""
+
+        if not QDesktopServices.openUrl(QUrl("ms-settings:storagesense")):
+            self._show_error(
+                "Windows Storage settings could not be opened",
+                "Open Windows Settings → System → Storage, free some space, then "
+                "return here and choose Check again.",
+            )
+            return False
+        return True
+
     def _handle_diagnostic_action(self, item: ReadinessItem) -> None:
-        if item.action in {"Review prepared captions", "Review prepared files"}:
-            self.review_prepared_dataset()
-        elif item.code in {"project", "collision"}:
+        action = item.action
+        if action is None:
+            return
+        kind = action.kind
+        self.studio_log.info(
+            "readiness.action",
+            f"code={item.code}; action={kind.value}",
+        )
+
+        if kind is ReadinessActionKind.EDIT_PROJECT_NAME:
             self.show_page(NAV_PROJECT)
             self.project_name_edit.setFocus()
-        elif item.code in {"trigger", "captions"}:
+        elif kind is ReadinessActionKind.USE_NEXT_PROJECT_NAME:
+            current = action.payload or self.project_name_edit.text().strip()
+            self.project_name_edit.setText(self._next_available_project_name(current))
+            self.overwrite_checkbox.setChecked(False)
+            self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.DISABLE_REBUILD:
+            self.overwrite_checkbox.setChecked(False)
+            self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.RESTORE_TRIGGER:
+            self.trigger_edit.setText(action.payload or config.DEFAULT_TRIGGER)
+            self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.REVIEW_PHOTOS:
             self.show_page(NAV_PROJECT)
-            if item.code == "captions":
-                self.vision_checkbox.setChecked(False)
-            else:
-                self.trigger_edit.setFocus()
-        elif item.code == "photos":
+            if self.review_photo_checks():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.CHOOSE_PHOTO_FOLDER:
             self.show_page(NAV_PROJECT)
-            if self.source_summary is not None:
-                self.review_photo_checks()
-            else:
-                self.photo_drop._browse()
-        elif item.code == "comfy":
+            if self.photo_drop._browse():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.REVIEW_PREPARED:
+            self.review_prepared_dataset()
+            self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.DISABLE_VISION_CAPTIONS:
+            self.vision_checkbox.setChecked(False)
+            self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.OPEN_COMFY_DESKTOP:
             self.show_page(NAV_SETUP)
-            self.open_comfy_desktop()
-        elif item.code == "checkpoint":
+            if self.open_comfy_desktop():
+                self._return_to_readiness_when_connected = True
+        elif kind is ReadinessActionKind.SELECT_COMFY_INSTALLATION:
             self.show_page(NAV_SETUP)
-            if item.action == "Confirm this is an SDXL base checkpoint":
-                self.confirm_sdxl_checkpoint()
-            else:
-                self.checkpoint_combo.setFocus()
-                self.checkpoint_combo.showPopup()
-        elif item.code == "connection":
-            self.show_page(NAV_SETUP)
+            self._return_to_readiness_after_installation = True
             self.installation_combo.setFocus()
             if self.installation_combo.isVisible():
                 self.installation_combo.showPopup()
-        elif item.code == "base_model":
+        elif kind is ReadinessActionKind.OPEN_COMFYUI:
             self.show_page(NAV_SETUP)
-            self.choose_base_model()
-        elif item.code == "lora_dir":
+            self._open_current_comfy_ui()
+        elif kind is ReadinessActionKind.SELECT_CHECKPOINT:
             self.show_page(NAV_SETUP)
-            if item.action == "Create LoRA folder":
-                self.create_verified_lora_folder()
-            else:
-                self.choose_lora_dir()
-        elif item.code == "trainer":
+            self._return_to_readiness_after_checkpoint = True
+            self.checkpoint_combo.setFocus()
+            self.checkpoint_combo.showPopup()
+        elif kind is ReadinessActionKind.CONFIRM_CHECKPOINT:
+            self.show_page(NAV_SETUP)
+            self.confirm_sdxl_checkpoint()
+        elif kind is ReadinessActionKind.CHOOSE_BASE_MODEL:
+            self.show_page(NAV_SETUP)
+            if self.choose_base_model():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.CREATE_LORA_FOLDER:
+            self.show_page(NAV_SETUP)
+            if self.create_verified_lora_folder():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.CHOOSE_LORA_FOLDER:
+            self.show_page(NAV_SETUP)
+            if self.choose_lora_dir():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.CHOOSE_TOOLKIT_FOLDER:
+            self.show_page(NAV_SETUP)
+            if self.choose_toolkit_dir():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.CHOOSE_TOOLKIT_PYTHON:
+            self.show_page(NAV_SETUP)
+            if self.choose_toolkit_python():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.REPAIR_TRAINER:
             self.show_page(NAV_SETUP)
             self.show_trainer_help()
-        elif item.code in {"storage", "training_storage"}:
+        elif kind is ReadinessActionKind.CHOOSE_WORKSPACE:
             self.show_page(NAV_SETUP)
-            self.choose_workspace_dir()
-        elif item.code == "internal":
+            if self.choose_workspace_dir():
+                self._complete_readiness_repair()
+        elif kind is ReadinessActionKind.OPEN_STORAGE_SETTINGS:
+            self.open_storage_settings()
+        elif kind is ReadinessActionKind.RETRY_READINESS:
             self.run_readiness_checks()
 
     def confirm_sdxl_checkpoint(self) -> None:
@@ -2816,7 +2992,7 @@ class MainWindow(QMainWindow):
         if box.clickedButton() is confirm_button:
             self.sdxl_confirm_checkbox.setChecked(True)
             self.save_current_settings(silent=True)
-            self.run_readiness_checks()
+            self._complete_readiness_repair()
         elif box.clickedButton() is choose_button:
             self.checkpoint_combo.setFocus()
             self.checkpoint_combo.showPopup()
@@ -2933,6 +3109,11 @@ class MainWindow(QMainWindow):
         environment = QProcessEnvironment.systemEnvironment()
         for key, value in command.environment.items():
             environment.insert(key, value)
+        if self._desktop_owner_lifetime.name:
+            environment.insert(
+                DESKTOP_OWNER_MUTEX_ENV,
+                self._desktop_owner_lifetime.name,
+            )
         process.setProcessEnvironment(environment)
         process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         process.readyReadStandardOutput.connect(self._read_pipeline_output)
@@ -3340,9 +3521,17 @@ class MainWindow(QMainWindow):
     ) -> RunFailureKind:
         """Map common real worker failures to one safe, direct recovery path."""
 
+        output = self._pipeline_recent_output.casefold()
+        if "mivim_run_busy" in output:
+            return "comfy_busy"
         if recovery is not None:
             return "validation"
-        output = self._pipeline_recent_output.casefold()
+        if (
+            "another mivim run is already using the accelerator" in output
+            or "another mivim run is already working on project" in output
+            or "another mivim run is already using a file or folder" in output
+        ):
+            return "busy"
         oom_markers = (
             "cuda out of memory",
             "torch.outofmemoryerror",
@@ -3399,7 +3588,45 @@ class MainWindow(QMainWindow):
                 f"mode={command.mode}; result=failed; exit_code={exit_code}",
             )
             failure_kind = self._classify_pipeline_failure(recovery)
-            if failure_kind == "validation":
+            if failure_kind == "comfy_busy":
+                self.run_stage_label.setText("ComfyUI is finishing earlier MIVIM work")
+                if (
+                    command.mode == "validate"
+                    and self._pending_validation_recovery is not None
+                ):
+                    self.run_detail_label.setText(
+                        "No new validation work was started. Open the selected "
+                        "ComfyUI instance and let its earlier MIVIM job finish, or "
+                        "stop that job there, then choose Retry validation only. "
+                        "Photos and training will not repeat."
+                    )
+                else:
+                    self.run_detail_label.setText(
+                        "No new work was started. Open the selected ComfyUI instance "
+                        "and let its earlier MIVIM job finish, or stop that job "
+                        "there, then choose Check and retry."
+                    )
+                self._stop_training_progress(0)
+            elif failure_kind == "busy":
+                self.run_stage_label.setText("Another MIVIM run is active")
+                if (
+                    command.mode == "validate"
+                    and self._pending_validation_recovery is not None
+                ):
+                    self.run_detail_label.setText(
+                        "No new validation work was started. Let the other run "
+                        "finish, or stop it safely from its own MIVIM window, then "
+                        "choose Retry validation only. Photos and training will not "
+                        "repeat."
+                    )
+                else:
+                    self.run_detail_label.setText(
+                        "No new work was started. Let the other run finish, or stop "
+                        "it safely from its own MIVIM window, then choose Check and "
+                        "retry."
+                    )
+                self._stop_training_progress(0)
+            elif failure_kind == "validation":
                 self.run_stage_label.setText(
                     "LoRA installed; validation needs attention"
                 )
@@ -3552,18 +3779,50 @@ class MainWindow(QMainWindow):
         if failure_kind is not None:
             self._run_failure_kind = failure_kind
         kind = self._run_failure_kind
-        self.edit_after_run_button.setVisible(visible)
-        self.open_run_folder_button.setVisible(visible)
+        run_is_busy = kind in {"busy", "comfy_busy"}
+        self.edit_after_run_button.setVisible(visible and not run_is_busy)
+        self.open_run_folder_button.setVisible(visible and not run_is_busy)
         self.use_fast_after_run_button.setVisible(visible and kind == "oom")
         self.repair_trainer_after_run_button.setVisible(visible and kind == "trainer")
-        self.open_desktop_after_run_button.setVisible(visible and kind == "validation")
-        self.retry_after_run_button.setVisible(visible and kind != "validation")
+        self.open_desktop_after_run_button.setVisible(
+            visible and kind in {"validation", "comfy_busy"}
+        )
+        validation_recovery_available = (
+            self._pending_validation_recovery is not None
+            and self._installed_lora_name is not None
+        )
+        self.retry_after_run_button.setVisible(
+            visible and kind != "validation" and not validation_recovery_available
+        )
         self.retry_validation_button.setVisible(
-            visible and self._installed_lora_name is not None
+            visible and validation_recovery_available
         )
 
     def use_fast_after_oom(self) -> None:
-        """Apply the lower-memory plan and deliberately approve a safe rebuild."""
+        """Apply the lower-memory plan only after visible rebuild approval."""
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Use the Fast plan and rebuild?")
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setText("Changing from this plan to Fast requires rebuilding this project.")
+        box.setInformativeText(
+            "Your source photos stay untouched. MIVIM may replace this project's "
+            "prepared copies, checkpoints, validation files, result record, and "
+            "installed ComfyUI LoRA. Existing installed LoRA bytes are preserved "
+            "as a previous copy when applicable."
+        )
+        approve = box.addButton(
+            "Use Fast and rebuild this project",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() is not approve:
+            self.studio_log.info(
+                "pipeline.recovery.fast.cancelled",
+                "The user did not approve rebuilding this project.",
+            )
+            return
 
         index = self.preset_combo.findData(TrainingPreset.FAST.value)
         if index >= 0:
@@ -4745,6 +5004,7 @@ class MainWindow(QMainWindow):
         self._training_elapsed_timer.stop()
         self.studio_log.info("session.closed", "MIVIM LoRA Studio closed.")
         self.studio_log.close()
+        self._desktop_owner_lifetime.close()
         event.accept()
 
     def _warn_close_for_running_comfy_prompt(self, detail: str) -> None:
@@ -4837,6 +5097,17 @@ def main(argv: Sequence[str] | None = None) -> int:
                 app.exit(2)
                 return
             print(f"Desktop screenshot: {destination}")
+            if args.screenshot_page == "result":
+                action = window.publish_workflow_button.text()
+                ready_actions = {"Add to ComfyUI", "Check in ComfyUI"}
+                handoff_state = (
+                    "ready"
+                    if window.publish_workflow_button.isVisible()
+                    and window.publish_workflow_button.isEnabled()
+                    and action in ready_actions
+                    else "blocked"
+                )
+                print(f"Desktop result handoff: {handoff_state}; action={action!r}")
             app.quit()
 
         QTimer.singleShot(max(200, args.screenshot_delay), capture)

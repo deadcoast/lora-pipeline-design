@@ -10,16 +10,17 @@ acceptance checks.
 
 | Area | Frustration prevented | User-facing correction or recovery |
 | --- | --- | --- |
-| Comfy Desktop | Wrong instance, port, or model library | Bind the selected Desktop installation, live runtime, checkpoint roots, and LoRA destination as one context; block ambiguous or stale state |
-| First setup | Raw paths and ports dominate onboarding | Show model selection and guided trainer setup first; keep paths and custom ports under **Advanced** |
+| Comfy Desktop | Wrong instance, port, or model library | Reconstruct executable-drive defaults, saved storage, launch arguments, generated config, local YAML, output folders, and live port as one selected context; block ambiguous or stale state |
+| First setup | Raw paths and ports dominate onboarding, or an installed Desktop is mistaken for missing | Detect the registered app before first launch, open it to create an instance, show model and trainer setup first, and keep paths/custom ports under **Advanced** |
 | Base model | Training and validation silently use different architectures | Require the exact same local checkpoint and an explicit SDXL-base confirmation |
 | Trainer | A CUDA-enabled-looking environment fails after training starts | Run a real CUDA kernel in the trainer's own Python; show GPU architecture and guided repair |
 | Source photos | Bad files are reported only as counts | Name and preview unreadable, small, blurry, duplicate, and likely near-duplicate files |
 | Exact copies | Users must manually clean harmless duplicates | Preserve originals and automatically prepare one copy |
 | Captions | A removed identity phrase silently ruins training | Require the phrase in every caption and offer to restore it automatically |
-| Prepared work | A failed later stage forces photo preparation again | Validate the source manifest and caption pairs, then continue with `--skip-prep` |
+| Prepared work | A failed later stage forces photo preparation again, or changed generated images are trusted silently | Validate the complete source set, requested description method, generated image identities, and editable caption pairs, then continue with `--skip-prep` |
 | Project names | Old checkpoints, grids, or LoRAs mix with a new run | Detect the whole project artifact namespace; require a new version name or explicit rebuild |
-| Long training | Progress appears frozen, errors are opaque, or Stop affects another ComfyUI user | Show elapsed/indeterminate training progress and durable local logs; remove an owned pending prompt, or target a running prompt only on ComfyUI 0.3.56+ |
+| Guided recovery | A button opens the wrong screen or silently changes advanced settings | Bind every readiness label to one typed operation; save successful repairs and rerun checks; keep photo review, folder selection, storage cleanup, and workspace relocation distinct |
+| Long training | Progress appears frozen, another window mutates the same work, a killed Studio leaves GPU work behind, Stop affects another ComfyUI user, or OOM recovery silently discards work | Show elapsed/indeterminate progress and durable logs; hold OS project/resource/GPU leases; bind worker and trainer lifetimes to the Studio; recover durable owned prompts; target a running prompt only on ComfyUI 0.3.56+; require approval before Fast recovery rebuilds |
 | Validation | Users cannot compare against the unchanged model | Include a clearly labelled no-LoRA baseline and plain-language prompt/strength axes |
 | Failed validation | Restarting causes unnecessary retraining or regeneration | Persist the exact handoff; retry missing or corrupt cells only when the full signature, including both model content identities, matches |
 | Result handoff | Casual users do not know what to enter or build in ComfyUI | Export editable Workflow JSON v0.4, then add its exact bytes through ComfyUI's user-data API under **Workflows → MIVIM**; select the profile when necessary, use a content-fingerprinted filename so concurrent saves cannot overwrite each other, read the file back, and retain **Show JSON file** as a manual fallback |
@@ -28,15 +29,20 @@ acceptance checks.
 
 ## Comfy Desktop compatibility boundary
 
-Discovery is read-only toward Desktop configuration. It understands the current
-installation records, shared/private model roots,
-`extra_model_paths.yaml`, identity-bearing live port locks, and the legacy
-Desktop layout. MIVIM never edits Desktop's installation registry.
+Discovery is read-only toward Desktop configuration. It understands the
+registered executable drive, Desktop's persisted default-data decision,
+installation records, shared/private model roots, startup path arguments,
+generated shared/per-instance model YAML, install-local
+`extra_model_paths.yaml`, output model folders, identity-bearing live port
+locks, and the legacy layout. MIVIM never edits Desktop's installation
+registry.
 
 A selected Desktop instance is an identity boundary. If its runtime cannot be
 matched safely, a full run is blocked instead of falling through to another
 running instance. Runtime locks currently identify installations by display
-name, so duplicate names are reported and blocked instead of guessed.
+name, so duplicate names are reported and blocked instead of guessed. A
+running instance is bound to its launch-time model snapshot; storage settings
+changed after launch require a visible Desktop restart.
 
 MIVIM can open Desktop or its browser UI, but Windows does not expose a reliable
 external command to select or start one particular Desktop instance. Once the
@@ -55,6 +61,9 @@ not used.
   untouched, such as ignoring exact copies.
 - Offer one clear repair action when user judgment is required, such as
   confirming an SDXL base model or repairing the trainer.
+- Make the visible action label a contract: it performs that operation only.
+  Successful settings repairs persist and return to readiness; opening Windows
+  Storage or another external surface does not pretend that the issue is fixed.
 - Preserve completed work before attempting the next fallible stage.
 - Keep technical output and rotating logs available locally without making
   terminal commands part of the normal workflow.

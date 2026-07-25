@@ -45,7 +45,8 @@ class PhotoIssueDialog(QDialog):
         root.addWidget(heading)
         text = QLabel(
             "These checks are local and never change your originals. Exact duplicates "
-            "must be removed before training; the other items are recommendations."
+            "are safely ignored when the training copy is prepared; the other items "
+            "are recommendations."
         )
         text.setWordWrap(True)
         root.addWidget(text)

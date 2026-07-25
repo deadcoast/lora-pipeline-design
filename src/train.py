@@ -14,8 +14,8 @@ Requires in .env:
 from __future__ import annotations
 
 import argparse
+import json
 import math
-import subprocess
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -25,8 +25,12 @@ import yaml
 from PIL import Image, UnidentifiedImageError
 
 from . import config
+from .comfy_activity import check_orphaned_comfy_prompts
 from .dataset_pairs import scan_dataset_pairs
 from .io_utils import atomic_write_text
+from .prepare_dataset import MANIFEST_NAME, prepared_output_manifest_issue
+from .process_control import run_managed_process
+from .run_guardian import active_run_guard_covers, pipeline_run_guard
 
 TRAINING_PRESETS = ("fast", "balanced", "quality")
 _PRESET_VALUES: dict[str, dict[str, Any]] = {
@@ -85,6 +89,24 @@ def _load_template(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 def _validate_dataset_pairs(dataset_dir: Path) -> int:
     """Validate the flat image/caption dataset that ai-toolkit will consume."""
+    manifest_path = dataset_dir / MANIFEST_NAME
+    if manifest_path.is_file():
+        try:
+            if manifest_path.stat().st_size > 4 * 1024 * 1024:
+                raise ValueError("the preparation record is unexpectedly large")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(
+                f"Dataset {dataset_dir} has a damaged preparation record: {exc}. "
+                "Rebuild the prepared photos before training."
+            ) from exc
+        manifest_issue = prepared_output_manifest_issue(dataset_dir, manifest)
+        if manifest_issue is not None:
+            raise ValueError(
+                f"Dataset {dataset_dir} no longer matches the reviewed prepared "
+                f"photos. {manifest_issue} Rebuild and review the photos before "
+                "training."
+            )
     inventory = scan_dataset_pairs(dataset_dir)
     problems = inventory.problem_messages()
     if problems:
@@ -346,6 +368,19 @@ def materialize_config(
     return destination
 
 
+def _training_project_name(
+    config_path: str | Path,
+    run_name: str | None,
+) -> str:
+    if run_name is not None:
+        return config.validate_project_name(run_name)
+    _template, template_data = _load_template(config_path)
+    template_name = template_data["config"].get("name")
+    if not isinstance(template_name, str) or not template_name:
+        raise ValueError("Training config has no usable config.name.")
+    return config.validate_project_name(template_name)
+
+
 def train(
     config_path: str | Path,
     *,
@@ -365,6 +400,65 @@ def train(
             f"ai-toolkit run.py not found at {run_py} (check AI_TOOLKIT_DIR)"
         )
 
+    project = _training_project_name(config_path, run_name)
+    resolved_dataset = (dataset_dir or (config.DATASETS_DIR / project)).resolve()
+    resolved_output = (output_dir or config.CHECKPOINTS_DIR).resolve()
+    workspace = config.RUN_CONFIGS_DIR.resolve().parent
+    resources = {
+        resolved_dataset,
+        resolved_output,
+        (config.RUN_CONFIGS_DIR / f"{project}.yaml").resolve(),
+    }
+    if base_model is not None:
+        resources.add(base_model.resolve())
+    if not active_run_guard_covers(
+        project=project,
+        workspace=workspace,
+        use_accelerator=True,
+        resource_paths=resources,
+    ):
+        with pipeline_run_guard(
+            project=project,
+            workspace=workspace,
+            mode="train",
+            use_accelerator=True,
+            resource_paths=resources,
+        ):
+            check_orphaned_comfy_prompts()
+            return _train_with_guard(
+                config_path,
+                run_py=run_py,
+                run_name=project,
+                trigger=trigger,
+                dataset_dir=resolved_dataset,
+                output_dir=resolved_output,
+                preset=preset,
+                base_model=base_model,
+            )
+    check_orphaned_comfy_prompts()
+    return _train_with_guard(
+        config_path,
+        run_py=run_py,
+        run_name=project,
+        trigger=trigger,
+        dataset_dir=resolved_dataset,
+        output_dir=resolved_output,
+        preset=preset,
+        base_model=base_model,
+    )
+
+
+def _train_with_guard(
+    config_path: str | Path,
+    *,
+    run_py: Path,
+    run_name: str,
+    trigger: str,
+    dataset_dir: Path,
+    output_dir: Path,
+    preset: str | None,
+    base_model: Path | None,
+) -> int:
     cfg = materialize_config(
         config_path,
         run_name=run_name,
@@ -378,12 +472,12 @@ def train(
     print(f"[train] {' '.join(cmd)}")
     print(f"[train] cwd = {config.AI_TOOLKIT_DIR}")
     # Stream ai-toolkit output live; run in its own directory so relative paths resolve.
-    proc = subprocess.run(cmd, cwd=config.AI_TOOLKIT_DIR, check=False)
-    if proc.returncode != 0:
-        print(f"[train] ai-toolkit exited with code {proc.returncode}", file=sys.stderr)
+    return_code = run_managed_process(cmd, cwd=Path(config.AI_TOOLKIT_DIR))
+    if return_code != 0:
+        print(f"[train] ai-toolkit exited with code {return_code}", file=sys.stderr)
     else:
         print(f"[train] done. Checkpoints: {output_dir or config.CHECKPOINTS_DIR}")
-    return proc.returncode
+    return return_code
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -420,15 +514,45 @@ def main(argv: Sequence[str] | None = None) -> None:
     )
     args = ap.parse_args(argv)
     try:
-        code = train(
-            args.config,
-            run_name=args.name,
-            trigger=args.trigger,
-            dataset_dir=args.dataset,
-            output_dir=args.output_dir,
-            preset=args.preset,
-            base_model=args.base_model,
-        )
+        project = args.name
+        if project is None:
+            _template, template_data = _load_template(args.config)
+            template_name = template_data["config"].get("name")
+            if not isinstance(template_name, str) or not template_name:
+                raise ValueError("Training config has no usable config.name.")
+            project = template_name
+        project = config.validate_project_name(project)
+        workspace = config.RUN_CONFIGS_DIR.resolve().parent
+        dataset_dir = (args.dataset or (config.DATASETS_DIR / project)).resolve()
+        output_dir = args.output_dir.resolve()
+        resources = {
+            dataset_dir,
+            output_dir,
+            (config.RUN_CONFIGS_DIR / f"{project}.yaml").resolve(),
+        }
+        if args.base_model is not None:
+            resources.add(args.base_model.resolve())
+        with pipeline_run_guard(
+            project=project,
+            workspace=workspace,
+            mode="train",
+            use_accelerator=True,
+            project_scopes=(
+                dataset_dir.resolve().parent,
+                output_dir.parent,
+            ),
+            resource_paths=resources,
+        ):
+            check_orphaned_comfy_prompts()
+            code = train(
+                args.config,
+                run_name=project,
+                trigger=args.trigger,
+                dataset_dir=args.dataset,
+                output_dir=output_dir,
+                preset=args.preset,
+                base_model=args.base_model,
+            )
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
         ap.error(str(exc))
     raise SystemExit(code)

@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -37,12 +38,16 @@ def test_built_windows_package_renders_the_real_result_handoff(
     Image.new("RGB", (960, 540), "#29466f").save(grid)
     workflow = tmp_path / "portrait_v1_use_in_comfyui.json"
     workflow.write_text('{"version": 0.4, "nodes": []}\n', encoding="utf-8")
-    lora = tmp_path / "models" / "loras" / "portrait_v1.safetensors"
+    installation_root = tmp_path / "ComfyUI-acceptance"
+    comfyui_root = installation_root / "ComfyUI"
+    lora = comfyui_root / "models" / "loras" / "portrait_v1.safetensors"
     lora.parent.mkdir(parents=True)
     lora.write_bytes(b"packaged lora acceptance")
-    checkpoint = tmp_path / "models" / "checkpoints" / "sdxl.safetensors"
+    checkpoint = comfyui_root / "models" / "checkpoints" / "sdxl.safetensors"
     checkpoint.parent.mkdir(parents=True)
     checkpoint.write_bytes(b"packaged checkpoint acceptance")
+    installation_id = "packaged-desktop"
+    installation_name = "Packaged Acceptance Desktop"
     record = RunResult(
         project_name="portrait_v1",
         mode="full",
@@ -55,6 +60,9 @@ def test_built_windows_package_renders_the_real_result_handoff(
         result_fingerprint=artifact_fingerprint(grid),
         workflow_path=workflow,
         workflow_fingerprint=artifact_fingerprint(workflow),
+        comfy_installation_id=installation_id,
+        comfy_installation_name=installation_name,
+        comfy_host="127.0.0.1:8188",
         installed_lora_path=lora,
         lora_fingerprint=artifact_fingerprint(lora),
         checkpoint_path=checkpoint,
@@ -62,6 +70,7 @@ def test_built_windows_package_renders_the_real_result_handoff(
     )
     settings_path = save_settings(
         AppSettings(
+            comfy_installation_id=installation_id,
             comfy_lora_dir=lora.parent,
             comfy_checkpoint=checkpoint.name,
             training_base_model=checkpoint,
@@ -71,7 +80,30 @@ def test_built_windows_package_renders_the_real_result_handoff(
     )
     screenshot = tmp_path / "packaged-result.png"
     environment = os.environ.copy()
-    environment["APPDATA"] = str(tmp_path / "empty-roaming")
+    appdata = tmp_path / "empty-roaming"
+    desktop_config = appdata / "Comfy Desktop"
+    desktop_config.mkdir(parents=True)
+    (desktop_config / "settings.json").write_text(
+        json.dumps({"selectedInstallationId": installation_id}),
+        encoding="utf-8",
+    )
+    (desktop_config / "installations.json").write_text(
+        json.dumps(
+            [
+                {
+                    "id": installation_id,
+                    "name": installation_name,
+                    "sourceId": "standalone",
+                    "installPath": str(installation_root),
+                    "status": "installed",
+                    "useSharedModels": False,
+                    "useSharedInputOutput": False,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    environment["APPDATA"] = str(appdata)
     environment["MIVIM_LORA_PIPELINE_DATA_DIR"] = str(tmp_path / "app-data")
 
     completed = subprocess.run(
@@ -96,6 +128,7 @@ def test_built_windows_package_renders_the_real_result_handoff(
 
     assert completed.returncode == 0, completed.stderr
     assert "Desktop screenshot:" in completed.stdout
+    assert "Desktop result handoff: ready" in completed.stdout
     with Image.open(screenshot) as captured:
         assert captured.width >= 1040
         assert captured.height >= 690

@@ -43,7 +43,7 @@ So the pipeline has two engines that talk to each other:
 |----------------------------|-----------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | **Training** the LoRA      | **ai-toolkit** (ostris)                 | One tool covers SDXL, Flux, *and* Wan 2.2 video. YAML configs, a web UI, and a `run.py` you can script. MIT licensed. This is what makes photos→video a small step instead of a rewrite. |
 | **Inference / validation** | **ComfyUI Desktop** (already installed) | Generate test images from your trained LoRA, run XY comparison grids, build the "does this LoRA work?" loop.                                                                             |
-| **Orchestration**          | **Your own Python** (in VSCode)         | Prepares datasets, launches training, then drives ComfyUI's API to auto-generate validation images. This *is* your "application."                                                        |
+| **Orchestration**          | **MIVIM LoRA Studio**                   | Guides setup and photo review, owns run safety and recovery, launches training, then drives ComfyUI's API to generate and publish verified validation work.                              |
 
 > **Why not train inside ComfyUI directly?** You *can* — nodes like `comfyUI-Realtime-Lora` and `Lora-Training-in-Comfy` wrap trainers as nodes. It's great for quick experiments and worth trying early to see training happen visually. But for a *reusable application pipeline* that scales to video, a dedicated trainer + scripted orchestration is cleaner, more reproducible, and far easier to debug. We'll use the ComfyUI training nodes as a learning aid, and ai-toolkit as the production trainer.
 
@@ -104,6 +104,9 @@ lora-pipeline-design/
 │  ├─ app_models.py / app_settings.py  # typed state and atomic persistence
 │  ├─ app_service.py                   # readiness, repairs, and command construction
 │  ├─ comfy_desktop.py                 # Desktop discovery and exact model roots
+│  ├─ run_guardian.py                  # OS project/resource/GPU leases
+│  ├─ process_control.py               # UI → worker → trainer crash ownership
+│  ├─ comfy_activity.py                # durable remote ComfyUI prompt ownership
 │  ├─ prepare_dataset.py / train.py    # prepared pairs and ai-toolkit launch
 │  ├─ comfy_client.py / validate.py    # API execution and verified result workflow
 │  └─ pipeline.py                      # prep → train → install → validate
@@ -176,10 +179,16 @@ You can drive training either from the **ai-toolkit web UI** (`http://localhost:
 
 ```python
 # src/train.py
-subprocess.run(
-    ["python", "run.py", "configs/person_sdxl.yaml"], cwd=AI_TOOLKIT_DIR, check=True
+exit_code = run_managed_process(
+    [trainer_python, "run.py", "configs/person_sdxl.yaml"],
+    cwd=AI_TOOLKIT_DIR,
 )
 ```
+
+The production path creates the trainer atomically inside a Windows
+kill-on-close Job Object. The pipeline worker also watches a Studio-owned
+lifetime mutex, so closing or hard-killing the UI releases the complete process
+tree rather than leaving an invisible GPU job.
 
 ### Step 3: Validation via ComfyUI's API
 
@@ -258,21 +267,28 @@ Ship each milestone before starting the next — it keeps failures isolated to o
 
 - Phase 1 is implemented as a guided desktop application for a single
   person/identity LoRA on SDXL.
-- Current Comfy Desktop 2 multi-instance state, shared model roots,
-  `extra_model_paths.yaml`, live-process port locks, and legacy Desktop layouts
-  are discovered read-only. Dead-process port locks are rejected.
+- Current Comfy Desktop 2 registration, executable-drive/default storage,
+  multi-instance state, shared/private model roots, launch arguments, generated
+  model YAML, install-local `extra_model_paths.yaml`, output model folders,
+  live-process port locks, and legacy layouts are discovered read-only.
+  Dead-process locks and unprovable running snapshots are rejected.
 - The app owns versioned per-user settings and a writable project workspace.
 - Fast, Balanced, and High Quality plans change real rank, steps, resolution,
   preview cadence, and validation breadth.
-- Setup checks, preparation-only operation, background logging, Windows
-  process-tree cancellation, result verification, and last-result restoration
-  are implemented in the user-facing application.
+- Setup checks, preparation-only operation, background logging, OS-level
+  resource/GPU leases, Studio-owned worker lifetime, atomic Windows trainer
+  Job membership, result verification, and last-result restoration are
+  implemented in the user-facing application.
 - Validation emits a prompt, client, and host ownership marker. Stop verifies
   that identity against ComfyUI's live queue before deleting a pending prompt.
   A running prompt receives a prompt-ID-targeted interrupt only on ComfyUI
   0.3.56 or newer. Older/unknown versions and absent/mismatched ownership are
   safe no-ops toward ComfyUI; the worker remains attached with instructions,
   and closing is refused until a safe stop can be confirmed.
+- Prompt reservations are persisted before submission and rechecked at every
+  accelerator entry point. Unreadable markers, incomplete queue schemas, and
+  unidentified queue entries fail closed; same-client submissions use distinct
+  records so one cleanup cannot erase another.
 - Background logging is a bounded, rotating, local-only support trail beside
   the user's settings. It records setup/readiness outcomes, recoverable worker
   failures, and real pipeline output without dumping environment variables or
@@ -282,7 +298,8 @@ Ship each milestone before starting the next — it keeps failures isolated to o
   a thumbnail/caption editor, and resumed with `--skip-prep` after preparation
   or a later-stage failure. The review and trainer consume one shared supported
   image/`.txt` inventory, and filename-specific structural failures block
-  process launch.
+  process launch. The authoritative trainer re-hashes the reviewed generated
+  images immediately before config materialization.
 - LoRA installation writes a versioned recovery record before validation starts.
   If validation fails or the studio closes, the next launch restores a
   validation-only retry and never repeats completed preparation or training.

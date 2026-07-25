@@ -20,6 +20,7 @@ import tempfile
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
+from enum import StrEnum
 from pathlib import Path
 from typing import Literal, cast
 
@@ -45,6 +46,12 @@ from .dataset_pairs import (
     scan_dataset_pairs,
 )
 from .io_utils import artifact_fingerprint
+from .prepare_dataset import (
+    MANIFEST_SCHEMA_VERSION,
+    captioner_identity,
+    prepared_output_manifest_issue,
+    source_files_match_manifest,
+)
 
 ReadinessState = Literal["ready", "warning", "error"]
 RunMode = Literal["full", "prepare", "validate"]
@@ -55,6 +62,44 @@ SourceIssueKind = Literal[
     "near_duplicate",
     "blurry",
 ]
+
+
+class ReadinessActionKind(StrEnum):
+    """Stable operations behind user-facing readiness buttons."""
+
+    EDIT_PROJECT_NAME = "edit_project_name"
+    USE_NEXT_PROJECT_NAME = "use_next_project_name"
+    DISABLE_REBUILD = "disable_rebuild"
+    RESTORE_TRIGGER = "restore_trigger"
+    REVIEW_PHOTOS = "review_photos"
+    CHOOSE_PHOTO_FOLDER = "choose_photo_folder"
+    REVIEW_PREPARED = "review_prepared"
+    DISABLE_VISION_CAPTIONS = "disable_vision_captions"
+    OPEN_COMFY_DESKTOP = "open_comfy_desktop"
+    SELECT_COMFY_INSTALLATION = "select_comfy_installation"
+    OPEN_COMFYUI = "open_comfyui"
+    SELECT_CHECKPOINT = "select_checkpoint"
+    CONFIRM_CHECKPOINT = "confirm_checkpoint"
+    CHOOSE_BASE_MODEL = "choose_base_model"
+    CREATE_LORA_FOLDER = "create_lora_folder"
+    CHOOSE_LORA_FOLDER = "choose_lora_folder"
+    CHOOSE_TOOLKIT_FOLDER = "choose_toolkit_folder"
+    CHOOSE_TOOLKIT_PYTHON = "choose_toolkit_python"
+    REPAIR_TRAINER = "repair_trainer"
+    CHOOSE_WORKSPACE = "choose_workspace"
+    OPEN_STORAGE_SETTINGS = "open_storage_settings"
+    RETRY_READINESS = "retry_readiness"
+
+
+@dataclass(frozen=True, slots=True)
+class ReadinessAction:
+    """One exact repair operation and the label presented for it."""
+
+    kind: ReadinessActionKind
+    label: str
+    payload: str = ""
+
+
 SUPPORTED_IMAGE_EXTENSIONS = frozenset(
     (*SUPPORTED_DATASET_IMAGE_EXTENSIONS, ".heic", ".heif")
 )
@@ -232,7 +277,7 @@ class ReadinessItem:
     title: str
     state: ReadinessState
     detail: str
-    action: str = ""
+    action: ReadinessAction | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -650,40 +695,55 @@ def inspect_prepared_dataset(
         sources = manifest["sources"]
         if (
             not isinstance(manifest, dict)
-            or manifest.get("schema_version") != 2
+            or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
             or not isinstance(settings, dict)
             or not isinstance(sources, list)
         ):
             raise ValueError("unsupported manifest format")
+        expected_caption_mode = "blip" if draft.use_vision_captions else "template"
+        output_issue = prepared_output_manifest_issue(folder, manifest)
         if settings.get("trigger") != draft.trigger.strip():
             manifest_error = "The prepared captions use a different identity phrase."
         elif settings.get("size") != draft.preset.image_size:
             manifest_error = (
                 "The prepared photo size does not match this training plan."
             )
-        elif draft.source_dir is not None and draft.source_dir.is_dir():
-            for entry in sources:
-                if not isinstance(entry, dict) or not isinstance(
-                    entry.get("path"), str
-                ):
-                    raise TypeError("invalid source entry")
-                relative = Path(entry["path"])
-                if relative.is_absolute() or ".." in relative.parts:
-                    raise ValueError("unsafe source entry")
-                source = draft.source_dir / relative
-                if not source.is_file():
-                    manifest_error = (
-                        "The source photo set changed after preparation; rebuild it."
-                    )
-                    break
-                stat = source.stat()
-                if stat.st_size != entry.get("size") or stat.st_mtime_ns != entry.get(
-                    "mtime_ns"
-                ):
-                    manifest_error = (
-                        "The source photo set changed after preparation; rebuild it."
-                    )
-                    break
+        elif settings.get("caption_mode") != expected_caption_mode:
+            requested = (
+                "Automatic descriptions"
+                if expected_caption_mode == "blip"
+                else "Simple template captions"
+            )
+            prepared_mode = settings.get("caption_mode")
+            prepared = (
+                "Automatic descriptions"
+                if prepared_mode == "blip"
+                else "Simple template captions"
+                if prepared_mode == "template"
+                else "an unknown method"
+            )
+            manifest_error = (
+                "The requested photo-description method changed after preparation: "
+                f"the files use {prepared}, but this project now requests {requested}. "
+                "Rebuild the prepared photos to apply that choice."
+            )
+        elif settings.get("captioner") != captioner_identity(expected_caption_mode):
+            manifest_error = (
+                "The prepared photo-description engine is from a different version. "
+                "Rebuild the prepared photos before training."
+            )
+        elif output_issue is not None:
+            manifest_error = (
+                f"{output_issue} Rebuild the prepared photos before training."
+            )
+        elif (
+            draft.source_dir is not None
+            and draft.source_dir.is_dir()
+            and not source_files_match_manifest(draft.source_dir, manifest)
+        ):
+            manifest_error = (
+                "The source photo set changed after preparation; rebuild it."
+            )
     except (
         FileNotFoundError,
         KeyError,
@@ -712,7 +772,10 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             "Training photos",
             "error",
             "No readable JPG, PNG, WebP, BMP, or TIFF images were found.",
-            "Choose another folder",
+            ReadinessAction(
+                ReadinessActionKind.CHOOSE_PHOTO_FOLDER,
+                "Choose another photo folder",
+            ),
         )
     if source.duplicate_count:
         return ReadinessItem(
@@ -722,7 +785,10 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             f"{source.unique_usable_count} unique usable photo(s); "
             f"{source.duplicate_count} exact copy or copies will be ignored "
             "automatically. Original files stay untouched.",
-            "Review photo checks",
+            ReadinessAction(
+                ReadinessActionKind.REVIEW_PHOTOS,
+                "Review photo checks",
+            ),
         )
     if source.unreadable_count:
         return ReadinessItem(
@@ -731,7 +797,10 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             "warning",
             f"{source.usable_count} usable; "
             f"{source.unreadable_count} unreadable file(s) will be skipped.",
-            "Review photo checks",
+            ReadinessAction(
+                ReadinessActionKind.REVIEW_PHOTOS,
+                "Review photo checks",
+            ),
         )
     if source.usable_count < 10:
         return ReadinessItem(
@@ -740,7 +809,17 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             "warning",
             f"{source.usable_count} usable photo(s). "
             "15–40 varied photos usually gives a better identity.",
-            "Review photo checks" if source.issues else "Add more varied photos",
+            (
+                ReadinessAction(
+                    ReadinessActionKind.REVIEW_PHOTOS,
+                    "Review photo checks",
+                )
+                if source.issues
+                else ReadinessAction(
+                    ReadinessActionKind.CHOOSE_PHOTO_FOLDER,
+                    "Choose a folder with more varied photos",
+                )
+            ),
         )
     if source.usable_count > 100:
         return ReadinessItem(
@@ -749,7 +828,10 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             "error",
             f"{source.usable_count} photos were found recursively. This looks "
             "like a broad photo library rather than one focused identity dataset.",
-            "Choose a folder with 15–40 varied photos",
+            ReadinessAction(
+                ReadinessActionKind.CHOOSE_PHOTO_FOLDER,
+                "Choose a folder with 15–40 varied photos",
+            ),
         )
     if source.usable_count > 60:
         return ReadinessItem(
@@ -758,7 +840,10 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             "warning",
             f"{source.usable_count} photos were found. A focused set of 15–40 "
             "varied images is usually easier to train well.",
-            "Review photo checks",
+            ReadinessAction(
+                ReadinessActionKind.REVIEW_PHOTOS,
+                "Review photo checks",
+            ),
         )
     if source.blurry_count or source.near_duplicate_count:
         concerns: list[str] = []
@@ -771,7 +856,10 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
             "Training photos",
             "warning",
             f"{source.usable_count} usable photo(s); " + " and ".join(concerns) + ".",
-            "Review photo checks",
+            ReadinessAction(
+                ReadinessActionKind.REVIEW_PHOTOS,
+                "Review photo checks",
+            ),
         )
     note = f"{source.usable_count} usable photo(s)" + (
         f"; {source.small_count} will be enlarged." if source.small_count else "."
@@ -781,7 +869,14 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
         "Training photos",
         "ready",
         note,
-        "Review photo checks" if source.issues else "",
+        (
+            ReadinessAction(
+                ReadinessActionKind.REVIEW_PHOTOS,
+                "Review photo checks",
+            )
+            if source.issues
+            else None
+        ),
     )
 
 
@@ -805,7 +900,10 @@ def _caption_readiness_item(draft: ProjectDraft) -> ReadinessItem:
         "Automatic photo descriptions",
         "error",
         "The optional PyTorch and Transformers components are not installed.",
-        "Turn off automatic descriptions",
+        ReadinessAction(
+            ReadinessActionKind.DISABLE_VISION_CAPTIONS,
+            "Turn off automatic descriptions",
+        ),
     )
 
 
@@ -848,13 +946,8 @@ def verified_missing_lora_directory(
     ):
         return None
     target_resolved = target.resolve()
-    for root in discovery.model_roots:
-        candidate = root.loras
-        if (
-            candidate.resolve() == target_resolved
-            and root.path.is_dir()
-            and candidate.parent.is_dir()
-        ):
+    for candidate in discovery.effective_lora_dirs:
+        if candidate.resolve() == target_resolved and candidate.parent.is_dir():
             return candidate
     return None
 
@@ -1305,10 +1398,10 @@ class ApplicationService:
         discovery: ComfyDesktopDiscovery | None,
         checkpoint: str,
     ) -> Path | None:
-        """Resolve an unambiguous API checkpoint inside configured model roots."""
+        """Resolve the exact first local file ComfyUI will load for this name."""
 
         candidates = self.resolve_checkpoint_paths(discovery, checkpoint)
-        return candidates[0] if len(candidates) == 1 else None
+        return candidates[0] if candidates else None
 
     def resolve_checkpoint_paths(
         self,
@@ -1317,22 +1410,9 @@ class ApplicationService:
     ) -> tuple[Path, ...]:
         """Return every safe local match in ComfyUI's effective search order."""
 
-        if discovery is None or not checkpoint.strip():
+        if discovery is None:
             return ()
-        relative = Path(checkpoint.replace("\\", "/"))
-        if relative.is_absolute() or ".." in relative.parts:
-            return ()
-        matches: list[Path] = []
-        for model_root in discovery.model_roots:
-            root = model_root.checkpoints.resolve()
-            candidate = (root / relative).resolve()
-            try:
-                candidate.relative_to(root)
-            except ValueError:
-                continue
-            if candidate.is_file():
-                matches.append(candidate)
-        return tuple(dict.fromkeys(matches))
+        return discovery.checkpoint_candidates(checkpoint)
 
     def apply_discovery(
         self,
@@ -1399,7 +1479,7 @@ class ApplicationService:
         )
 
         lora_dir = settings.comfy_lora_dir
-        effective_lora_dirs = tuple(root.loras for root in found.model_roots)
+        effective_lora_dirs = found.effective_lora_dirs
         if lora_dir is None or (
             found.selected_installation is not None
             and not any(
@@ -1407,12 +1487,10 @@ class ApplicationService:
                 for candidate in effective_lora_dirs
             )
         ):
-            lora_dir = None
-            model_root = next((item for item in found.model_roots if item.exists), None)
-            if model_root is None and found.model_roots:
-                model_root = found.model_roots[0]
-            if model_root is not None:
-                lora_dir = model_root.loras
+            lora_dir = next(
+                (candidate for candidate in effective_lora_dirs if candidate.is_dir()),
+                effective_lora_dirs[0] if effective_lora_dirs else None,
+            )
 
         checkpoint = settings.comfy_checkpoint
         if live.checkpoints:
@@ -1427,15 +1505,25 @@ class ApplicationService:
                 )
         else:
             local_names: list[str] = []
-            for model_root in found.model_roots:
-                if model_root.checkpoints.is_dir():
-                    local_names.extend(
-                        str(path.relative_to(model_root.checkpoints)).replace("\\", "/")
-                        for path in model_root.checkpoints.rglob("*")
-                        if path.is_file()
-                        and path.suffix.lower() in {".safetensors", ".ckpt", ".pt"}
-                    )
-            unique_local_names = tuple(sorted(set(local_names), key=str.casefold))
+            seen_local_names: set[str] = set()
+            for checkpoint_dir in found.effective_checkpoint_dirs:
+                if checkpoint_dir.is_dir():
+                    for path in sorted(checkpoint_dir.rglob("*")):
+                        if not path.is_file() or path.suffix.lower() not in {
+                            ".safetensors",
+                            ".ckpt",
+                            ".pt",
+                        }:
+                            continue
+                        relative_name = str(path.relative_to(checkpoint_dir)).replace(
+                            "\\",
+                            "/",
+                        )
+                        key = relative_name.casefold()
+                        if key not in seen_local_names:
+                            seen_local_names.add(key)
+                            local_names.append(relative_name)
+            unique_local_names = tuple(local_names)
             if unique_local_names and (
                 checkpoint not in unique_local_names
                 or not self.resolve_checkpoint_paths(found, checkpoint)
@@ -1450,23 +1538,25 @@ class ApplicationService:
                 )
 
         checkpoint_paths = self.resolve_checkpoint_paths(found, checkpoint)
+        active_checkpoint = checkpoint_paths[0] if checkpoint_paths else None
         previous_base = settings.training_base_model
-        if previous_base is not None and any(
-            previous_base.resolve() == candidate.resolve()
-            for candidate in checkpoint_paths
+        if (
+            previous_base is not None
+            and active_checkpoint is not None
+            and previous_base.resolve() == active_checkpoint.resolve()
         ):
             training_base_model = previous_base
         elif (
             not checkpoint_paths
-            and not found.model_roots
+            and not found.effective_checkpoint_dirs
             and previous_base is not None
             and previous_base.is_file()
         ):
             # A transient Desktop discovery failure must not erase the exact
             # checkpoint identity needed to resume a verified run.
             training_base_model = previous_base
-        elif len(checkpoint_paths) == 1:
-            training_base_model = checkpoint_paths[0]
+        elif active_checkpoint is not None:
+            training_base_model = active_checkpoint
         else:
             training_base_model = None
 
@@ -1556,7 +1646,10 @@ class ApplicationService:
                     "Project name",
                     "error",
                     str(exc),
-                    "Use a short name such as alex_v1.",
+                    ReadinessAction(
+                        ReadinessActionKind.EDIT_PROJECT_NAME,
+                        "Edit project name",
+                    ),
                 )
             )
         else:
@@ -1621,7 +1714,10 @@ class ApplicationService:
                         "Rebuild is explicitly enabled. This run may replace "
                         + ", ".join(existing_descriptions)
                         + ".",
-                        "Turn off rebuild to preserve existing work",
+                        ReadinessAction(
+                            ReadinessActionKind.DISABLE_REBUILD,
+                            "Turn off rebuild to preserve existing work",
+                        ),
                     )
                 )
             elif artifacts_for_collision.has_non_dataset_outputs:
@@ -1639,7 +1735,11 @@ class ApplicationService:
                         f"{prepared_detail}{output_description} already use this "
                         "project name. A new run is blocked so files cannot be mixed "
                         "or replaced silently.",
-                        "Use a new version name or explicitly allow rebuilding",
+                        ReadinessAction(
+                            ReadinessActionKind.USE_NEXT_PROJECT_NAME,
+                            "Use the next version name",
+                            draft.project_name,
+                        ),
                     )
                 )
             elif (
@@ -1652,14 +1752,24 @@ class ApplicationService:
                         "ready",
                         f"{prepared.image_count} prepared photo/caption pairs "
                         "match this project and will be reused.",
-                        "Review prepared captions",
+                        ReadinessAction(
+                            ReadinessActionKind.REVIEW_PREPARED,
+                            "Review prepared captions",
+                        ),
                     )
                 )
             elif existing_dataset is not None and not draft.overwrite_existing:
                 repair_action = (
-                    "Review prepared files"
+                    ReadinessAction(
+                        ReadinessActionKind.REVIEW_PREPARED,
+                        "Review prepared files",
+                    )
                     if prepared is not None and prepared.file_problem_messages
-                    else "Allow rebuilding or use a new version name"
+                    else ReadinessAction(
+                        ReadinessActionKind.USE_NEXT_PROJECT_NAME,
+                        "Use the next version name",
+                        draft.project_name,
+                    )
                 )
                 items.append(
                     ReadinessItem(
@@ -1697,7 +1807,11 @@ class ApplicationService:
                     "Identity phrase",
                     "error",
                     "The identity phrase is empty.",
-                    "Keep the recommended phrase or enter a unique one.",
+                    ReadinessAction(
+                        ReadinessActionKind.RESTORE_TRIGGER,
+                        "Restore recommended identity phrase",
+                        config.DEFAULT_TRIGGER,
+                    ),
                 )
             )
         else:
@@ -1718,7 +1832,10 @@ class ApplicationService:
                     "ready",
                     f"{prepared.image_count} prepared photo(s) will be reused; "
                     "the source folder will not be processed again.",
-                    "Review prepared captions",
+                    ReadinessAction(
+                        ReadinessActionKind.REVIEW_PREPARED,
+                        "Review prepared captions",
+                    ),
                 )
             )
             items.append(
@@ -1728,7 +1845,10 @@ class ApplicationService:
                     "ready",
                     f"All {prepared.caption_count} prepared photo(s) have editable "
                     "captions.",
-                    "Review prepared captions",
+                    ReadinessAction(
+                        ReadinessActionKind.REVIEW_PREPARED,
+                        "Review prepared captions",
+                    ),
                 )
             )
         else:
@@ -1740,7 +1860,10 @@ class ApplicationService:
                         "Training photos",
                         "error",
                         "Choose a folder containing photos of one person.",
-                        "Choose photo folder",
+                        ReadinessAction(
+                            ReadinessActionKind.CHOOSE_PHOTO_FOLDER,
+                            "Choose photo folder",
+                        ),
                     )
                 )
             else:
@@ -1751,6 +1874,15 @@ class ApplicationService:
                 items.append(_source_readiness_item(source))
             items.append(_caption_readiness_item(draft))
 
+        local_installations = (
+            tuple(
+                installation
+                for installation in discovery.installations
+                if installation.is_local
+            )
+            if discovery is not None
+            else ()
+        )
         host = _normalise_host(settings.comfy_host)
         selected_for_probe = (
             next(
@@ -1765,6 +1897,17 @@ class ApplicationService:
             if discovery is not None
             else None
         )
+        selected_name_matches = (
+            tuple(
+                installation
+                for installation in local_installations
+                if selected_for_probe is not None
+                and installation.name.casefold() == selected_for_probe.name.casefold()
+            )
+            if selected_for_probe is not None
+            else ()
+        )
+        selected_name_is_ambiguous = len(selected_name_matches) > 1
         matching_hosts = (
             tuple(
                 hint.host
@@ -1773,14 +1916,32 @@ class ApplicationService:
                 and hint.installation_name.casefold()
                 == selected_for_probe.name.casefold()
             )
-            if discovery is not None
+            if discovery is not None and not selected_name_is_ambiguous
             else ()
         )
         probe_hosts = (
-            (host,) if selected_for_probe is None or host in matching_hosts else ()
+            ()
+            if selected_name_is_ambiguous
+            else (host,)
+            if selected_for_probe is None or host in matching_hosts
+            else ()
         )
         comfy = probe_comfy_api(probe_hosts, timeout=0.75)
-        if comfy.reachable:
+        if selected_name_is_ambiguous:
+            items.append(
+                ReadinessItem(
+                    "comfy",
+                    "ComfyUI",
+                    "error",
+                    "MIVIM paused the connection because more than one local "
+                    "Desktop instance has the selected name.",
+                    ReadinessAction(
+                        ReadinessActionKind.OPEN_COMFY_DESKTOP,
+                        "Open Comfy Desktop to rename instances",
+                    ),
+                )
+            )
+        elif comfy.reachable:
             items.append(
                 ReadinessItem(
                     "comfy",
@@ -1790,25 +1951,57 @@ class ApplicationService:
                 )
             )
         else:
+            has_local_instance = bool(
+                discovery is not None
+                and any(
+                    installation.is_local for installation in discovery.installations
+                )
+            )
+            desktop_detected = discovery is not None and discovery.detected
+            if has_local_instance:
+                offline_detail = (
+                    "Comfy Desktop is installed but its selected instance is not "
+                    "running."
+                )
+                offline_action = "Open Comfy Desktop and check again"
+            elif desktop_detected:
+                offline_detail = (
+                    "Comfy Desktop is installed, but no local ComfyUI instance is "
+                    "ready yet. Open Desktop and finish creating or selecting one."
+                )
+                offline_action = "Open Comfy Desktop to create an instance"
+            else:
+                offline_detail = "Comfy Desktop was not found on this computer."
+                offline_action = "Open the Comfy Desktop install guide"
             items.append(
                 ReadinessItem(
                     "comfy",
                     "ComfyUI",
                     "error",
-                    "Comfy Desktop is installed but its selected instance is not running.",
-                    "Open Comfy Desktop, launch an instance, then retry",
+                    offline_detail,
+                    ReadinessAction(
+                        ReadinessActionKind.OPEN_COMFY_DESKTOP,
+                        offline_action,
+                    ),
+                )
+            )
+        if discovery is not None and discovery.warnings:
+            visible_warnings = discovery.warnings[:3]
+            detail = " ".join(visible_warnings)
+            if len(discovery.warnings) > len(visible_warnings):
+                detail += (
+                    f" {len(discovery.warnings) - len(visible_warnings)} additional "
+                    "configuration note(s) are available in the local logs."
+                )
+            items.append(
+                ReadinessItem(
+                    "comfy_config",
+                    "Comfy Desktop configuration",
+                    "warning",
+                    detail,
                 )
             )
 
-        local_installations = (
-            tuple(
-                installation
-                for installation in discovery.installations
-                if installation.is_local
-            )
-            if discovery is not None
-            else ()
-        )
         selected_installation = next(
             (
                 installation
@@ -1826,6 +2019,22 @@ class ApplicationService:
                     "The local ComfyUI connection is unambiguous.",
                 )
             )
+        elif selected_name_is_ambiguous and selected_installation is not None:
+            items.append(
+                ReadinessItem(
+                    "connection",
+                    "Desktop instance binding",
+                    "error",
+                    f"More than one local Desktop instance is named "
+                    f"“{selected_installation.name}”. MIVIM cannot safely tell "
+                    "which running API owns the selected model folders. Give each "
+                    "instance a unique name in Comfy Desktop, then check again.",
+                    ReadinessAction(
+                        ReadinessActionKind.OPEN_COMFY_DESKTOP,
+                        "Open Comfy Desktop to rename instances",
+                    ),
+                )
+            )
         else:
             runtime_hints = discovery.runtime_hints if discovery is not None else ()
             matching_runtime = next(
@@ -1839,7 +2048,10 @@ class ApplicationService:
                         "Desktop instance binding",
                         "error",
                         "More than one local Desktop instance exists and none is selected.",
-                        "Choose a Desktop instance",
+                        ReadinessAction(
+                            ReadinessActionKind.SELECT_COMFY_INSTALLATION,
+                            "Choose a Desktop instance",
+                        ),
                     )
                 )
             elif matching_runtime is None:
@@ -1850,7 +2062,10 @@ class ApplicationService:
                         "error",
                         "The running API could not be matched to the selected Desktop "
                         "instance. This run is blocked to protect the wrong model library.",
-                        "Launch the selected instance and check again",
+                        ReadinessAction(
+                            ReadinessActionKind.OPEN_COMFY_DESKTOP,
+                            "Open Comfy Desktop and check again",
+                        ),
                     )
                 )
             elif (
@@ -1865,7 +2080,10 @@ class ApplicationService:
                         f"The API at {comfy.host} belongs to "
                         f"“{matching_runtime.installation_name}”, not the selected "
                         f"“{selected_installation.name}”.",
-                        "Choose the running Desktop instance",
+                        ReadinessAction(
+                            ReadinessActionKind.SELECT_COMFY_INSTALLATION,
+                            "Choose the running Desktop instance",
+                        ),
                     )
                 )
             else:
@@ -1881,13 +2099,36 @@ class ApplicationService:
 
         selected_checkpoint = settings.comfy_checkpoint.strip()
         if not selected_checkpoint:
+            if comfy.checkpoints:
+                checkpoint_action = ReadinessAction(
+                    ReadinessActionKind.SELECT_CHECKPOINT,
+                    "Choose an SDXL model",
+                )
+                checkpoint_detail = "No checkpoint is selected."
+            elif comfy.reachable:
+                checkpoint_action = ReadinessAction(
+                    ReadinessActionKind.OPEN_COMFYUI,
+                    "Open ComfyUI to add an SDXL model",
+                )
+                checkpoint_detail = (
+                    "The running ComfyUI instance does not report any checkpoints."
+                )
+            else:
+                checkpoint_action = ReadinessAction(
+                    ReadinessActionKind.OPEN_COMFY_DESKTOP,
+                    "Open Comfy Desktop and check again",
+                )
+                checkpoint_detail = (
+                    "Checkpoint choices will appear after the selected ComfyUI "
+                    "instance is running."
+                )
             items.append(
                 ReadinessItem(
                     "checkpoint",
                     "SDXL base model",
                     "error",
-                    "No checkpoint is selected.",
-                    "Install or choose an SDXL checkpoint in ComfyUI",
+                    checkpoint_detail,
+                    checkpoint_action,
                 )
             )
         elif comfy.reachable and selected_checkpoint not in comfy.checkpoints:
@@ -1895,13 +2136,26 @@ class ApplicationService:
             detail = f"ComfyUI cannot see “{selected_checkpoint}”."
             if sample:
                 detail += f" Available models include: {sample}."
+                action = ReadinessAction(
+                    ReadinessActionKind.SELECT_CHECKPOINT,
+                    "Choose a model ComfyUI can see",
+                )
+            else:
+                detail += (
+                    " The running instance does not report any checkpoints; add an "
+                    "SDXL base model before training."
+                )
+                action = ReadinessAction(
+                    ReadinessActionKind.OPEN_COMFYUI,
+                    "Open ComfyUI to add an SDXL model",
+                )
             items.append(
                 ReadinessItem(
                     "checkpoint",
                     "SDXL base model",
                     "error",
                     detail,
-                    "Choose a model ComfyUI can see",
+                    action,
                 )
             )
         elif (
@@ -1916,7 +2170,10 @@ class ApplicationService:
                     f"ComfyUI reports “{selected_checkpoint}”, but does not expose "
                     "enough metadata to prove that it is an SDXL base model. "
                     "Confirm it before spending time on training.",
-                    "Confirm this is an SDXL base checkpoint",
+                    ReadinessAction(
+                        ReadinessActionKind.CONFIRM_CHECKPOINT,
+                        "Confirm this is an SDXL base checkpoint",
+                    ),
                 )
             )
         else:
@@ -1934,21 +2191,19 @@ class ApplicationService:
             discovery,
             selected_checkpoint,
         )
+        active_checkpoint = checkpoint_paths[0] if checkpoint_paths else None
         if base_model is None:
-            ambiguity = (
-                f" {len(checkpoint_paths)} matching files were found; choose the "
-                "one used by this Desktop instance."
-                if len(checkpoint_paths) > 1
-                else ""
-            )
             items.append(
                 ReadinessItem(
                     "base_model",
                     "Training base model",
                     "error",
                     "The selected ComfyUI checkpoint file could not be located for "
-                    f"the trainer.{ambiguity}",
-                    "Choose the local SDXL checkpoint file",
+                    "the trainer.",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_BASE_MODEL,
+                        "Choose the local SDXL checkpoint file",
+                    ),
                 )
             )
         elif not base_model.is_file():
@@ -1958,7 +2213,10 @@ class ApplicationService:
                     "Training base model",
                     "error",
                     f"The local checkpoint no longer exists: {base_model}",
-                    "Choose the local SDXL checkpoint file",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_BASE_MODEL,
+                        "Choose the local SDXL checkpoint file",
+                    ),
                 )
             )
         elif not checkpoint_paths:
@@ -1969,21 +2227,49 @@ class ApplicationService:
                     "error",
                     "The selected training file could not be resolved inside the "
                     "selected Desktop instance's effective model folders.",
-                    "Choose the checkpoint from the selected Desktop instance",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_BASE_MODEL,
+                        "Choose the checkpoint from the selected Desktop instance",
+                    ),
                 )
             )
-        elif not any(
-            base_model.resolve() == candidate.resolve()
-            for candidate in checkpoint_paths
+        elif (
+            active_checkpoint is None
+            or base_model.resolve() != active_checkpoint.resolve()
         ):
+            shadow_detail = (
+                f" A same-named file exists there, but ComfyUI will load the "
+                f"higher-priority copy at {active_checkpoint}."
+                if active_checkpoint is not None
+                and any(
+                    base_model.resolve() == candidate.resolve()
+                    for candidate in checkpoint_paths[1:]
+                )
+                else ""
+            )
             items.append(
                 ReadinessItem(
                     "base_model",
                     "Training base model",
                     "error",
                     "The selected training file is not the checkpoint selected in "
-                    "ComfyUI. Training and validation must use the same base model.",
-                    "Choose the matching local SDXL checkpoint",
+                    "ComfyUI. Training and validation must use the same base model."
+                    + shadow_detail,
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_BASE_MODEL,
+                        "Choose the matching local SDXL checkpoint",
+                    ),
+                )
+            )
+        elif len(checkpoint_paths) > 1:
+            items.append(
+                ReadinessItem(
+                    "base_model",
+                    "Training base model",
+                    "warning",
+                    f"Training and validation are bound to ComfyUI's first match: "
+                    f"{active_checkpoint}. {len(checkpoint_paths) - 1} lower-priority "
+                    "same-named model copy or copies will be ignored.",
                 )
             )
         else:
@@ -1998,7 +2284,7 @@ class ApplicationService:
 
         lora_dir = settings.comfy_lora_dir
         effective_lora_dirs = (
-            tuple(root.loras for root in discovery.model_roots)
+            discovery.effective_lora_dirs
             if discovery is not None and selected_installation is not None
             else ()
         )
@@ -2010,7 +2296,10 @@ class ApplicationService:
                     "ComfyUI LoRA library",
                     "error",
                     "The LoRA library could not be discovered.",
-                    "Choose the ComfyUI models\\loras folder",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_LORA_FOLDER,
+                        "Choose the ComfyUI models\\loras folder",
+                    ),
                 )
             )
         elif selected_installation is not None and (
@@ -2027,7 +2316,10 @@ class ApplicationService:
                     "error",
                     "The selected LoRA folder is not part of the selected Desktop "
                     "instance's effective model folders.",
-                    "Use the selected Desktop instance's LoRA folder",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_LORA_FOLDER,
+                        "Choose the selected instance's LoRA folder",
+                    ),
                 )
             )
         elif not lora_dir.is_dir():
@@ -2038,9 +2330,15 @@ class ApplicationService:
                     "error",
                     f"The folder does not exist: {lora_dir}",
                     (
-                        "Create LoRA folder"
+                        ReadinessAction(
+                            ReadinessActionKind.CREATE_LORA_FOLDER,
+                            "Create LoRA folder",
+                        )
                         if creatable_lora_dir is not None
-                        else "Choose another folder"
+                        else ReadinessAction(
+                            ReadinessActionKind.CHOOSE_LORA_FOLDER,
+                            "Choose another LoRA folder",
+                        )
                     ),
                 )
             )
@@ -2053,7 +2351,10 @@ class ApplicationService:
                         "ComfyUI LoRA library",
                         "error",
                         f"The folder cannot accept a trained model: {write_error}",
-                        "Choose a writable models\\loras folder",
+                        ReadinessAction(
+                            ReadinessActionKind.CHOOSE_LORA_FOLDER,
+                            "Choose a writable models\\loras folder",
+                        ),
                     )
                 )
             else:
@@ -2075,7 +2376,10 @@ class ApplicationService:
                     "LoRA trainer",
                     "error",
                     "ai-toolkit has not been connected yet.",
-                    "Choose the ai-toolkit folder",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_TOOLKIT_FOLDER,
+                        "Choose the ai-toolkit folder",
+                    ),
                 )
             )
         elif toolkit_python is None or not toolkit_python.is_file():
@@ -2085,7 +2389,10 @@ class ApplicationService:
                     "LoRA trainer",
                     "error",
                     "The trainer's isolated Python environment was not found.",
-                    "Choose its venv Python",
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_TOOLKIT_PYTHON,
+                        "Choose its venv Python",
+                    ),
                 )
             )
         else:
@@ -2098,7 +2405,14 @@ class ApplicationService:
                     trainer_detail
                     if trainer_ready
                     else f"{trainer_detail} ({toolkit})",
-                    "" if trainer_ready else "Repair the ai-toolkit environment",
+                    (
+                        None
+                        if trainer_ready
+                        else ReadinessAction(
+                            ReadinessActionKind.REPAIR_TRAINER,
+                            "Repair the ai-toolkit environment",
+                        )
+                    ),
                 )
             )
 
@@ -2133,9 +2447,19 @@ class ApplicationService:
                 storage_state,
                 storage_detail,
                 (
-                    "Choose another workspace"
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_WORKSPACE,
+                        "Choose another workspace",
+                    )
                     if not writable
-                    else ("Free some disk space" if free_gib < 20 else "")
+                    else (
+                        ReadinessAction(
+                            ReadinessActionKind.OPEN_STORAGE_SETTINGS,
+                            "Open Windows Storage settings",
+                        )
+                        if free_gib < 20
+                        else None
+                    )
                 ),
             )
         )
@@ -2150,9 +2474,21 @@ class ApplicationService:
                     else "A full training run requires at least 20 GB free in the "
                     "selected workspace."
                 ),
-                "Free space or choose another workspace"
-                if not writable or free_gib < 20
-                else "",
+                (
+                    ReadinessAction(
+                        ReadinessActionKind.CHOOSE_WORKSPACE,
+                        "Choose another workspace",
+                    )
+                    if not writable
+                    else (
+                        ReadinessAction(
+                            ReadinessActionKind.OPEN_STORAGE_SETTINGS,
+                            "Open Windows Storage settings",
+                        )
+                        if free_gib < 20
+                        else None
+                    )
+                ),
             )
         )
 

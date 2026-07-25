@@ -23,7 +23,7 @@ if (-not (Test-Path -LiteralPath $deployPython -PathType Leaf)) {
     }
 }
 
-$deployRuntime = & $deployPython -c "import struct, sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{struct.calcsize(""P"") * 8}')"
+$deployRuntime = & $deployPython -c "import struct, sys; print(f'{sys.version_info.major}.{sys.version_info.minor}|{struct.calcsize(chr(80)) * 8}')"
 if ($LASTEXITCODE -ne 0 -or $deployRuntime -ne "3.13|64") {
     throw "The deployment environment must use 64-bit Python 3.13. Found: $deployRuntime"
 }
@@ -113,6 +113,14 @@ try {
         if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) {
             throw "Deployment is missing required application data: $requiredFile"
         }
+    }
+    $signature = Get-AuthenticodeSignature -LiteralPath $expectedExecutable
+    if ($signature.Status -ne [System.Management.Automation.SignatureStatus]::Valid) {
+        Write-Warning (
+            "The local package is not Authenticode-signed. Before distributing " +
+            "it to casual users, sign MIVIMLoRAStudio.exe with the MIVIM " +
+            "publisher certificate and verify Get-AuthenticodeSignature reports Valid."
+        )
     }
 }
 finally {

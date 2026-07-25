@@ -40,11 +40,19 @@ You can also launch it directly:
 ### Connect
 
 - Detects current Comfy Desktop 2 and legacy Desktop installations.
+- Detects the registered Windows application before its first Desktop launch,
+  then guides the user to create a local instance instead of offering the
+  installer again.
 - Reads Desktop configuration and live-process runtime port hints without
   modifying them; stale locks from closed instances are ignored.
 - Supports Desktop's multi-instance, shared-model, and dynamic-port layout.
-- Includes compatible checkpoint and LoRA folders declared in the selected
-  instance's `extra_model_paths.yaml`.
+- Reconstructs Desktop's executable-drive and persisted shared-storage
+  defaults, configured model libraries, startup path arguments, generated
+  per-instance model config, install-local `extra_model_paths.yaml`, and output
+  model folders in ComfyUI's actual first-match order.
+- Uses the launch snapshot for a running instance. If Desktop storage changed
+  after launch or the snapshot cannot be proven, the app asks the user to
+  restart that instance instead of approving next-launch paths as current.
 - Shows an instance selector when more than one local Desktop installation
   exists, then binds that instance's runtime port, model roots, checkpoint, and
   LoRA destination as one connection. It never falls through to another
@@ -94,6 +102,11 @@ The application checks the actual paths and services it will use:
 
 Photo preparation remains available when the trainer or ComfyUI is not ready.
 A full run is enabled only when every required capability passes.
+Each readiness card has one exact repair operation behind its visible button:
+choosing photos never opens review by surprise, model and trainer actions return
+to the relevant setup control, and successful settings changes are saved before
+the checks run again. Low-storage recovery opens Windows Storage settings;
+changing the workspace remains a separate, clearly labelled choice.
 The project name is also checked across prepared data, trainer checkpoints and
 config, validation work and grid, the completed-run record, and the installed
 ComfyUI LoRA. Existing outputs require a new version name or explicit rebuild
@@ -109,15 +122,22 @@ Every plan includes a no-LoRA baseline for an honest before/after comparison:
 | Balanced     |   16 | 2,000 |    1,024 px | 0.6, 0.8, 1.0             |
 | High quality |   32 | 3,000 |    1,024 px | 0.5, 0.65, 0.8, 0.95, 1.1 |
 
-The run monitor streams the real pipeline output and prevents concurrent GPU
-runs. Before validation begins, Stop cancels the complete Windows process tree
-so a trainer process is not silently left running. During validation, pending
-owned prompts are removed individually. A running prompt receives a targeted
+The run monitor streams the real pipeline output. Cross-process leases prevent
+overlapping GPU, project, workspace, dataset, checkpoint, grid, and ComfyUI
+model-library mutations—even across multiple Studio windows and direct CLI
+stage calls. On Windows, the Studio owns its worker lifetime and trainers are
+created atomically inside a kill-on-close Job Object, so a normal stop, crash,
+or hard-killed window cannot silently leave training on the GPU. During
+validation, durable prompt reservations survive a worker crash. Pending owned
+prompts are removed individually; a running prompt receives a targeted
 interrupt only when ComfyUI reports version 0.3.56 or newer. Older or unknown
-versions and unverified ownership are safe no-ops toward ComfyUI: MIVIM remains
-attached, explains how to stop that job in ComfyUI, and refuses to close while
-it cannot confirm a safe stop. Other users' work is never stopped. Failed starts
-and interrupted runs expose direct edit, output-folder, and retry actions.
+versions, unreadable queue state, and unverified ownership fail closed: MIVIM
+explains the exact ComfyUI action and never stops another user's work. Failed
+starts and interrupted runs expose direct edit, output-folder, and retry
+actions.
+An out-of-memory recovery can offer the Fast preset, but it explains that a
+fresh rebuild replaces the current project's generated work and requires
+explicit approval before enabling that rebuild.
 Prepared data and completed checkpoints are retained. If training and
 installation finish but ComfyUI validation fails,
 the monitor offers a validation-only retry instead of repeating training. That
@@ -136,7 +156,11 @@ offers thumbnails and an editable caption for every prepared photo; continuing
 the full run uses `--skip-prep`, so a prepare-only run or a failure after
 preparation does not force users to repeat that work. Reuse and training share
 one image/`.txt` pair contract; duplicate stems, missing partners, and
-unsupported image files are named before Start can launch a process.
+unsupported image files are named before Start can launch a process. The
+manifest also binds reuse to the requested description method and the exact
+generated image bytes. The trainer rechecks those hashes immediately before
+materializing its run config. Captions remain editable, but replaced or deleted
+prepared images require a visible rebuild instead of being trusted silently.
 
 ### Result
 
@@ -299,6 +323,12 @@ worker, so it does not depend on a system Python interpreter after deployment.
 Distribute the complete `dist\MIVIMLoRAStudio.dist` folder, not the executable
 by itself.
 
+The script permits unsigned local test builds but prints a release warning.
+Before publishing the folder to casual users, Authenticode-sign
+`MIVIMLoRAStudio.exe` with the MIVIM publisher certificate and confirm
+`Get-AuthenticodeSignature` reports `Valid`. The certificate and private key
+are release credentials and are intentionally not stored in this repository.
+
 ## Architecture
 
 See the [MIVIM quality-of-life map](docs/quality-of-life-map.md) for the
@@ -309,13 +339,15 @@ desktop feature.
 PySide6 desktop
   ├─ application service (readiness + commands)
   ├─ versioned user settings
-  ├─ read-only Comfy Desktop discovery
+  ├─ read-only Comfy Desktop discovery + live launch snapshot
   ├─ bounded local support log
+  ├─ Studio-owned worker lifetime
   └─ background pipeline worker
+       ├─ cross-process project/resource/GPU leases
        ├─ prepare_dataset
-       ├─ ai-toolkit subprocess
+       ├─ crash-owned ai-toolkit process tree
        ├─ atomic LoRA handoff
-       └─ ComfyUI API validation
+       └─ durable ComfyUI API validation ownership
 ```
 
 Important source files:
@@ -330,6 +362,9 @@ Important source files:
 | `src/app_settings.py`   | Atomic per-user persistence                            |
 | `src/studio_logging.py` | Local rotating setup, recovery, and pipeline logs      |
 | `src/comfy_desktop.py`  | Desktop 2/legacy discovery and live API models         |
+| `src/run_guardian.py`   | Cross-process project, resource, and accelerator leases |
+| `src/process_control.py` | Studio/worker/trainer crash-lifetime ownership          |
+| `src/comfy_activity.py` | Durable ownership of remotely queued ComfyUI prompts     |
 | `src/pipeline.py`       | Preparation → training → installation → validation     |
 | `src/train.py`          | Concrete ai-toolkit config and real preset overrides   |
 | `src/comfy_client.py`   | ComfyUI prompt/WebSocket/history client                |
@@ -346,8 +381,9 @@ Important source files:
   and resolution.
 - Each completed validation produces a comparison grid plus a tested,
   core-node-only ComfyUI Workflow JSON v0.4. The PNG separately embeds the API
-  prompt and equivalent editable UI workflow. Workflow JSON 1.0 is the newest
-  documented schema; automatic Desktop import and 1.0 export are not claimed.
+  prompt and equivalent editable UI workflow. Publication of the verified 0.4
+  workflow through ComfyUI's supported user-data API is implemented; Workflow
+  JSON 1.0 export is not claimed.
 - Automated integration uses a mock ComfyUI API. A live Desktop/GPU training
   run and manual workflow import remain environment acceptance checks.
   Multi-checkpoint and automatic strength-winner selection remain subsequent

@@ -18,6 +18,7 @@ from PySide6.QtCore import QProcess, Qt, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication,
+    QFileDialog,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -125,6 +126,42 @@ def _wait_for_initial_setup(qtbot, window: MainWindow) -> None:
     )
 
 
+def _click_diagnostic_action(
+    qtbot,
+    window: MainWindow,
+    action: app_service.ReadinessAction,
+    *,
+    code: str = "test",
+) -> None:
+    item = app_service.ReadinessItem(
+        code,
+        "Test repair",
+        "error",
+        "A user-facing repair is required.",
+        action,
+    )
+    window.nav_buttons[NAV_RUN].setEnabled(True)
+    window.pages.setCurrentIndex(NAV_RUN)
+    window.run_stack.setCurrentIndex(0)
+    window._readiness_finished(
+        app_service.ReadinessReport(
+            (item,),
+            can_prepare=False,
+            can_run_full=False,
+            comfy_status=ComfyApiStatus(False, None, (), (), "test"),
+            source=None,
+            prepared=None,
+        )
+    )
+    QApplication.processEvents()
+    button = next(
+        candidate
+        for candidate in window.diagnostics_widget.findChildren(QPushButton)
+        if candidate.isVisible() and candidate.text() == action.label
+    )
+    qtbot.mouseClick(button, Qt.MouseButton.LeftButton)
+
+
 def _result_desktop_discovery(
     root: Path,
     *,
@@ -141,6 +178,7 @@ def _result_desktop_discovery(
         status="installed",
         last_launched_at=1,
         use_shared_models=False,
+        use_shared_input_output=False,
     )
     model_root = ComfyModelRoot(
         path=root / "models",
@@ -224,7 +262,7 @@ def _open_online_result_window(
                 host=host,
                 installation_name="Portrait Desktop",
                 pid=1234,
-                timestamp=1,
+                timestamp=9_999_999_999_999,
             ),
         ),
     )
@@ -620,7 +658,9 @@ def test_invalid_prepared_pairs_disable_start_before_qprocess(
     assert collision.state == "error"
     assert "001.jpg" in collision.detail
     assert "001.png" in collision.detail
-    assert collision.action == "Review prepared files"
+    assert collision.action is not None
+    assert collision.action.kind is app_service.ReadinessActionKind.REVIEW_PREPARED
+    assert collision.action.label == "Review prepared files"
     assert not window.start_button.isEnabled()
     assert window.pipeline_process is None
 
@@ -652,6 +692,7 @@ def test_verified_missing_comfy_lora_folder_has_safe_gui_repair(
         status="installed",
         last_launched_at=1,
         use_shared_models=False,
+        use_shared_input_output=False,
         model_dirs=(model_root,),
     )
     discovery = ComfyDesktopDiscovery(
@@ -708,7 +749,9 @@ def test_verified_missing_comfy_lora_folder_has_safe_gui_repair(
     lora_item = next(
         item for item in window.readiness_report.items if item.code == "lora_dir"
     )
-    assert lora_item.action == "Create LoRA folder"
+    assert lora_item.action is not None
+    assert lora_item.action.kind is app_service.ReadinessActionKind.CREATE_LORA_FOLDER
+    assert lora_item.action.label == "Create LoRA folder"
     create_button = next(
         button
         for button in window.diagnostics_widget.findChildren(QPushButton)
@@ -734,6 +777,417 @@ def test_verified_missing_comfy_lora_folder_has_safe_gui_repair(
     assert not outside.exists()
     assert errors
     assert errors[-1][0] == "LoRA folder was not created"
+
+
+def test_typed_photo_and_project_repairs_do_exactly_what_their_labels_say(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    chosen_photos = tmp_path / "chosen-photos"
+    chosen_photos.mkdir()
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    reviews: list[str] = []
+    monkeypatch.setattr(window, "review_project", lambda: reviews.append("reviewed"))
+
+    window.overwrite_checkbox.setChecked(True)
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.DISABLE_REBUILD,
+            "Turn off rebuild to preserve existing work",
+        ),
+    )
+    assert not window.overwrite_checkbox.isChecked()
+    assert reviews == ["reviewed"]
+
+    monkeypatch.setattr(
+        QFileDialog,
+        "getExistingDirectory",
+        lambda *_args, **_kwargs: str(chosen_photos),
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.CHOOSE_PHOTO_FOLDER,
+            "Choose another photo folder",
+        ),
+    )
+    assert window.source_folder == chosen_photos
+    assert reviews == ["reviewed", "reviewed"]
+
+    photo_reviews: list[bool] = []
+
+    def review_photos() -> bool:
+        photo_reviews.append(True)
+        return False
+
+    monkeypatch.setattr(
+        window,
+        "review_photo_checks",
+        review_photos,
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.REVIEW_PHOTOS,
+            "Review photo checks",
+        ),
+    )
+    assert photo_reviews == [True]
+    assert window.source_folder == chosen_photos
+
+
+def test_typed_external_and_trainer_repairs_keep_their_action_contracts(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+
+    opened_desktop: list[bool] = []
+
+    def open_desktop() -> bool:
+        opened_desktop.append(True)
+        return True
+
+    monkeypatch.setattr(
+        window,
+        "open_comfy_desktop",
+        open_desktop,
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.OPEN_COMFY_DESKTOP,
+            "Open Comfy Desktop and check again",
+        ),
+    )
+    assert opened_desktop == [True]
+    assert window._return_to_readiness_when_connected
+    assert window.pages.currentIndex() == 0
+
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.SELECT_COMFY_INSTALLATION,
+            "Choose a Desktop instance",
+        ),
+    )
+    assert window._return_to_readiness_after_installation
+    assert window.pages.currentIndex() == 0
+
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.SELECT_CHECKPOINT,
+            "Choose an SDXL model",
+        ),
+    )
+    assert window._return_to_readiness_after_checkpoint
+    assert window.pages.currentIndex() == 0
+
+    opened_comfyui: list[bool] = []
+
+    def open_comfyui() -> bool:
+        opened_comfyui.append(True)
+        return True
+
+    monkeypatch.setattr(
+        window,
+        "_open_current_comfy_ui",
+        open_comfyui,
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.OPEN_COMFYUI,
+            "Open ComfyUI to add an SDXL model",
+        ),
+    )
+    assert opened_comfyui == [True]
+    assert window.pages.currentIndex() == 0
+
+    opened_urls: list[QUrl] = []
+
+    def open_url(url: QUrl) -> bool:
+        opened_urls.append(url)
+        return True
+
+    monkeypatch.setattr(
+        QDesktopServices,
+        "openUrl",
+        open_url,
+    )
+    monkeypatch.setattr(
+        window,
+        "choose_workspace_dir",
+        lambda: pytest.fail("Storage cleanup must not open the workspace chooser"),
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.OPEN_STORAGE_SETTINGS,
+            "Open Windows Storage settings",
+        ),
+    )
+    assert opened_urls[-1].toString() == "ms-settings:storagesense"
+
+    trainer_choices: list[bool] = []
+    reviews: list[bool] = []
+
+    def choose_toolkit() -> bool:
+        trainer_choices.append(True)
+        return True
+
+    monkeypatch.setattr(
+        window,
+        "choose_toolkit_dir",
+        choose_toolkit,
+    )
+    monkeypatch.setattr(window, "review_project", lambda: reviews.append(True))
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.CHOOSE_TOOLKIT_FOLDER,
+            "Choose the ai-toolkit folder",
+        ),
+    )
+    assert trainer_choices == [True]
+    assert reviews == [True]
+
+    python_choices: list[bool] = []
+
+    def choose_python() -> bool:
+        python_choices.append(True)
+        return True
+
+    monkeypatch.setattr(
+        window,
+        "choose_toolkit_python",
+        choose_python,
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.CHOOSE_TOOLKIT_PYTHON,
+            "Choose the ai-toolkit venv Python",
+        ),
+    )
+    assert python_choices == [True]
+    assert reviews == [True, True]
+
+    checkpoint_repairs: list[bool] = []
+    monkeypatch.setattr(
+        window,
+        "confirm_sdxl_checkpoint",
+        lambda: checkpoint_repairs.append(True),
+    )
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.CONFIRM_CHECKPOINT,
+            "Confirm this is an SDXL base checkpoint",
+        ),
+    )
+    assert checkpoint_repairs == [True]
+
+
+def test_offline_model_hint_explains_how_to_load_the_real_model_list(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+
+    assert "Connect a running local ComfyUI instance" in window.model_hint.text()
+    assert "Add an SDXL model" not in window.model_hint.text()
+
+
+def test_duplicate_checkpoint_hint_names_active_copy_and_ignored_count(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    preferred = tmp_path / "preferred"
+    shadowed = tmp_path / "shadowed"
+    for folder in (preferred, shadowed):
+        folder.mkdir()
+        (folder / "portraitXL.safetensors").write_bytes(folder.name.encode())
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    window.settings = replace(
+        window.settings,
+        comfy_checkpoint="portraitXL.safetensors",
+        training_base_model=preferred / "portraitXL.safetensors",
+    )
+    window.discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=(),
+        selected_installation=None,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=("127.0.0.1:8188",),
+        launcher=ComfyLauncher("", "", "", (), False),
+        warnings=(),
+        checkpoint_dirs=(preferred, shadowed),
+    )
+    window.comfy_status = ComfyApiStatus(
+        True,
+        "127.0.0.1:8188",
+        ("portraitXL.safetensors",),
+        (),
+        None,
+    )
+
+    window._populate_settings()
+
+    assert str(preferred / "portraitXL.safetensors") in window.model_hint.text()
+    assert "1 lower-priority same-named copy" in window.model_hint.text()
+    assert "Choose the exact file below" not in window.model_hint.text()
+
+
+def test_desktop_launch_repair_polls_then_returns_to_readiness(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service = _OfflineLocalService(root=tmp_path)
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=service,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+
+    def launch_desktop() -> bool:
+        window._desktop_poll_remaining = 18
+        return True
+
+    reviews: list[bool] = []
+    monkeypatch.setattr(window, "open_comfy_desktop", launch_desktop)
+    monkeypatch.setattr(window, "review_project", lambda: reviews.append(True))
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.OPEN_COMFY_DESKTOP,
+            "Open Comfy Desktop and check again",
+        ),
+    )
+
+    original = window._collect_settings()
+    window._setup_request += 1
+    window._setup_refreshed(
+        window._setup_request,
+        original,
+        (
+            original,
+            service.discover_comfy(),
+            ComfyApiStatus(True, "127.0.0.1:8188", (), (), None),
+        ),
+    )
+    QApplication.processEvents()
+
+    assert not window._return_to_readiness_when_connected
+    assert window._desktop_poll_remaining == 0
+    assert reviews == [True]
+
+
+def test_installed_desktop_without_instance_opens_desktop_not_install_guide(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path / "Comfy Desktop",
+        legacy_config_dir=None,
+        installations=(),
+        selected_installation=None,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=(),
+        launcher=ComfyLauncher(
+            "Comfy Desktop",
+            "desktop-app",
+            r"shell:AppsFolder\desktop-app",
+            ("explorer.exe", r"shell:AppsFolder\desktop-app"),
+            True,
+        ),
+        warnings=(),
+    )
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(
+            False,
+            None,
+            (),
+            (),
+            "offline",
+        ),
+    )
+    launched: list[list[str]] = []
+    monkeypatch.setattr(
+        "src.desktop.subprocess.Popen",
+        lambda command, **_kwargs: launched.append(command),
+    )
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_FixedDiscoveryService(root=tmp_path, discovery=discovery),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+
+    assert window.comfy_badge.text() == "CREATE INSTANCE"
+    assert window.open_desktop_button.text() == "Open Comfy Desktop"
+    assert window.open_comfy_desktop()
+    assert launched == [
+        ["explorer.exe", r"shell:AppsFolder\desktop-app"],
+    ]
 
 
 def test_unavailable_saved_desktop_requires_an_explicit_user_choice(
@@ -790,6 +1244,27 @@ def test_unavailable_saved_desktop_requires_an_explicit_user_choice(
     assert window.installation_combo.currentData() == "original"
     assert "Original instance unavailable" in window.installation_combo.currentText()
 
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.SELECT_COMFY_INSTALLATION,
+            "Choose a Desktop instance",
+        ),
+    )
+    current_index = window.installation_combo.findData("current")
+    assert current_index >= 0
+    window.installation_combo.setCurrentIndex(current_index)
+    qtbot.waitUntil(
+        lambda: (
+            window.pages.currentIndex() == NAV_RUN
+            and not window._return_to_readiness_after_setup
+        ),
+        timeout=5_000,
+    )
+
+    assert load_settings(tmp_path / "settings.json").comfy_installation_id == "current"
+
 
 def test_failed_pipeline_start_has_visible_recovery_actions(
     qtbot,
@@ -832,9 +1307,22 @@ def test_failed_pipeline_start_has_visible_recovery_actions(
     assert window.nav_buttons[NAV_RUN].isEnabled()
     assert not window.cancel_button.isEnabled()
 
-    window._installed_lora_name = "broken_start_v1.safetensors"
+    recovery = ValidationRecovery(
+        project_name="broken_start_v1",
+        state="validation_pending",
+        lora_name="broken_start_v1.safetensors",
+        installed_lora_path=tmp_path / "broken_start_v1.safetensors",
+        expected_grid_path=tmp_path / "broken_start_v1.png",
+        trigger="mivim person",
+        preset=TrainingPreset.BALANCED,
+        checkpoint="portraitXL.safetensors",
+        updated_at="2026-07-24T12:00:00+00:00",
+    )
+    window._pending_validation_recovery = recovery
+    window._installed_lora_name = recovery.lora_name
     window._show_recovery_actions(True)
     assert window.retry_validation_button.isVisible()
+    assert not window.retry_after_run_button.isVisible()
 
 
 def test_real_trainer_process_uses_elapsed_indeterminate_progress_then_restores(
@@ -1269,6 +1757,19 @@ def test_real_cuda_oom_offers_fast_plan_and_applies_the_recovery(
     assert "Use Fast & check again" in window.run_detail_label.text()
     assert window.use_fast_after_run_button.isVisible()
     assert not window.repair_trainer_after_run_button.isVisible()
+
+    def approve_fast_rebuild() -> None:
+        dialog = next(
+            child for child in window.findChildren(QMessageBox) if child.isVisible()
+        )
+        approve = next(
+            child
+            for child in dialog.findChildren(QPushButton)
+            if child.text() == "Use Fast and rebuild this project"
+        )
+        approve.click()
+
+    QTimer.singleShot(0, approve_fast_rebuild)
     qtbot.mouseClick(
         window.use_fast_after_run_button,
         Qt.MouseButton.LeftButton,
@@ -1277,6 +1778,170 @@ def test_real_cuda_oom_offers_fast_plan_and_applies_the_recovery(
     assert window.overwrite_checkbox.isChecked()
     assert window.run_stack.currentIndex() == 0
     qtbot.waitUntil(lambda: not window._workers, timeout=10_000)
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Another MIVIM run is already using the accelerator.",
+        'Another MIVIM run is already working on project "busy_v1".',
+        (
+            "Another MIVIM run is already using a file or folder required "
+            'by project "busy_v1".'
+        ),
+    ),
+)
+def test_run_guard_contention_has_a_clear_wait_and_retry_experience(
+    qtbot,
+    tmp_path: Path,
+    message: str,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    command = _script_pipeline_command(
+        tmp_path,
+        f"import sys\nprint({message!r}, file=sys.stderr, flush=True)\nraise SystemExit(2)\n",
+    )
+
+    window._launch_pipeline_command(command, "Starting safely")
+    qtbot.waitUntil(
+        lambda: window.run_stage_label.text() == "Another MIVIM run is active",
+        timeout=3_000,
+    )
+
+    assert "No new work was started" in window.run_detail_label.text()
+    assert "choose Check and retry" in window.run_detail_label.text()
+    assert window.retry_after_run_button.isVisible()
+    assert not window.retry_validation_button.isVisible()
+    assert not window.edit_after_run_button.isVisible()
+    assert not window.open_run_folder_button.isVisible()
+
+
+def test_orphaned_comfy_work_has_a_direct_desktop_recovery(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    command = _script_pipeline_command(
+        tmp_path,
+        (
+            "import sys\n"
+            "print('MIVIM_RUN_BUSY: ComfyUI is still finishing MIVIM job "
+            "prompt-a.', file=sys.stderr, flush=True)\n"
+            "raise SystemExit(2)\n"
+        ),
+    )
+
+    window._launch_pipeline_command(command, "Checking ComfyUI safety")
+    qtbot.waitUntil(
+        lambda: (
+            window.run_stage_label.text() == "ComfyUI is finishing earlier MIVIM work"
+        ),
+        timeout=3_000,
+    )
+
+    assert "No new work was started" in window.run_detail_label.text()
+    assert "stop that job there" in window.run_detail_label.text()
+    assert window.open_desktop_after_run_button.isVisible()
+    assert window.retry_after_run_button.isVisible()
+    assert not window.edit_after_run_button.isVisible()
+    assert not window.open_run_folder_button.isVisible()
+
+
+def test_busy_validation_recovery_shows_only_validation_retry(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    recovery = ValidationRecovery(
+        project_name="busy_validation_v1",
+        state="validation_pending",
+        lora_name="busy_validation_v1.safetensors",
+        installed_lora_path=tmp_path / "busy_validation_v1.safetensors",
+        expected_grid_path=tmp_path / "busy_validation_v1.png",
+        trigger="mivim person",
+        preset=TrainingPreset.BALANCED,
+        checkpoint="portraitXL.safetensors",
+        updated_at="2026-07-24T12:00:00+00:00",
+    )
+    window._pending_validation_recovery = recovery
+    window._installed_lora_name = recovery.lora_name
+    command = replace(
+        _script_pipeline_command(
+            tmp_path,
+            (
+                "import sys\n"
+                "print('Another MIVIM run is already using the accelerator.', "
+                "file=sys.stderr, flush=True)\n"
+                "raise SystemExit(2)\n"
+            ),
+        ),
+        mode="validate",
+    )
+
+    window._launch_pipeline_command(command, "Retrying validation")
+    qtbot.waitUntil(
+        lambda: window.run_stage_label.text() == "Another MIVIM run is active",
+        timeout=3_000,
+    )
+
+    assert "No new validation work was started" in window.run_detail_label.text()
+    assert "Retry validation only" in window.run_detail_label.text()
+    assert "Photos and training will not repeat" in window.run_detail_label.text()
+    assert window.retry_validation_button.isVisible()
+    assert not window.retry_after_run_button.isVisible()
+
+
+def test_fast_oom_recovery_does_not_enable_rebuild_without_user_approval(
+    qtbot,
+    tmp_path: Path,
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    window.use_fast_after_run_button.setVisible(True)
+
+    def cancel_fast_rebuild() -> None:
+        dialog = next(
+            child for child in window.findChildren(QMessageBox) if child.isVisible()
+        )
+        cancel = dialog.button(QMessageBox.StandardButton.Cancel)
+        assert cancel is not None
+        cancel.click()
+
+    QTimer.singleShot(0, cancel_fast_rebuild)
+    qtbot.mouseClick(
+        window.use_fast_after_run_button,
+        Qt.MouseButton.LeftButton,
+    )
+
+    assert window.preset_combo.currentData() == TrainingPreset.BALANCED.value
+    assert not window.overwrite_checkbox.isChecked()
 
 
 def test_real_missing_trainer_dependency_opens_guided_repair(
@@ -1358,6 +2023,84 @@ def test_trainer_repair_check_opens_the_visible_review_page(
 
     assert window.pages.currentIndex() == NAV_RUN
     assert window.run_stack.currentIndex() == 0
+    qtbot.waitUntil(lambda: not window._workers, timeout=10_000)
+
+
+@pytest.mark.parametrize("choice", ("folder", "python"))
+def test_repair_trainer_dialog_choice_persists_and_rechecks(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    choice: str,
+) -> None:
+    toolkit = tmp_path / "ai-toolkit"
+    toolkit.mkdir()
+    detected_python = toolkit / "venv" / "Scripts" / "python.exe"
+    detected_python.parent.mkdir(parents=True)
+    detected_python.write_text("", encoding="utf-8")
+    chosen_python = tmp_path / "custom-venv" / "python.exe"
+    chosen_python.parent.mkdir()
+    chosen_python.write_text("", encoding="utf-8")
+    settings_path = tmp_path / "settings.json"
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=settings_path,
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    if choice == "folder":
+        monkeypatch.setattr(
+            QFileDialog,
+            "getExistingDirectory",
+            lambda *_args, **_kwargs: str(toolkit),
+        )
+        button_text = "Choose ai-toolkit folder"
+        expected_python = detected_python
+    else:
+        window.toolkit_dir_edit.setText(str(toolkit))
+        monkeypatch.setattr(
+            QFileDialog,
+            "getOpenFileName",
+            lambda *_args, **_kwargs: (str(chosen_python), ""),
+        )
+        button_text = "Choose venv Python"
+        expected_python = chosen_python
+    request_before = window._readiness_request
+
+    def click_trainer_choice() -> None:
+        dialogs = [
+            child for child in window.findChildren(QMessageBox) if child.isVisible()
+        ]
+        if not dialogs:
+            QTimer.singleShot(10, click_trainer_choice)
+            return
+        dialog = dialogs[0]
+        button = next(
+            child
+            for child in dialog.findChildren(QPushButton)
+            if child.text() == button_text
+        )
+        button.click()
+
+    QTimer.singleShot(0, click_trainer_choice)
+    _click_diagnostic_action(
+        qtbot,
+        window,
+        app_service.ReadinessAction(
+            app_service.ReadinessActionKind.REPAIR_TRAINER,
+            "Repair trainer",
+        ),
+        code="trainer",
+    )
+
+    saved = load_settings(settings_path)
+    assert saved.ai_toolkit_dir == toolkit
+    assert saved.ai_toolkit_python == expected_python
+    assert window.pages.currentIndex() == NAV_RUN
+    assert window.run_stack.currentIndex() == 0
+    assert window._readiness_request > request_before
     qtbot.waitUntil(lambda: not window._workers, timeout=10_000)
 
 
@@ -2332,7 +3075,7 @@ def test_workflow_retry_rediscovers_dynamic_port_and_reports_exact_match(
                 host="127.0.0.1:8299",
                 installation_name="Portrait Desktop",
                 pid=5678,
-                timestamp=2,
+                timestamp=9_999_999_999_999,
             ),
         ),
     )

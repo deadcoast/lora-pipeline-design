@@ -12,8 +12,13 @@ from urllib.parse import unquote, urlsplit
 from urllib.request import Request
 
 import pytest
+import websocket
 
-from src.comfy_client import ComfyClient, ComfyUserProfile
+from src.comfy_client import (
+    ComfyClient,
+    ComfyUserProfile,
+    PromptCancellationResult,
+)
 
 
 class _FakeResponse:
@@ -551,6 +556,25 @@ def test_cancel_does_nothing_when_prompt_has_left_the_queue(
     assert writes == []
 
 
+@pytest.mark.parametrize(
+    "queue",
+    [
+        {},
+        {"queue_running": []},
+        {"queue_pending": []},
+    ],
+)
+def test_cancel_rejects_incomplete_queue_schema(
+    monkeypatch: pytest.MonkeyPatch,
+    queue: dict[str, Any],
+) -> None:
+    client = ComfyClient()
+    monkeypatch.setattr(client, "_http_json", lambda _path: queue)
+
+    with pytest.raises(TypeError, match="incomplete queue response"):
+        client.cancel_owned_prompt("unknown")
+
+
 def test_cancel_rejects_an_explicit_empty_worker_client_id() -> None:
     client = ComfyClient()
 
@@ -559,8 +583,11 @@ def test_cancel_rejects_an_explicit_empty_worker_client_id() -> None:
 
 
 def test_run_prints_owned_prompt_marker(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    monkeypatch.setenv("MIVIM_RUN_GUARD_DIR", str(tmp_path / "guard"))
     client = ComfyClient(host="127.0.0.1:8188")
     prompt_id = "prompt-123"
     monkeypatch.setattr(client, "queue_prompt", lambda _graph: prompt_id)
@@ -588,3 +615,92 @@ def test_run_prints_owned_prompt_marker(
         f"prompt_id={prompt_id} client_id={client.client_id} "
         "host=127.0.0.1:8188"
     )
+
+
+def test_run_timeout_requests_owned_cancel_and_leaves_recovery_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = tmp_path / "guard"
+    monkeypatch.setenv("MIVIM_RUN_GUARD_DIR", str(guard))
+    client = ComfyClient(host="127.0.0.1:8188")
+    prompt_id = "prompt-timeout"
+    monkeypatch.setattr(client, "queue_prompt", lambda _graph: prompt_id)
+    cancellations: list[str] = []
+
+    def cancel(owned_prompt: str) -> PromptCancellationResult:
+        cancellations.append(owned_prompt)
+        return PromptCancellationResult(
+            status="running_interrupt_requested",
+            prompt_id=owned_prompt,
+            client_id=client.client_id,
+            message="Interrupt requested.",
+        )
+
+    monkeypatch.setattr(client, "cancel_owned_prompt", cancel)
+
+    class TimeoutWebSocket:
+        def connect(self, _url: str, timeout: float) -> None:
+            assert timeout == client.timeout
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def recv(self) -> str:
+            raise websocket.WebSocketTimeoutException("timed out")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("src.comfy_client.websocket.WebSocket", TimeoutWebSocket)
+
+    with pytest.raises(TimeoutError, match="Timed out"):
+        client.run({})
+
+    assert cancellations == [prompt_id]
+    markers = tuple((guard / "comfy-prompts").glob("prompt-*.json"))
+    assert len(markers) == 1
+    record = json.loads(markers[0].read_text(encoding="utf-8"))
+    assert record["prompt_id"] == prompt_id
+    assert record["client_id"] == client.client_id
+
+
+def test_run_failure_clears_marker_when_prompt_already_left_queue(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    guard = tmp_path / "guard"
+    monkeypatch.setenv("MIVIM_RUN_GUARD_DIR", str(guard))
+    client = ComfyClient(host="127.0.0.1:8188")
+    prompt_id = "prompt-finished"
+    monkeypatch.setattr(client, "queue_prompt", lambda _graph: prompt_id)
+    monkeypatch.setattr(
+        client,
+        "cancel_owned_prompt",
+        lambda owned_prompt: PromptCancellationResult(
+            status="not_found",
+            prompt_id=owned_prompt,
+            client_id=client.client_id,
+            message="Already finished.",
+        ),
+    )
+
+    class BrokenWebSocket:
+        def connect(self, _url: str, timeout: float) -> None:
+            assert timeout == client.timeout
+
+        def settimeout(self, _timeout: float) -> None:
+            pass
+
+        def recv(self) -> str:
+            raise websocket.WebSocketConnectionClosedException("disconnected")
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("src.comfy_client.websocket.WebSocket", BrokenWebSocket)
+
+    with pytest.raises(RuntimeError, match="disconnected"):
+        client.run({})
+
+    assert tuple((guard / "comfy-prompts").glob("prompt-*.json")) == ()

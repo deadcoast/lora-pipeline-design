@@ -27,13 +27,15 @@ import os
 import tempfile
 from collections.abc import Iterator, Sequence
 from pathlib import Path
-from typing import TypedDict
+from typing import TypedDict, cast
 
 from PIL import Image, ImageOps
 
 from . import config
 from .caption import BLIP_MODEL_ID, BLIP_MODEL_REVISION, make_caption
+from .comfy_activity import check_orphaned_comfy_prompts
 from .io_utils import atomic_write_bytes, atomic_write_text
+from .run_guardian import active_run_guard_covers, pipeline_run_guard
 
 VALID_EXT = {
     ".jpg",
@@ -47,6 +49,7 @@ VALID_EXT = {
     ".heif",
 }
 MANIFEST_NAME = ".source-manifest.json"
+MANIFEST_SCHEMA_VERSION = 3
 
 
 class _Report(TypedDict):
@@ -57,6 +60,14 @@ class _Report(TypedDict):
     widths: list[int]
     heights: list[int]
     caption_lengths: list[int]
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _iter_images(src: Path) -> Iterator[Path]:
@@ -74,11 +85,7 @@ def _deduplicate_images(
     duplicates: list[tuple[Path, Path]] = []
     digests: dict[str, Path] = {}
     for image in images:
-        digest = hashlib.sha256()
-        with image.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        fingerprint = digest.hexdigest()
+        fingerprint = _sha256_file(image)
         original = digests.get(fingerprint)
         if original is None:
             digests[fingerprint] = image
@@ -111,6 +118,16 @@ def _commit_staged_dataset(staging: Path, out: Path) -> None:
     os.replace(staging / MANIFEST_NAME, out / MANIFEST_NAME)
 
 
+def captioner_identity(caption_mode: str) -> str:
+    """Return the exact caption implementation identity recorded for reuse."""
+
+    if caption_mode == "blip":
+        return f"{BLIP_MODEL_ID}@{BLIP_MODEL_REVISION}"
+    if caption_mode == "template":
+        return "template-v1"
+    raise ValueError(f"Unsupported caption mode: {caption_mode}")
+
+
 def _source_manifest(
     src: Path,
     images: list[Path],
@@ -122,11 +139,7 @@ def _source_manifest(
     sources: list[dict[str, int | str]] = []
     digests: dict[str, Path] = {}
     for image in images:
-        digest = hashlib.sha256()
-        with image.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        sha256 = digest.hexdigest()
+        sha256 = _sha256_file(image)
         if sha256 in digests:
             raise ValueError(
                 f"Duplicate source images have identical content: "
@@ -142,21 +155,146 @@ def _source_manifest(
             }
         )
 
-    captioner = (
-        f"{BLIP_MODEL_ID}@{BLIP_MODEL_REVISION}"
-        if caption_mode == "blip"
-        else "template-v1"
-    )
     return {
-        "schema_version": 2,
+        "schema_version": MANIFEST_SCHEMA_VERSION,
         "settings": {
             "size": size,
             "trigger": trigger,
             "caption_mode": caption_mode,
-            "captioner": captioner,
+            "captioner": captioner_identity(caption_mode),
         },
         "sources": sources,
     }
+
+
+def _prepared_output_manifest(folder: Path) -> list[dict[str, str]]:
+    return [
+        {"image": path.name, "sha256": _sha256_file(path)}
+        for path in sorted(folder.iterdir())
+        if path.is_file() and path.stem.isdigit() and path.suffix == ".png"
+    ]
+
+
+def prepared_output_manifest_issue(folder: Path, manifest: object) -> str | None:
+    """Describe the first generated-image integrity problem, if any."""
+
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or not isinstance(manifest.get("outputs"), list)
+        or not folder.is_dir()
+    ):
+        return "The preparation record has no valid prepared-image inventory."
+
+    expected: dict[str, str] = {}
+    for entry in cast(list[object], manifest["outputs"]):
+        if not isinstance(entry, dict):
+            return "The preparation record has a damaged prepared-image entry."
+        name = entry.get("image")
+        sha256 = entry.get("sha256")
+        if (
+            not isinstance(name, str)
+            or Path(name).name != name
+            or not Path(name).stem.isdigit()
+            or Path(name).suffix != ".png"
+            or name in expected
+            or not isinstance(sha256, str)
+            or len(sha256) != 64
+            or any(character not in "0123456789abcdef" for character in sha256)
+        ):
+            return "The preparation record has a damaged prepared-image entry."
+        expected[name] = sha256
+    if not expected:
+        return "The preparation record does not list any prepared images."
+
+    try:
+        actual = {
+            path.name: path
+            for path in folder.iterdir()
+            if path.is_file() and path.stem.isdigit() and path.suffix == ".png"
+        }
+        missing = sorted(expected.keys() - actual.keys())
+        if missing:
+            return f"The prepared image {missing[0]} is missing."
+        unexpected = sorted(actual.keys() - expected.keys())
+        if unexpected:
+            return (
+                f"The prepared image {unexpected[0]} was not created by this "
+                "preparation run."
+            )
+        for name, path in actual.items():
+            if _sha256_file(path) != expected[name]:
+                return f"The prepared image {name} changed after preparation."
+    except OSError as exc:
+        return f"The prepared images could not be verified: {exc}"
+    return None
+
+
+def prepared_outputs_match_manifest(folder: Path, manifest: object) -> bool:
+    """Return whether generated images still match their preparation record.
+
+    Captions are deliberately excluded because the desktop exposes them for user
+    editing. Their presence, readability, and identity phrase are checked by the
+    dataset-pair review before reuse.
+    """
+
+    return prepared_output_manifest_issue(folder, manifest) is None
+
+
+def source_files_match_manifest(src: Path, manifest: object) -> bool:
+    """Return whether the current unique source set exactly matches a manifest.
+
+    The desktop uses this before reusing already-prepared pairs.  Rebuilding the
+    source entries through the same path as preparation catches added/removed
+    unique content and changes even when a file's size and timestamp were
+    preserved.  Paths, renames, and exact duplicate files do not matter because
+    they cannot change the already-prepared training pairs.
+    """
+
+    if (
+        not isinstance(manifest, dict)
+        or manifest.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        or not isinstance(manifest.get("sources"), list)
+        or not isinstance(manifest.get("settings"), dict)
+        or not src.is_dir()
+    ):
+        return False
+    settings = manifest["settings"]
+    size = settings.get("size")
+    trigger = settings.get("trigger")
+    caption_mode = settings.get("caption_mode")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or not isinstance(trigger, str)
+        or not trigger.strip()
+        or caption_mode not in {"template", "blip"}
+    ):
+        return False
+
+    try:
+        candidates = list(_iter_images(src))
+        images, _duplicates = _deduplicate_images(candidates)
+        current = _source_manifest(
+            src,
+            images,
+            size=size,
+            trigger=trigger.strip(),
+            caption_mode=caption_mode,
+        )
+    except (OSError, ValueError):
+        return False
+    previous_sources = cast(list[object], manifest["sources"])
+    current_sources = cast(list[object], current["sources"])
+    if not all(
+        isinstance(entry, dict) and isinstance(entry.get("sha256"), str)
+        for entry in previous_sources
+    ):
+        return False
+    return {
+        entry["sha256"] for entry in current_sources if isinstance(entry, dict)
+    } == {entry["sha256"] for entry in previous_sources if isinstance(entry, dict)}
 
 
 def _validate_source_manifest(
@@ -175,9 +313,10 @@ def _validate_source_manifest(
             raise ValueError(
                 f"Dataset source manifest is invalid; use --overwrite: {exc}"
             ) from exc
-        if previous == current:
-            return
-        if not isinstance(previous, dict) or previous.get("schema_version") != 2:
+        if (
+            not isinstance(previous, dict)
+            or previous.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        ):
             raise ValueError(
                 "Dataset source manifest uses an older format; use --overwrite "
                 "to rebuild it safely."
@@ -187,10 +326,17 @@ def _validate_source_manifest(
                 "Source images changed since this dataset was prepared; "
                 "use --overwrite to rebuild it safely."
             )
-        raise ValueError(
-            "Dataset preparation settings changed since this dataset was prepared; "
-            "use --overwrite to rebuild it with the new settings."
-        )
+        if previous.get("settings") != current["settings"]:
+            raise ValueError(
+                "Dataset preparation settings changed since this dataset was "
+                "prepared; use --overwrite to rebuild it with the new settings."
+            )
+        if not prepared_outputs_match_manifest(out, previous):
+            raise ValueError(
+                "Prepared images changed since this dataset was created; use "
+                "--overwrite to rebuild and verify them safely."
+            )
+        return
     has_generated_pairs = any(
         path.is_file() and path.stem.isdigit() and path.suffix in {".png", ".txt"}
         for path in out.iterdir()
@@ -296,6 +442,53 @@ def prepare(
     overwrite: bool = False,
 ) -> Path:
     name = config.validate_project_name(name)
+    output = (config.DATASETS_DIR / name).resolve()
+    workspace = config.RUN_CONFIGS_DIR.resolve().parent
+    resources = (output,)
+    if not active_run_guard_covers(
+        project=name,
+        workspace=workspace,
+        use_accelerator=caption_mode == "blip",
+        resource_paths=resources,
+    ):
+        with pipeline_run_guard(
+            project=name,
+            workspace=workspace,
+            mode="prepare",
+            use_accelerator=caption_mode == "blip",
+            resource_paths=resources,
+        ):
+            if caption_mode == "blip":
+                check_orphaned_comfy_prompts()
+            return _prepare_with_guard(
+                src=src,
+                name=name,
+                size=size,
+                trigger=trigger,
+                caption_mode=caption_mode,
+                overwrite=overwrite,
+            )
+    if caption_mode == "blip":
+        check_orphaned_comfy_prompts()
+    return _prepare_with_guard(
+        src=src,
+        name=name,
+        size=size,
+        trigger=trigger,
+        caption_mode=caption_mode,
+        overwrite=overwrite,
+    )
+
+
+def _prepare_with_guard(
+    src: Path,
+    name: str,
+    size: int = 1024,
+    trigger: str = config.DEFAULT_TRIGGER,
+    caption_mode: str = "template",
+    overwrite: bool = False,
+) -> Path:
+    name = config.validate_project_name(name)
     if not src.is_dir():
         raise FileNotFoundError(f"Source image directory not found: {src}")
     if size <= 0:
@@ -357,6 +550,7 @@ def prepare(
         _print_report(name, out, report, trigger)
         if report["ok"] + report["skipped"] == 0:
             raise RuntimeError(f"Dataset preparation produced no usable pairs in {out}")
+        manifest["outputs"] = _prepared_output_manifest(target)
         atomic_write_text(
             target / MANIFEST_NAME,
             json.dumps(manifest, indent=2) + "\n",
@@ -419,14 +613,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = ap.parse_args(argv)
 
     try:
-        prepare(
-            src=Path(args.src),
-            name=args.name,
-            size=args.size,
-            trigger=args.trigger,
-            caption_mode="blip" if args.vision else "template",
-            overwrite=args.overwrite,
-        )
+        project = config.validate_project_name(args.name)
+        workspace = config.RUN_CONFIGS_DIR.resolve().parent
+        with pipeline_run_guard(
+            project=project,
+            workspace=workspace,
+            mode="prepare",
+            use_accelerator=args.vision,
+            project_scopes=(config.DATASETS_DIR.resolve().parent,),
+            resource_paths=((config.DATASETS_DIR / project).resolve(),),
+        ):
+            if args.vision:
+                check_orphaned_comfy_prompts()
+            prepare(
+                src=Path(args.src),
+                name=project,
+                size=args.size,
+                trigger=args.trigger,
+                caption_mode="blip" if args.vision else "template",
+                overwrite=args.overwrite,
+            )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:
         ap.error(str(exc))
 

@@ -11,8 +11,11 @@ Modules:
     config           - loads .env and resolves paths
     prepare_dataset  - resize/convert/auto-orient images + write captions
     caption          - caption helpers (template trigger-token, optional BLIP)
+    comfy_activity   - durable ownership of submitted ComfyUI prompts
     comfy_client     - minimal ComfyUI REST/WebSocket API client
     io_utils         - atomic filesystem writes and copies
+    process_control  - Studio/worker/trainer crash-lifetime ownership
+    run_guardian     - cross-process project/resource/accelerator leases
     validate         - generate a validation grid from a trained LoRA
     train            - thin wrapper around ai-toolkit's run.py
     pipeline         - prep -> train -> validate, one command
@@ -20,7 +23,7 @@ Modules:
 
 from typing import TYPE_CHECKING
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 if TYPE_CHECKING:
     from . import (
@@ -28,6 +31,7 @@ if TYPE_CHECKING:
         app_service,
         app_settings,
         caption,
+        comfy_activity,
         comfy_client,
         comfy_desktop,
         config,
@@ -37,6 +41,8 @@ if TYPE_CHECKING:
         photo_review,
         pipeline,
         prepare_dataset,
+        process_control,
+        run_guardian,
         train,
         validate,
     )
@@ -47,6 +53,7 @@ __all__ = [
     "app_service",
     "app_settings",
     "caption",
+    "comfy_activity",
     "comfy_client",
     "comfy_desktop",
     "config",
@@ -56,6 +63,8 @@ __all__ = [
     "photo_review",
     "pipeline",
     "prepare_dataset",
+    "process_control",
+    "run_guardian",
     "train",
     "validate",
 ]

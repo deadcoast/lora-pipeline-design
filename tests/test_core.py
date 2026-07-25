@@ -311,6 +311,21 @@ def test_trainer_pair_validation_uses_the_same_exact_file_contract(
         assert filename in message
 
 
+def test_trainer_rejects_valid_image_bytes_replaced_after_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    Image.new("RGB", (80, 40), "white").save(source / "photo.png")
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    prepared = prepare_dataset.prepare(source, "reviewed_v1", size=32)
+    Image.new("RGB", (32, 16), "black").save(prepared / "001.png")
+
+    with pytest.raises(ValueError, match="changed after preparation"):
+        train_module._validate_dataset_pairs(prepared)
+
+
 def test_blip_loader_pins_the_model_revision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -428,6 +443,50 @@ def test_prepare_ignores_exact_duplicate_sources_without_changing_originals(
     assert len(list(prepared.glob("*.png"))) == 1
     assert len(list(prepared.glob("*.txt"))) == 1
     assert {path.name: path.read_bytes() for path in source.iterdir()} == before
+
+
+def test_prepared_manifest_reuse_requires_the_complete_unchanged_source_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    first = source / "first.bmp"
+    Image.new("RGB", (80, 40), "white").save(first)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+
+    prepared = prepare_dataset.prepare(source, "subject_v1", size=32)
+    manifest = json.loads(
+        (prepared / prepare_dataset.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert prepare_dataset.source_files_match_manifest(source, manifest)
+
+    duplicate = source / "duplicate.bmp"
+    duplicate.write_bytes(first.read_bytes())
+    assert prepare_dataset.source_files_match_manifest(source, manifest)
+
+    Image.new("RGB", (80, 40), "blue").save(source / "new.bmp")
+    assert not prepare_dataset.source_files_match_manifest(source, manifest)
+
+
+def test_prepared_manifest_reuse_hashes_content_even_when_metadata_is_preserved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    photo = source / "photo.bmp"
+    Image.new("RGB", (80, 40), "white").save(photo)
+    original_stat = photo.stat()
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+
+    prepared = prepare_dataset.prepare(source, "subject_v1", size=32)
+    manifest = json.loads(
+        (prepared / prepare_dataset.MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    Image.new("RGB", (80, 40), "black").save(photo)
+    assert photo.stat().st_size == original_stat.st_size
+    os.utime(photo, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+
+    assert not prepare_dataset.source_files_match_manifest(source, manifest)
 
 
 def test_failed_overwrite_preserves_the_previous_dataset(

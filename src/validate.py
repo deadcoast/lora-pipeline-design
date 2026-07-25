@@ -30,8 +30,10 @@ from typing import Any, cast
 from PIL import Image, ImageDraw, ImageFont, PngImagePlugin
 
 from . import config
+from .comfy_activity import check_orphaned_comfy_prompts
 from .comfy_client import ComfyClient
 from .io_utils import atomic_write_bytes, atomic_write_text
+from .run_guardian import active_run_guard_covers, pipeline_run_guard
 
 WORKFLOW = config.ROOT / "workflows" / "validate_sdxl_api.json"
 VALIDATION_MANIFEST_SCHEMA_VERSION = 2
@@ -852,6 +854,62 @@ def validate(
     checkpoint_content_identity: str | None = None,
 ) -> Path:
     run_name = config.validate_project_name(run_name)
+    workspace = config.RUN_CONFIGS_DIR.resolve().parent
+    resources = {config.GRIDS_DIR.resolve()}
+    if config.COMFY_LORA_DIR is not None:
+        resources.add(config.COMFY_LORA_DIR.resolve())
+    if not active_run_guard_covers(
+        project=run_name,
+        workspace=workspace,
+        use_accelerator=True,
+        resource_paths=resources,
+    ):
+        with pipeline_run_guard(
+            project=run_name,
+            workspace=workspace,
+            mode="validate",
+            use_accelerator=True,
+            resource_paths=resources,
+        ):
+            check_orphaned_comfy_prompts()
+            return _validate_with_guard(
+                lora=lora,
+                strengths=strengths,
+                prompts=prompts,
+                trigger=trigger,
+                seed=seed,
+                run_name=run_name,
+                workflow_path=workflow_path,
+                lora_content_identity=lora_content_identity,
+                checkpoint_content_identity=checkpoint_content_identity,
+            )
+    check_orphaned_comfy_prompts()
+    return _validate_with_guard(
+        lora=lora,
+        strengths=strengths,
+        prompts=prompts,
+        trigger=trigger,
+        seed=seed,
+        run_name=run_name,
+        workflow_path=workflow_path,
+        lora_content_identity=lora_content_identity,
+        checkpoint_content_identity=checkpoint_content_identity,
+    )
+
+
+def _validate_with_guard(
+    lora: str,
+    strengths: Sequence[float],
+    prompts: Sequence[str],
+    trigger: str,
+    seed: int,
+    run_name: str,
+    workflow_path: Path = WORKFLOW,
+    *,
+    lora_content_identity: str | None = None,
+    checkpoint_content_identity: str | None = None,
+) -> Path:
+    run_name = config.validate_project_name(run_name)
     lora = _validated_model_reference(lora, "LoRA")
     _validated_model_reference(config.COMFY_SDXL_CKPT, "Checkpoint")
     strengths = list(strengths)
@@ -1141,15 +1199,37 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     run_name = args.name or Path(args.lora).stem
     try:
-        validate(
-            lora=args.lora,
-            strengths=args.strengths,
-            prompts=DEFAULT_PROMPTS,
-            trigger=args.trigger,
-            seed=args.seed,
-            run_name=run_name,
-        )
-    except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
+        run_name = config.validate_project_name(run_name)
+        workspace = config.RUN_CONFIGS_DIR.resolve().parent
+        project_scopes = [config.GRIDS_DIR.resolve().parent]
+        resources = {config.GRIDS_DIR.resolve()}
+        if config.COMFY_LORA_DIR is not None:
+            project_scopes.append(config.COMFY_LORA_DIR.resolve().parent)
+            resources.add(config.COMFY_LORA_DIR.resolve())
+        with pipeline_run_guard(
+            project=run_name,
+            workspace=workspace,
+            mode="validate",
+            use_accelerator=True,
+            project_scopes=project_scopes,
+            resource_paths=resources,
+        ):
+            check_orphaned_comfy_prompts()
+            validate(
+                lora=args.lora,
+                strengths=args.strengths,
+                prompts=DEFAULT_PROMPTS,
+                trigger=args.trigger,
+                seed=args.seed,
+                run_name=run_name,
+            )
+    except (
+        FileNotFoundError,
+        RuntimeError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as exc:
         ap.error(str(exc))
 
 

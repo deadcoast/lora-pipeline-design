@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -32,6 +33,7 @@ from urllib.error import HTTPError, URLError
 import websocket  # from the websocket-client package
 
 from . import config
+from .comfy_activity import reserve_comfy_prompt
 from .io_utils import atomic_write_bytes
 
 CancellationStatus = Literal[
@@ -537,8 +539,10 @@ class ComfyClient:
             raise ValueError("client_id cannot be empty")
 
         queue = self._http_json("/queue")
-        running = queue.get("queue_running", [])
-        pending = queue.get("queue_pending", [])
+        if "queue_running" not in queue or "queue_pending" not in queue:
+            raise TypeError("ComfyUI returned an incomplete queue response.")
+        running = queue.get("queue_running")
+        pending = queue.get("queue_pending")
         if not isinstance(running, list) or not isinstance(pending, list):
             raise TypeError("ComfyUI returned an invalid queue response.")
 
@@ -651,7 +655,14 @@ class ComfyClient:
                 f"Could not connect to the ComfyUI WebSocket at {self.host}: {exc}"
             ) from exc
         try:
+            reservation = reserve_comfy_prompt(self.host, self.client_id)
+        except BaseException:
+            ws.close()
+            raise
+        prompt_id: str | None = None
+        try:
             prompt_id = self.queue_prompt(graph)
+            reservation.attach_prompt(prompt_id)
             print(
                 "[comfy] owned prompt queued "
                 f"prompt_id={prompt_id} client_id={self.client_id} host={self.host}",
@@ -688,10 +699,12 @@ class ComfyClient:
                     if not isinstance(d, dict):
                         continue
                     if d.get("node") is None and d.get("prompt_id") == prompt_id:
+                        reservation.clear()
                         return prompt_id  # this prompt is done
                 elif m.get("type") == "execution_success":
                     data = m.get("data")
                     if isinstance(data, dict) and data.get("prompt_id") == prompt_id:
+                        reservation.clear()
                         return prompt_id
                 elif m.get("type") in {"execution_error", "execution_interrupted"}:
                     data = m.get("data", {})
@@ -701,6 +714,28 @@ class ComfyClient:
                     if event_prompt in (None, prompt_id):
                         raise RuntimeError(f"ComfyUI {m.get('type')}: {data}")
             raise TimeoutError("Timed out waiting for ComfyUI to finish the prompt.")
+        except BaseException:
+            if prompt_id is not None:
+                try:
+                    cancellation = self.cancel_owned_prompt(prompt_id)
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    print(
+                        "[comfy] Could not confirm prompt cleanup; MIVIM will "
+                        f"recheck ComfyUI before the next GPU run: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[comfy] {cancellation.message}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    if cancellation.status == "not_found":
+                        reservation.clear()
+            # If submission failed after ComfyUI accepted the request, the
+            # reservation still carries client_id and lets the next run find it.
+            raise
         finally:
             ws.close()
 

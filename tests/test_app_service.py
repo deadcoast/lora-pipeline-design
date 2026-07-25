@@ -213,8 +213,64 @@ def test_readiness_keeps_photo_preparation_available_when_comfy_is_offline(
 
     assert report.can_prepare
     assert not report.can_run_full
-    assert next(item for item in report.items if item.code == "comfy").state == "error"
+    comfy_item = next(item for item in report.items if item.code == "comfy")
+    assert comfy_item.state == "error"
+    assert comfy_item.action is not None
+    assert comfy_item.action.kind is app_service.ReadinessActionKind.OPEN_COMFY_DESKTOP
+    assert comfy_item.action.label == "Open the Comfy Desktop install guide"
     assert not list(loras.glob(".mivim-write-check-*"))
+
+
+def test_readiness_guides_first_desktop_instance_instead_of_reinstall(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 15)
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(
+            False,
+            None,
+            (),
+            (),
+            "not running",
+        ),
+    )
+    discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path / "Comfy Desktop",
+        legacy_config_dir=None,
+        installations=(),
+        selected_installation=None,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=(),
+        launcher=ComfyLauncher(
+            "Comfy Desktop",
+            "test",
+            "",
+            (),
+            True,
+        ),
+        warnings=(),
+    )
+
+    report = ApplicationService(root=tmp_path).readiness(
+        AppSettings(),
+        ProjectDraft(
+            project_name="first_instance_v1",
+            source_dir=photos,
+            preset=TrainingPreset.BALANCED,
+        ),
+        discovery,
+    )
+
+    comfy_item = next(item for item in report.items if item.code == "comfy")
+    assert "no local ComfyUI instance" in comfy_item.detail
+    assert comfy_item.action is not None
+    assert comfy_item.action.label == "Open Comfy Desktop to create an instance"
 
 
 def test_readiness_allows_full_run_only_after_live_model_verification(
@@ -250,6 +306,10 @@ def test_readiness_allows_full_run_only_after_live_model_verification(
     base_model = tmp_path / "models" / "checkpoints" / "sdxl.safetensors"
     base_model.parent.mkdir(parents=True, exist_ok=True)
     base_model.write_bytes(b"checkpoint")
+    shadowed_dir = tmp_path / "older-models" / "checkpoints"
+    shadowed_dir.mkdir(parents=True)
+    shadowed_model = shadowed_dir / base_model.name
+    shadowed_model.write_bytes(b"different checkpoint with the same name")
     settings = AppSettings(
         comfy_lora_dir=loras,
         comfy_checkpoint="sdxl.safetensors",
@@ -282,6 +342,8 @@ def test_readiness_allows_full_run_only_after_live_model_verification(
         host_candidates=("127.0.0.1:8188",),
         launcher=ComfyLauncher("", "", "", (), False),
         warnings=(),
+        checkpoint_dirs=(base_model.parent, shadowed_dir),
+        lora_dirs=(loras,),
     )
 
     report = ApplicationService(root=tmp_path).readiness(
@@ -293,7 +355,9 @@ def test_readiness_allows_full_run_only_after_live_model_verification(
     assert not report.can_run_full
     unconfirmed = next(item for item in report.items if item.code == "checkpoint")
     assert unconfirmed.state == "error"
-    assert unconfirmed.action == "Confirm this is an SDXL base checkpoint"
+    assert unconfirmed.action is not None
+    assert unconfirmed.action.kind is app_service.ReadinessActionKind.CONFIRM_CHECKPOINT
+    assert unconfirmed.action.label == "Confirm this is an SDXL base checkpoint"
 
     settings.confirmed_sdxl_checkpoint = settings.comfy_checkpoint
     report = ApplicationService(root=tmp_path).readiness(
@@ -305,6 +369,10 @@ def test_readiness_allows_full_run_only_after_live_model_verification(
     assert report.can_prepare
     assert report.can_run_full
     assert all(item.state != "error" for item in report.items)
+    model_binding = next(item for item in report.items if item.code == "base_model")
+    assert model_binding.state == "warning"
+    assert str(base_model) in model_binding.detail
+    assert "lower-priority same-named model" in model_binding.detail
 
 
 def test_desktop_command_uses_real_pipeline_entrypoint_and_preset(
@@ -571,6 +639,86 @@ def test_discovered_comfy_checkpoint_becomes_the_training_base(
     assert resolved == expected
 
 
+def test_setup_binds_duplicate_checkpoint_name_to_comfyuis_first_match(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preferred = tmp_path / "preferred"
+    shadowed = tmp_path / "shadowed"
+    for directory, content in ((preferred, b"preferred"), (shadowed, b"shadowed")):
+        directory.mkdir()
+        (directory / "portraitXL.safetensors").write_bytes(content)
+    discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=(),
+        selected_installation=None,
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=("127.0.0.1:8188",),
+        launcher=ComfyLauncher("", "", "", (), False),
+        warnings=(),
+        checkpoint_dirs=(preferred, shadowed),
+    )
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(
+            True,
+            "127.0.0.1:8188",
+            ("portraitXL.safetensors",),
+            (),
+            None,
+        ),
+    )
+
+    applied, _context, _status = ApplicationService(root=tmp_path).setup_snapshot(
+        AppSettings(
+            comfy_checkpoint="portraitXL.safetensors",
+            training_base_model=shadowed / "portraitXL.safetensors",
+        ),
+        discovery,
+    )
+
+    assert applied.training_base_model == preferred / "portraitXL.safetensors"
+
+
+def test_stale_checkpoint_with_empty_live_inventory_opens_comfyui(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(
+            True,
+            "127.0.0.1:8188",
+            (),
+            (),
+            None,
+        ),
+    )
+
+    report = ApplicationService(root=tmp_path).readiness(
+        AppSettings(
+            comfy_host="127.0.0.1:8188",
+            comfy_checkpoint="removed.safetensors",
+        ),
+        ProjectDraft(
+            project_name="empty_inventory_v1",
+            source_dir=tmp_path / "photos",
+        ),
+    )
+    checkpoint = next(item for item in report.items if item.code == "checkpoint")
+
+    assert checkpoint.state == "error"
+    assert checkpoint.action is not None
+    assert checkpoint.action.kind is app_service.ReadinessActionKind.OPEN_COMFYUI
+    assert checkpoint.action.label == "Open ComfyUI to add an SDXL model"
+    assert "does not report any checkpoints" in checkpoint.detail
+
+
 def test_desktop_command_passes_local_comfy_model_to_trainer(tmp_path: Path) -> None:
     photos = tmp_path / "photos"
     _write_images(photos, 1)
@@ -693,6 +841,134 @@ def test_prepared_dataset_is_reused_without_reprocessing_or_source_folder(
     )
     assert "--skip-prep" in command.arguments
     assert "--src" not in command.arguments
+
+
+def test_prepared_dataset_reuse_rejects_a_new_unique_source_photo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 2, size=1024)
+    datasets = tmp_path / "datasets"
+    monkeypatch.setattr(config, "DATASETS_DIR", datasets)
+    prepared = prepare_dataset.prepare(
+        photos,
+        "changed_sources_v1",
+        trigger="mivim person",
+    )
+    Image.new("RGB", (1024, 1024), "purple").save(photos / "new-photo.png")
+    draft = ProjectDraft(
+        project_name="changed_sources_v1",
+        source_dir=photos,
+        trigger="mivim person",
+    )
+
+    summary = app_service.inspect_prepared_dataset(prepared, draft)
+
+    assert not summary.ready
+    assert summary.manifest_error is not None
+    assert "source photo set changed" in summary.manifest_error.casefold()
+
+
+@pytest.mark.parametrize(
+    ("prepared_mode", "use_vision_captions"),
+    (("template", True), ("blip", False)),
+)
+def test_prepared_dataset_reuse_rejects_caption_mode_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prepared_mode: str,
+    use_vision_captions: bool,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 2, size=1024)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    monkeypatch.setattr(
+        prepare_dataset,
+        "make_caption",
+        lambda *_args, **_kwargs: "mivim person, portrait\n",
+    )
+    prepared = prepare_dataset.prepare(
+        photos,
+        f"caption_mode_{prepared_mode}",
+        trigger="mivim person",
+        caption_mode=prepared_mode,
+    )
+
+    summary = app_service.inspect_prepared_dataset(
+        prepared,
+        ProjectDraft(
+            project_name=f"caption_mode_{prepared_mode}",
+            source_dir=photos,
+            trigger="mivim person",
+            use_vision_captions=use_vision_captions,
+        ),
+    )
+
+    assert not summary.ready
+    assert summary.manifest_error is not None
+    assert "photo-description method changed" in summary.manifest_error
+
+
+def test_prepared_dataset_allows_caption_edits_but_rejects_image_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 2, size=1024)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    prepared = prepare_dataset.prepare(
+        photos,
+        "output_attestation_v1",
+        trigger="mivim person",
+    )
+    draft = ProjectDraft(
+        project_name="output_attestation_v1",
+        source_dir=photos,
+        trigger="mivim person",
+    )
+    (prepared / "001.txt").write_text(
+        "mivim person, edited by the user\n",
+        encoding="utf-8",
+    )
+
+    assert app_service.inspect_prepared_dataset(prepared, draft).ready
+
+    Image.new("RGB", (1024, 924), "black").save(prepared / "001.png")
+    changed = app_service.inspect_prepared_dataset(prepared, draft)
+
+    assert not changed.ready
+    assert changed.manifest_error is not None
+    assert "001.png changed after preparation" in changed.manifest_error
+
+
+def test_prepared_dataset_rejects_a_deleted_complete_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 2, size=1024)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    prepared = prepare_dataset.prepare(
+        photos,
+        "deleted_pair_v1",
+        trigger="mivim person",
+    )
+    (prepared / "001.png").unlink()
+    (prepared / "001.txt").unlink()
+
+    summary = app_service.inspect_prepared_dataset(
+        prepared,
+        ProjectDraft(
+            project_name="deleted_pair_v1",
+            source_dir=photos,
+            trigger="mivim person",
+        ),
+    )
+
+    assert not summary.ready
+    assert summary.manifest_error is not None
+    assert "001.png is missing" in summary.manifest_error
 
 
 def test_prepare_result_record_is_resume_metadata_not_an_output_collision(
@@ -955,7 +1231,9 @@ def test_prepared_dataset_names_every_structural_pair_problem(
     for filename in ("001.jpg", "001.png", "orphan.webp", "notes.txt", "animated.gif"):
         assert filename in summary.problem_detail
         assert filename in collision.detail
-    assert collision.action == "Review prepared files"
+    assert collision.action is not None
+    assert collision.action.kind is app_service.ReadinessActionKind.REVIEW_PREPARED
+    assert collision.action.label == "Review prepared files"
     assert not report.can_run_full
 
 
@@ -1095,6 +1373,76 @@ def test_setup_preserves_an_unavailable_instance_id_without_substitution(
     assert not status.reachable
 
 
+def test_readiness_never_probes_saved_host_for_duplicate_desktop_names(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installations = tuple(
+        ComfyInstallation(
+            id=installation_id,
+            name="Same Desktop",
+            source_id="standalone",
+            install_path=tmp_path / installation_id,
+            comfyui_path=tmp_path / installation_id / "ComfyUI",
+            version=None,
+            status="installed",
+            last_launched_at=index,
+        )
+        for index, installation_id in enumerate(("a", "b"), start=1)
+    )
+    discovery = ComfyDesktopDiscovery(
+        config_dir=tmp_path,
+        legacy_config_dir=None,
+        installations=installations,
+        selected_installation=installations[0],
+        model_roots=(),
+        input_dir=None,
+        output_dir=None,
+        host_candidates=("127.0.0.1:8201", "127.0.0.1:8202"),
+        launcher=ComfyLauncher("", "", "", (), False),
+        warnings=(),
+        runtime_hints=(
+            ComfyRuntimeHint("127.0.0.1:8201", "Same Desktop", 101, 1000),
+            ComfyRuntimeHint("127.0.0.1:8202", "Same Desktop", 102, 2000),
+        ),
+    )
+    probed: list[tuple[str, ...]] = []
+
+    def probe(hosts, **_kwargs):
+        candidates = tuple(hosts)
+        probed.append(candidates)
+        return ComfyApiStatus(
+            bool(candidates),
+            candidates[0] if candidates else None,
+            (),
+            (),
+            None if candidates else "ambiguous",
+        )
+
+    monkeypatch.setattr(app_service, "probe_comfy_api", probe)
+
+    report = ApplicationService(root=tmp_path).readiness(
+        AppSettings(
+            comfy_installation_id="a",
+            comfy_host="127.0.0.1:8202",
+        ),
+        ProjectDraft(
+            project_name="duplicate_desktop_v1",
+            source_dir=tmp_path / "photos",
+        ),
+        discovery,
+    )
+    connection = next(item for item in report.items if item.code == "connection")
+
+    assert probed == [()]
+    assert not report.comfy_status.reachable
+    assert connection.state == "error"
+    assert "unique name" in connection.detail
+    assert connection.action is not None
+    assert connection.action.kind is app_service.ReadinessActionKind.OPEN_COMFY_DESKTOP
+    assert not report.can_run_full
+
+
 def test_setup_never_borrows_python_from_a_different_selected_toolkit(
     tmp_path: Path,
     monkeypatch,
@@ -1143,6 +1491,7 @@ def test_setup_binds_selected_desktop_runtime_checkpoint_and_lora_root(
         status="installed",
         last_launched_at=1,
         use_shared_models=False,
+        use_shared_input_output=False,
         model_dirs=(model_a,),
     )
     install_b = ComfyInstallation(
@@ -1155,9 +1504,20 @@ def test_setup_binds_selected_desktop_runtime_checkpoint_and_lora_root(
         status="installed",
         last_launched_at=2,
         use_shared_models=False,
+        use_shared_input_output=False,
         model_dirs=(model_b,),
         model_dirs_primary=model_b,
     )
+    generated = tmp_path / "instance-model-paths" / "b.yaml"
+    generated.parent.mkdir(parents=True)
+    generated.write_text(
+        f"private:\n  base_path: {model_b.as_posix()}\n"
+        "  is_default: true\n"
+        "  checkpoints: checkpoints\n"
+        "  loras: loras\n",
+        encoding="utf-8",
+    )
+    future_timestamp = 9_999_999_999_999
     discovery = ComfyDesktopDiscovery(
         config_dir=tmp_path,
         legacy_config_dir=None,
@@ -1170,8 +1530,18 @@ def test_setup_binds_selected_desktop_runtime_checkpoint_and_lora_root(
         launcher=ComfyLauncher("", "", "", (), False),
         warnings=(),
         runtime_hints=(
-            ComfyRuntimeHint("127.0.0.1:8201", "Portrait A", 101, 1000),
-            ComfyRuntimeHint("127.0.0.1:8202", "Portrait B", 102, 2000),
+            ComfyRuntimeHint(
+                "127.0.0.1:8201",
+                "Portrait A",
+                101,
+                future_timestamp,
+            ),
+            ComfyRuntimeHint(
+                "127.0.0.1:8202",
+                "Portrait B",
+                102,
+                future_timestamp,
+            ),
         ),
     )
     probed: list[tuple[str, ...]] = []
@@ -1224,6 +1594,7 @@ def test_setup_rejects_same_named_checkpoint_outside_selected_instance(
         status="installed",
         last_launched_at=1,
         use_shared_models=False,
+        use_shared_input_output=False,
         model_dirs=(model_root,),
     )
     root = ComfyModelRoot(
@@ -1290,6 +1661,7 @@ def test_setup_rebinds_lora_folder_for_one_selected_instance(
         status="installed",
         last_launched_at=1,
         use_shared_models=False,
+        use_shared_input_output=False,
         model_dirs=(model_root,),
     )
     discovery = ComfyDesktopDiscovery(

@@ -53,6 +53,7 @@ _MODEL_FILE_SUFFIXES = frozenset(
     {".bin", ".ckpt", ".pkl", ".pt", ".pt2", ".pth", ".safetensors", ".sft"}
 )
 _PORT_LOCK_NAME = re.compile(r"^port-(\d{1,5})\.json$", re.IGNORECASE)
+_DESKTOP_DATA_LOCATION_FILE = "data-location.json"
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +74,9 @@ class ComfyInstallation:
     model_dirs_primary: Path | None = None
     input_dir: Path | None = None
     output_dir: Path | None = None
+    launch_args: str = ""
+    adopted: bool = False
+    adopted_base_dir: Path | None = None
 
     @property
     def is_local(self) -> bool:
@@ -90,6 +94,43 @@ class ComfyModelRoot:
     checkpoints: Path
     source: str
     exists: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfiguredModelDirectory:
+    """One category-specific model directory from an ordered ComfyUI config."""
+
+    path: Path
+    source: str
+    is_default: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtraModelLayout:
+    """Parsed category paths and compatibility roots from one extra-path file."""
+
+    roots: tuple[ComfyModelRoot, ...]
+    checkpoints: tuple[_ConfiguredModelDirectory, ...]
+    loras: tuple[_ConfiguredModelDirectory, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _EffectiveModelLayout:
+    """Compatibility roots plus ComfyUI-ordered category directories."""
+
+    roots: tuple[ComfyModelRoot, ...]
+    checkpoint_dirs: tuple[Path, ...]
+    lora_dirs: tuple[Path, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _LaunchPathConfiguration:
+    """Path-affecting arguments Comfy Desktop will pass to one installation."""
+
+    models_dir: Path | None
+    input_dir: Path | None
+    output_dir: Path | None
+    extra_model_configs: tuple[Path, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -130,12 +171,21 @@ class ComfyDesktopDiscovery:
     runtime_hints: tuple[ComfyRuntimeHint, ...] = ()
     shared_model_roots: tuple[ComfyModelRoot, ...] = ()
     legacy_model_roots: tuple[ComfyModelRoot, ...] = ()
+    checkpoint_dirs: tuple[Path, ...] = ()
+    lora_dirs: tuple[Path, ...] = ()
+    shared_input_dir: Path | None = None
+    shared_output_dir: Path | None = None
+    desktop_executable: Path | None = None
 
     @property
     def detected(self) -> bool:
         """Return whether either desktop configuration layout was found."""
 
-        return self.config_dir is not None or self.legacy_config_dir is not None
+        return (
+            self.config_dir is not None
+            or self.legacy_config_dir is not None
+            or self.desktop_executable is not None
+        )
 
     @property
     def preferred_model_root(self) -> ComfyModelRoot | None:
@@ -145,6 +195,32 @@ class ComfyDesktopDiscovery:
             (root for root in self.model_roots if root.exists),
             self.model_roots[0] if self.model_roots else None,
         )
+
+    @property
+    def effective_checkpoint_dirs(self) -> tuple[Path, ...]:
+        """Return checkpoint search paths in the order ComfyUI resolves names."""
+
+        return self.checkpoint_dirs or _deduplicate_paths(
+            root.checkpoints for root in self.model_roots
+        )
+
+    @property
+    def effective_lora_dirs(self) -> tuple[Path, ...]:
+        """Return LoRA search paths in the order ComfyUI resolves names."""
+
+        return self.lora_dirs or _deduplicate_paths(
+            root.loras for root in self.model_roots
+        )
+
+    def checkpoint_candidates(self, name: str) -> tuple[Path, ...]:
+        """Resolve every local checkpoint match without losing search priority."""
+
+        return model_file_candidates(self.effective_checkpoint_dirs, name)
+
+    def lora_candidates(self, name: str) -> tuple[Path, ...]:
+        """Resolve every local LoRA match without losing search priority."""
+
+        return model_file_candidates(self.effective_lora_dirs, name)
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,6 +286,153 @@ def _configured_path(value: object, config_dir: Path) -> Path | None:
         path
         if path.is_absolute() or PureWindowsPath(expanded).is_absolute()
         else config_dir / path
+    )
+
+
+def _desktop_launch_tokens(value: str) -> tuple[str, ...]:
+    """Split startup arguments with the same quote rules as Comfy Desktop."""
+
+    tokens: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    for character in value:
+        if quote is not None:
+            if character == quote:
+                quote = None
+            else:
+                current.append(character)
+        elif character in {'"', "'"}:
+            quote = character
+        elif character.isspace():
+            if current:
+                tokens.append("".join(current))
+                current = []
+        else:
+            current.append(character)
+    if current:
+        tokens.append("".join(current))
+    return tuple(tokens)
+
+
+def _launch_argument_values(
+    tokens: Sequence[str],
+    option: str,
+    *,
+    consume_many: bool = False,
+) -> tuple[str, ...]:
+    """Return supplied values for one long option in command-line order."""
+
+    values: list[str] = []
+    prefix = f"{option}="
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        inline: str | None = None
+        if token.startswith(prefix):
+            inline = token[len(prefix) :]
+        elif token != option:
+            index += 1
+            continue
+
+        if inline:
+            values.append(inline)
+        cursor = index + 1
+        if inline is None and not consume_many:
+            if cursor < len(tokens) and not tokens[cursor].startswith("--"):
+                values.append(tokens[cursor])
+                cursor += 1
+        elif consume_many:
+            while cursor < len(tokens) and not tokens[cursor].startswith("--"):
+                values.append(tokens[cursor])
+                cursor += 1
+        index = max(cursor, index + 1)
+    return tuple(values)
+
+
+def _installation_launch_cwd(installation: ComfyInstallation) -> Path | None:
+    """Return the working directory used by the Desktop source launcher."""
+
+    if installation.source_id.casefold() == "git":
+        return installation.comfyui_path or installation.install_path
+    return installation.install_path or installation.comfyui_path
+
+
+def _launch_path_configuration(
+    installation: ComfyInstallation,
+    *,
+    shared_input_dir: Path | None,
+    shared_output_dir: Path | None,
+    warnings: list[str] | None = None,
+) -> _LaunchPathConfiguration:
+    """Resolve the path arguments Desktop passes after source-specific defaults."""
+
+    def warn(message: str) -> None:
+        if warnings is not None and message not in warnings:
+            warnings.append(message)
+
+    launch_cwd = _installation_launch_cwd(installation)
+    tokens = _desktop_launch_tokens(installation.launch_args)
+    base_values = _launch_argument_values(tokens, "--base-directory")
+    models_values = _launch_argument_values(tokens, "--models-directory")
+    input_values = _launch_argument_values(tokens, "--input-directory")
+    output_values = _launch_argument_values(tokens, "--output-directory")
+    config_values = _launch_argument_values(
+        tokens,
+        "--extra-model-paths-config",
+        consume_many=True,
+    )
+
+    base_dir = (
+        installation.adopted_base_dir
+        if installation.adopted and installation.adopted_base_dir is not None
+        else installation.comfyui_path
+    )
+    if installation.adopted and installation.adopted_base_dir is None:
+        warn(
+            f"{installation.name} is marked as an adopted Comfy installation, "
+            "but its original data folder is missing from Desktop's settings."
+        )
+    if base_values and launch_cwd is not None:
+        base_dir = _configured_path(base_values[-1], launch_cwd) or base_dir
+
+    models_dir = base_dir / "models" if base_dir is not None else None
+    if models_values and launch_cwd is not None:
+        models_dir = _configured_path(models_values[-1], launch_cwd) or models_dir
+
+    user_input = base_dir / "input" if base_dir is not None else None
+    user_output = base_dir / "output" if base_dir is not None else None
+    if input_values and launch_cwd is not None:
+        user_input = _configured_path(input_values[-1], launch_cwd) or user_input
+    if output_values and launch_cwd is not None:
+        user_output = _configured_path(output_values[-1], launch_cwd) or user_output
+
+    if installation.use_shared_input_output:
+        # Desktop appends its shared values after launchArgs, so they win. A
+        # missing raw setting means the launcher's computed default is unknown
+        # to this read-only integration; do not claim the user argument wins.
+        input_dir = shared_input_dir
+        output_dir = shared_output_dir
+    else:
+        input_dir = installation.input_dir or user_input
+        output_dir = installation.output_dir or user_output
+
+    extra_configs: list[Path] = []
+    if launch_cwd is not None:
+        for value in config_values:
+            path = _configured_path(value, launch_cwd)
+            if path is not None:
+                extra_configs.append(path)
+    elif config_values:
+        warn(
+            f"Could not resolve {installation.name}'s relative extra model-path "
+            "configuration because its install folder is unavailable."
+        )
+
+    return _LaunchPathConfiguration(
+        models_dir=models_dir,
+        input_dir=input_dir,
+        output_dir=output_dir,
+        extra_model_configs=_deduplicate_paths(extra_configs),
     )
 
 
@@ -280,6 +503,9 @@ def _installation_from_json(
         model_dirs_primary=model_dirs_primary,
         input_dir=_configured_path(value.get("inputDir"), config_dir),
         output_dir=_configured_path(value.get("outputDir"), config_dir),
+        launch_args=_string(value.get("launchArgs")) or "",
+        adopted=value.get("adopted") is True,
+        adopted_base_dir=_configured_path(value.get("adoptedBaseDir"), config_dir),
     )
 
 
@@ -345,9 +571,247 @@ def _model_paths_from_settings(
     return tuple(paths)
 
 
+def _windows_drive(path: Path | str) -> str:
+    return PureWindowsPath(str(path)).drive.casefold()
+
+
+def _display_icon_executable(value: object) -> Path | None:
+    """Extract an executable path from a Windows DisplayIcon registry value."""
+
+    raw = _string(value)
+    if raw is None:
+        return None
+    if raw.startswith('"'):
+        closing_quote = raw.find('"', 1)
+        executable = raw[1:closing_quote] if closing_quote > 1 else ""
+    else:
+        executable = re.sub(r",\s*-?\d+\s*$", "", raw).strip()
+    path = Path(executable) if executable else None
+    return path if path is not None and path.suffix.casefold() == ".exe" else None
+
+
+def _registered_comfy_desktop_executable(
+    warnings: list[str],
+) -> Path | None:
+    """Return the installed Desktop executable recorded by Windows.
+
+    Electron Builder's NSIS installer records ``DisplayIcon`` in the Windows
+    uninstall registry. Reading that value lets this integration reproduce
+    Desktop's redirected-drive storage choice without searching disks.
+    """
+
+    if sys.platform != "win32":
+        return None
+    try:
+        import winreg
+    except ImportError:
+        return None
+
+    locations = (
+        (winreg.HKEY_CURRENT_USER, 0),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY),
+    )
+    subkey = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    candidates: list[Path] = []
+    for hive, view in locations:
+        try:
+            root = winreg.OpenKey(hive, subkey, 0, winreg.KEY_READ | view)
+        except OSError:
+            continue
+        with root:
+            try:
+                subkey_count = winreg.QueryInfoKey(root)[0]
+            except OSError:
+                continue
+            for index in range(subkey_count):
+                try:
+                    child_name = winreg.EnumKey(root, index)
+                    child = winreg.OpenKey(root, child_name)
+                except OSError:
+                    continue
+                with child:
+                    try:
+                        display_name = winreg.QueryValueEx(child, "DisplayName")[0]
+                    except OSError:
+                        continue
+                    if not (
+                        isinstance(display_name, str)
+                        and display_name.strip().casefold().startswith("comfy desktop")
+                    ):
+                        continue
+                    try:
+                        display_icon = winreg.QueryValueEx(child, "DisplayIcon")[0]
+                    except OSError:
+                        display_icon = None
+                    executable = _display_icon_executable(display_icon)
+                    if executable is None:
+                        try:
+                            install_location = winreg.QueryValueEx(
+                                child, "InstallLocation"
+                            )[0]
+                        except OSError:
+                            install_location = None
+                        install_path = _string(install_location)
+                        if install_path is not None:
+                            executable = Path(install_path) / "Comfy Desktop.exe"
+                    if executable is not None and _path_is_file(executable):
+                        candidates.append(executable)
+
+    candidates = list(_deduplicate_paths(candidates))
+    drives = {_windows_drive(path) for path in candidates if _windows_drive(path)}
+    if len(drives) > 1:
+        warnings.append(
+            "Multiple registered Comfy Desktop executables were found on "
+            "different drives; the default shared folders were not guessed."
+        )
+        return None
+    return candidates[0] if candidates else None
+
+
+def _desktop_default_data_root(
+    desktop_dir: Path,
+    settings: Mapping[str, Any],
+    installations: Sequence[ComfyInstallation],
+    *,
+    desktop_executable: Path | None,
+    home_dir: Path,
+    local_appdata: Path,
+    system_drive: str,
+    warnings: list[str],
+) -> Path | None:
+    """Mirror Desktop's persisted Windows default-data-root decision.
+
+    Current Desktop records the system-drive choice in ``data-location.json``.
+    A redirected Desktop executable deliberately has no marker, so only the
+    launcher's exact default installation shape is accepted as evidence of that
+    drive. Ambiguous state fails closed instead of inventing a model library.
+    """
+
+    system = _windows_drive(system_drive)
+    executable_drive = (
+        _windows_drive(desktop_executable) if desktop_executable is not None else ""
+    )
+    executable_drive_attested = bool(executable_drive and system)
+    if executable_drive_attested and executable_drive != system:
+        return Path(f"{executable_drive}\\Comfy-Desktop")
+
+    if not executable_drive_attested:
+        explicit_install_dir = _configured_path(settings.get("installDir"), desktop_dir)
+        redirected_roots: set[str] = set()
+        ambiguous_external_install = False
+        for installation in installations:
+            install_path = installation.install_path
+            if install_path is None:
+                continue
+            windows_path = PureWindowsPath(str(install_path))
+            drive = windows_path.drive.casefold()
+            if not drive or not system or drive == system:
+                continue
+            exact_default_shape = (
+                installation.source_id.casefold() == "standalone"
+                and not installation.adopted
+                and windows_path.parent.name.casefold() == "comfyui-installs"
+                and windows_path.parent.parent.name.casefold() == "comfy-desktop"
+                and windows_path.parent.parent.parent == PureWindowsPath(f"{drive}\\")
+            )
+            if explicit_install_dir is None and exact_default_shape:
+                redirected_roots.add(str(windows_path.parent.parent))
+            else:
+                ambiguous_external_install = True
+        if len(redirected_roots) == 1 and not ambiguous_external_install:
+            return Path(next(iter(redirected_roots)))
+        if redirected_roots or ambiguous_external_install:
+            warnings.append(
+                "Comfy Desktop's default shared-folder drive could not be "
+                "proven from its read-only state. Launch Desktop once so it "
+                "can record or generate the active model paths."
+            )
+            return None
+
+    marker_path = desktop_dir / _DESKTOP_DATA_LOCATION_FILE
+    marker_exists = _path_is_file(marker_path)
+    marker = _read_json(marker_path, warnings)
+    if isinstance(marker, Mapping):
+        mode = marker.get("mode")
+        if mode == "legacy-home":
+            return home_dir
+        if mode == "local-appdata":
+            return local_appdata / "Comfy-Desktop"
+        warnings.append(
+            "Comfy Desktop has an unrecognized data-location marker; MIVIM "
+            "reconstructed Desktop's safe system-drive default."
+        )
+    elif marker is not None:
+        warnings.append(
+            "Comfy Desktop has an invalid data-location marker; MIVIM "
+            "reconstructed Desktop's safe system-drive default."
+        )
+    elif marker_exists:
+        warnings.append(
+            "Comfy Desktop's data-location marker could not be read; MIVIM "
+            "reconstructed Desktop's safe system-drive default."
+        )
+
+    if _path_exists(home_dir / "ComfyUI-Installs") or _path_exists(
+        home_dir / "ComfyUI-Shared"
+    ):
+        return home_dir
+    return local_appdata / "Comfy-Desktop"
+
+
 def _path_key(path: Path) -> str:
     # These paths describe Windows state even when discovery is tested elsewhere.
     return str(path).replace("/", "\\").rstrip("\\").casefold()
+
+
+def _deduplicate_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
+    """Preserve the first occurrence of each Windows model directory."""
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = _path_key(path)
+        if key not in seen:
+            seen.add(key)
+            result.append(path)
+    return tuple(result)
+
+
+def model_file_candidates(
+    directories: Iterable[Path],
+    name: str,
+) -> tuple[Path, ...]:
+    """Return safe existing matches in ComfyUI's supplied search order."""
+
+    if not isinstance(name, str) or not name.strip():
+        return ()
+    relative = Path(name.replace("\\", "/"))
+    if relative.is_absolute() or ".." in relative.parts:
+        return ()
+
+    matches: list[Path] = []
+    seen: set[str] = set()
+    for directory in directories:
+        try:
+            # Keep lexical containment while allowing a configured model folder
+            # to contain Windows junctions/symlinks, as ComfyUI itself does.
+            root = directory.absolute()
+            candidate = (root / relative).absolute()
+            candidate.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        key = _path_key(candidate)
+        if key in seen:
+            continue
+        try:
+            is_file = candidate.is_file()
+        except OSError:
+            is_file = False
+        if is_file:
+            seen.add(key)
+            matches.append(candidate)
+    return tuple(matches)
 
 
 def _make_model_roots(
@@ -372,31 +836,32 @@ def _make_model_roots(
     return tuple(roots)
 
 
-def _extra_model_paths(
-    comfyui_path: Path | None,
-    installation_name: str,
-) -> tuple[ComfyModelRoot, ...]:
-    """Read model folders enabled by ComfyUI's ``extra_model_paths.yaml``.
+def _extra_model_layout_file(
+    config_path: Path | None,
+    source_name: str,
+    warnings: list[str] | None = None,
+) -> _ExtraModelLayout:
+    """Parse one config in the same scalar-path form accepted by ComfyUI."""
 
-    This is deliberately read-only and conservative: only entries that define
-    both checkpoint and LoRA folders can become a pipeline destination.  An
-    invalid or future configuration shape is ignored so Desktop discovery can
-    still start normally.
-    """
+    empty = _ExtraModelLayout(roots=(), checkpoints=(), loras=())
+    if config_path is None or not _path_is_file(config_path):
+        return empty
 
-    if comfyui_path is None:
-        return ()
-    config_path = comfyui_path / "extra_model_paths.yaml"
-    if not _path_is_file(config_path):
-        return ()
+    def warn(message: str) -> None:
+        if warnings is not None and message not in warnings:
+            warnings.append(message)
+
     try:
         if config_path.stat().st_size > _CONFIG_SIZE_LIMIT:
-            return ()
+            warn(f"Ignored unusually large Comfy model-path config: {config_path}")
+            return empty
         value = yaml.safe_load(config_path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, yaml.YAMLError):
-        return ()
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        warn(f"Could not read Comfy model-path config {config_path.name}: {exc}")
+        return empty
     if not isinstance(value, Mapping):
-        return ()
+        warn(f"Comfy model-path config {config_path.name} is not a YAML mapping.")
+        return empty
 
     def category_paths(
         section: Mapping[object, object],
@@ -404,24 +869,28 @@ def _extra_model_paths(
         base_path: Path,
     ) -> tuple[Path, ...]:
         raw = section.get(key)
-        values: Sequence[object]
-        if isinstance(raw, str):
-            values = tuple(line.strip() for line in raw.splitlines() if line.strip())
-        elif isinstance(raw, Sequence):
-            values = raw
-        else:
-            values = ()
+        if raw is None:
+            return ()
+        if not isinstance(raw, str):
+            warn(
+                f"{config_path.name} uses a non-text {key} value; ComfyUI "
+                "accepts one path or a multiline text block."
+            )
+            return ()
         paths: list[Path] = []
-        for item in values:
+        for item in (line for line in raw.splitlines() if line):
             path = _configured_path(item, base_path)
             if path is not None:
                 paths.append(path)
         return tuple(paths)
 
     roots: list[ComfyModelRoot] = []
+    checkpoint_dirs: list[_ConfiguredModelDirectory] = []
+    lora_dirs: list[_ConfiguredModelDirectory] = []
     seen: set[tuple[str, str]] = set()
     for section_name, raw_section in value.items():
         if not isinstance(raw_section, Mapping):
+            warn(f"Ignored invalid section {section_name!s} in {config_path.name}.")
             continue
         base_path = (
             _configured_path(raw_section.get("base_path"), config_path.parent)
@@ -429,6 +898,35 @@ def _extra_model_paths(
         )
         checkpoints = category_paths(raw_section, "checkpoints", base_path)
         loras = category_paths(raw_section, "loras", base_path)
+        source = f"{source_name} ({section_name})"
+        raw_default = raw_section.get("is_default", False)
+        is_default = bool(raw_default)
+        if (
+            raw_default is not True
+            and raw_default is not False
+            and raw_default is not None
+        ):
+            warn(
+                f"{config_path.name} has a non-boolean is_default value in "
+                f"section {section_name!s}; ComfyUI treats it according to "
+                "YAML runtime truthiness."
+            )
+        checkpoint_dirs.extend(
+            _ConfiguredModelDirectory(
+                path=path,
+                source=source,
+                is_default=is_default,
+            )
+            for path in checkpoints
+        )
+        lora_dirs.extend(
+            _ConfiguredModelDirectory(
+                path=path,
+                source=source,
+                is_default=is_default,
+            )
+            for path in loras
+        )
         for checkpoint_dir in checkpoints:
             for lora_dir in loras:
                 key = (_path_key(checkpoint_dir), _path_key(lora_dir))
@@ -446,14 +944,354 @@ def _extra_model_paths(
                         path=common_path,
                         loras=lora_dir,
                         checkpoints=checkpoint_dir,
-                        source=(
-                            f"{installation_name} extra_model_paths.yaml "
-                            f"({section_name})"
-                        ),
+                        source=source,
                         exists=_path_exists(checkpoint_dir) or _path_exists(lora_dir),
                     )
                 )
-    return tuple(roots)
+    return _ExtraModelLayout(
+        roots=tuple(roots),
+        checkpoints=tuple(checkpoint_dirs),
+        loras=tuple(lora_dirs),
+    )
+
+
+def _extra_model_layout(
+    comfyui_path: Path | None,
+    installation_name: str,
+    warnings: list[str] | None = None,
+) -> _ExtraModelLayout:
+    """Read an install-local ``extra_model_paths.yaml`` if it exists."""
+
+    config_path = (
+        comfyui_path / "extra_model_paths.yaml" if comfyui_path is not None else None
+    )
+    return _extra_model_layout_file(
+        config_path,
+        f"{installation_name} extra_model_paths.yaml",
+        warnings,
+    )
+
+
+def _extra_model_paths(
+    comfyui_path: Path | None,
+    installation_name: str,
+) -> tuple[ComfyModelRoot, ...]:
+    """Return paired extra roots for compatibility with pre-0.6 callers."""
+
+    return _extra_model_layout(comfyui_path, installation_name).roots
+
+
+def _ordered_model_directories(
+    base: Iterable[Path],
+    configured: Iterable[_ConfiguredModelDirectory],
+) -> tuple[Path, ...]:
+    """Apply ComfyUI's add-model-path prepend/append ordering semantics."""
+
+    ordered = list(_deduplicate_paths(base))
+    for item in configured:
+        key = _path_key(item.path)
+        existing_index = next(
+            (index for index, path in enumerate(ordered) if _path_key(path) == key),
+            None,
+        )
+        if existing_index is not None:
+            if item.is_default and existing_index != 0:
+                ordered.insert(0, ordered.pop(existing_index))
+            continue
+        if item.is_default:
+            ordered.insert(0, item.path)
+        else:
+            ordered.append(item.path)
+    return tuple(ordered)
+
+
+def _generated_layout_matches_roots(
+    layout: _ExtraModelLayout,
+    roots: Sequence[ComfyModelRoot],
+) -> bool:
+    """Return whether Desktop's generated YAML matches current settings."""
+
+    expected_checkpoints = tuple(root.checkpoints for root in roots)
+    expected_loras = tuple(root.loras for root in roots)
+    actual_checkpoints = _ordered_model_directories((), layout.checkpoints)
+    actual_loras = _ordered_model_directories((), layout.loras)
+    return tuple(_path_key(path) for path in actual_checkpoints) == tuple(
+        _path_key(path) for path in expected_checkpoints
+    ) and tuple(_path_key(path) for path in actual_loras) == tuple(
+        _path_key(path) for path in expected_loras
+    )
+
+
+def _effective_model_layout(
+    installation: ComfyInstallation | None,
+    shared_roots: tuple[ComfyModelRoot, ...],
+    legacy_roots: tuple[ComfyModelRoot, ...],
+    *,
+    desktop_config_dir: Path | None = None,
+    legacy_config_dir: Path | None = None,
+    output_dir: Path | None = None,
+    launch_paths: _LaunchPathConfiguration | None = None,
+    running_since_ms: int | None = None,
+    warnings: list[str] | None = None,
+) -> _EffectiveModelLayout:
+    if installation is None:
+        roots = shared_roots or legacy_roots
+        checkpoint_dirs = _deduplicate_paths(root.checkpoints for root in roots)
+        lora_dirs = _deduplicate_paths(root.loras for root in roots)
+        legacy_extra = _ExtraModelLayout(roots=(), checkpoints=(), loras=())
+        if not shared_roots and legacy_config_dir is not None:
+            legacy_extra = _extra_model_layout_file(
+                legacy_config_dir / "extra_models_config.yaml",
+                "Legacy Comfy Desktop extra_models_config.yaml",
+                warnings,
+            )
+            checkpoint_dirs = _ordered_model_directories(
+                checkpoint_dirs,
+                legacy_extra.checkpoints,
+            )
+            lora_dirs = _ordered_model_directories(lora_dirs, legacy_extra.loras)
+        if output_dir is not None:
+            checkpoint_dirs = _deduplicate_paths(
+                (*checkpoint_dirs, output_dir / "checkpoints")
+            )
+            lora_dirs = _deduplicate_paths((*lora_dirs, output_dir / "loras"))
+        unique_roots: list[ComfyModelRoot] = []
+        seen_roots: set[tuple[str, str]] = set()
+        for root in (*roots, *legacy_extra.roots):
+            key = (_path_key(root.checkpoints), _path_key(root.loras))
+            if key not in seen_roots:
+                seen_roots.add(key)
+                unique_roots.append(root)
+        return _EffectiveModelLayout(
+            roots=tuple(unique_roots),
+            checkpoint_dirs=checkpoint_dirs,
+            lora_dirs=lora_dirs,
+        )
+
+    resolved_launch_paths = launch_paths or _launch_path_configuration(
+        installation,
+        shared_input_dir=None,
+        shared_output_dir=output_dir,
+        warnings=warnings,
+    )
+    own = (
+        _make_model_roots(((resolved_launch_paths.models_dir, installation.name),))
+        if resolved_launch_paths.models_dir is not None
+        else ()
+    )
+    local_extra = _extra_model_layout(
+        installation.comfyui_path,
+        installation.name,
+        warnings,
+    )
+    launch_extras: list[_ExtraModelLayout] = []
+    for config_path in resolved_launch_paths.extra_model_configs:
+        if not _path_is_file(config_path):
+            message = (
+                f"{installation.name} starts with a missing extra model-path "
+                f"configuration: {config_path}"
+            )
+            if warnings is not None and message not in warnings:
+                warnings.append(message)
+            continue
+        launch_extras.append(
+            _extra_model_layout_file(
+                config_path,
+                f"{installation.name} startup arguments ({config_path.name})",
+                warnings,
+            )
+        )
+    if installation.use_shared_models:
+        launcher_roots = shared_roots
+        preferred_roots = (*shared_roots, *own)
+        launcher_primary = shared_roots[0].path if shared_roots else None
+        generated_name = "shared_model_paths.yaml"
+    else:
+        launcher_roots = _make_model_roots(
+            (path, f"{installation.name} extra models")
+            for path in installation.model_dirs
+        )
+        launcher_primary = None
+        if installation.model_dirs_primary is not None:
+            primary_key = _path_key(installation.model_dirs_primary)
+            primary = tuple(
+                root for root in launcher_roots if _path_key(root.path) == primary_key
+            )
+            remainder = tuple(root for root in launcher_roots if root not in primary)
+            if primary:
+                launcher_primary = primary[0].path
+                preferred_roots = (*primary, *own, *remainder)
+            else:
+                preferred_roots = (*own, *launcher_roots)
+        else:
+            preferred_roots = (*own, *launcher_roots)
+        generated_name = f"instance-model-paths/{installation.id}.yaml"
+
+    generated_path = (
+        desktop_config_dir / Path(generated_name)
+        if desktop_config_dir is not None
+        else None
+    )
+    if generated_path is not None and _path_is_file(generated_path):
+        generated_extra = _extra_model_layout_file(
+            generated_path,
+            f"Comfy Desktop {generated_path.name}",
+            warnings,
+        )
+        generated_matches_settings = _generated_layout_matches_roots(
+            generated_extra,
+            launcher_roots,
+        )
+        if running_since_ms is not None:
+            try:
+                generated_modified_ms = generated_path.stat().st_mtime_ns // 1_000_000
+            except OSError as exc:
+                if warnings is not None:
+                    warnings.append(
+                        "MIVIM could not verify the running ComfyUI model-path "
+                        f"snapshot: {exc}. Restart this instance in Comfy Desktop."
+                    )
+                return _EffectiveModelLayout(
+                    roots=(),
+                    checkpoint_dirs=(),
+                    lora_dirs=(),
+                )
+            if generated_modified_ms > running_since_ms:
+                if warnings is not None:
+                    warnings.append(
+                        "Comfy Desktop rewrote model paths after this ComfyUI "
+                        "instance started. Restart the selected instance so MIVIM "
+                        "can verify exactly which model library is active."
+                    )
+                return _EffectiveModelLayout(
+                    roots=(),
+                    checkpoint_dirs=(),
+                    lora_dirs=(),
+                )
+            if (
+                launcher_roots
+                and not generated_extra.checkpoints
+                and not generated_extra.loras
+            ):
+                if warnings is not None:
+                    warnings.append(
+                        "The running ComfyUI model-path snapshot is incomplete. "
+                        "Restart the selected instance in Comfy Desktop."
+                    )
+                return _EffectiveModelLayout(
+                    roots=(),
+                    checkpoint_dirs=(),
+                    lora_dirs=(),
+                )
+            desktop_extra = generated_extra
+            if not generated_matches_settings:
+                preferred_roots = (*generated_extra.roots, *own)
+                if warnings is not None:
+                    warnings.append(
+                        "The running ComfyUI instance still uses its launch-time "
+                        "model folders. Restart it in Comfy Desktop to apply the "
+                        "new storage settings."
+                    )
+        elif generated_matches_settings:
+            desktop_extra = generated_extra
+        else:
+            if warnings is not None:
+                warnings.append(
+                    f"Ignored stale Comfy Desktop model-path file "
+                    f"{generated_path.name}; current Desktop storage settings "
+                    "take effect when the instance starts."
+                )
+            desktop_extra = _ExtraModelLayout(roots=(), checkpoints=(), loras=())
+    else:
+        if running_since_ms is not None and launcher_roots:
+            if warnings is not None:
+                warnings.append(
+                    "MIVIM could not find the model-path snapshot used by the "
+                    "running ComfyUI instance. Restart it in Comfy Desktop."
+                )
+            return _EffectiveModelLayout(
+                roots=(),
+                checkpoint_dirs=(),
+                lora_dirs=(),
+            )
+        desktop_extra = _ExtraModelLayout(
+            roots=(),
+            checkpoints=(),
+            loras=(),
+        )
+    if not desktop_extra.checkpoints and not desktop_extra.loras:
+        desktop_extra = _ExtraModelLayout(
+            roots=(),
+            checkpoints=tuple(
+                _ConfiguredModelDirectory(
+                    root.checkpoints,
+                    f"{installation.name} Desktop model library",
+                    launcher_primary is not None
+                    and _path_key(root.path) == _path_key(launcher_primary),
+                )
+                for root in launcher_roots
+            ),
+            loras=tuple(
+                _ConfiguredModelDirectory(
+                    root.loras,
+                    f"{installation.name} Desktop model library",
+                    launcher_primary is not None
+                    and _path_key(root.path) == _path_key(launcher_primary),
+                )
+                for root in launcher_roots
+            ),
+        )
+
+    # ComfyUI initializes the install's built-in models directory, then loads
+    # install-local YAML, then Desktop's generated CLI YAML, and finally adds
+    # category folders under the configured output directory.
+    checkpoint_dirs = _ordered_model_directories(
+        (root.checkpoints for root in own),
+        local_extra.checkpoints,
+    )
+    for extra in launch_extras:
+        checkpoint_dirs = _ordered_model_directories(
+            checkpoint_dirs,
+            extra.checkpoints,
+        )
+    checkpoint_dirs = _ordered_model_directories(
+        checkpoint_dirs,
+        desktop_extra.checkpoints,
+    )
+    lora_dirs = _ordered_model_directories(
+        (root.loras for root in own),
+        local_extra.loras,
+    )
+    for extra in launch_extras:
+        lora_dirs = _ordered_model_directories(lora_dirs, extra.loras)
+    lora_dirs = _ordered_model_directories(
+        lora_dirs,
+        desktop_extra.loras,
+    )
+    effective_output_dir = resolved_launch_paths.output_dir
+    if effective_output_dir is not None:
+        checkpoint_dirs = _deduplicate_paths(
+            (*checkpoint_dirs, effective_output_dir / "checkpoints")
+        )
+        lora_dirs = _deduplicate_paths((*lora_dirs, effective_output_dir / "loras"))
+
+    unique: list[ComfyModelRoot] = []
+    seen: set[tuple[str, str]] = set()
+    for root in (
+        *preferred_roots,
+        *local_extra.roots,
+        *(root for extra in launch_extras for root in extra.roots),
+        *desktop_extra.roots,
+    ):
+        key = (_path_key(root.checkpoints), _path_key(root.loras))
+        if key not in seen:
+            seen.add(key)
+            unique.append(root)
+    return _EffectiveModelLayout(
+        roots=tuple(unique),
+        checkpoint_dirs=checkpoint_dirs,
+        lora_dirs=lora_dirs,
+    )
 
 
 def _effective_model_roots(
@@ -461,43 +1299,13 @@ def _effective_model_roots(
     shared_roots: tuple[ComfyModelRoot, ...],
     legacy_roots: tuple[ComfyModelRoot, ...],
 ) -> tuple[ComfyModelRoot, ...]:
-    if installation is None:
-        return shared_roots or legacy_roots
+    """Return paired roots for compatibility with pre-0.6 callers."""
 
-    own = (
-        _make_model_roots(((installation.comfyui_path / "models", installation.name),))
-        if installation.comfyui_path is not None
-        else ()
-    )
-    extra = _extra_model_paths(installation.comfyui_path, installation.name)
-    if installation.use_shared_models:
-        visible_own = (
-            own if any(root.exists for root in own) or not shared_roots else ()
-        )
-        candidates = (*shared_roots, *visible_own, *extra)
-    else:
-        external = _make_model_roots(
-            (path, f"{installation.name} extra models")
-            for path in installation.model_dirs
-        )
-        if installation.model_dirs_primary is not None:
-            primary_key = _path_key(installation.model_dirs_primary)
-            primary = tuple(
-                root for root in external if _path_key(root.path) == primary_key
-            )
-            remainder = tuple(root for root in external if root not in primary)
-            candidates = (*primary, *own, *remainder, *extra)
-        else:
-            candidates = (*own, *external, *extra)
-
-    unique: list[ComfyModelRoot] = []
-    seen: set[tuple[str, str]] = set()
-    for root in candidates:
-        key = (_path_key(root.checkpoints), _path_key(root.loras))
-        if key not in seen:
-            seen.add(key)
-            unique.append(root)
-    return tuple(unique)
+    return _effective_model_layout(
+        installation,
+        shared_roots,
+        legacy_roots,
+    ).roots
 
 
 def select_comfy_installation(
@@ -522,6 +1330,8 @@ def select_comfy_installation(
             input_dir=None,
             output_dir=None,
             host_candidates=(),
+            checkpoint_dirs=(),
+            lora_dirs=(),
         )
 
     same_named_installations = tuple(
@@ -530,54 +1340,91 @@ def select_comfy_installation(
         if installation.is_local
         and installation.name.casefold() == selected.name.casefold()
     )
-    matched_hosts = (
+    matched_runtime_hints = (
         tuple(
-            hint.host
+            hint
             for hint in discovery.runtime_hints
             if hint.installation_name.casefold() == selected.name.casefold()
         )
         if len(same_named_installations) == 1
         else ()
     )
-    warnings = discovery.warnings
+    matched_hosts = tuple(hint.host for hint in matched_runtime_hints)
+    warnings = list(discovery.warnings)
     if len(same_named_installations) > 1:
-        warnings = (
-            *warnings,
-            (
-                f'Multiple Comfy Desktop installations are named "{selected.name}". '
-                "Their running ports cannot be distinguished safely; rename one "
-                "installation in Comfy Desktop."
-            ),
+        duplicate_warning = (
+            f'Multiple Comfy Desktop installations are named "{selected.name}". '
+            "Their running ports cannot be distinguished safely; rename one "
+            "installation in Comfy Desktop."
         )
+        if duplicate_warning not in warnings:
+            warnings.append(duplicate_warning)
     # A selected Desktop installation is an identity boundary.  Falling back
     # to another installation's live port can train into and validate against
     # different model libraries without any obvious error for a casual user.
     hosts = _deduplicate_hosts(matched_hosts)
-    input_dir = discovery.input_dir
-    output_dir = discovery.output_dir
-    if not selected.use_shared_input_output:
-        input_dir = selected.input_dir or (
-            selected.comfyui_path / "input"
-            if selected.comfyui_path is not None
-            else input_dir
+    shared_input_dir = discovery.shared_input_dir
+    shared_output_dir = discovery.shared_output_dir
+    if (
+        discovery.selected_installation is not None
+        and discovery.selected_installation.use_shared_input_output
+    ):
+        shared_input_dir = shared_input_dir or discovery.input_dir
+        shared_output_dir = shared_output_dir or discovery.output_dir
+    launch_paths = _launch_path_configuration(
+        selected,
+        shared_input_dir=shared_input_dir,
+        shared_output_dir=shared_output_dir,
+        warnings=warnings,
+    )
+    layout = _effective_model_layout(
+        selected,
+        discovery.shared_model_roots,
+        discovery.legacy_model_roots,
+        desktop_config_dir=discovery.config_dir,
+        legacy_config_dir=discovery.legacy_config_dir,
+        output_dir=launch_paths.output_dir,
+        launch_paths=launch_paths,
+        running_since_ms=(
+            min(hint.timestamp for hint in matched_runtime_hints)
+            if matched_runtime_hints
+            else None
+        ),
+        warnings=warnings,
+    )
+    if matched_runtime_hints and _desktop_settings_changed_after_start(
+        discovery.config_dir,
+        min(hint.timestamp for hint in matched_runtime_hints),
+        warnings,
+    ):
+        layout = _EffectiveModelLayout(roots=(), checkpoint_dirs=(), lora_dirs=())
+    paths_attested = (
+        (not selected.use_shared_models or bool(discovery.shared_model_roots))
+        and (
+            not selected.use_shared_input_output or launch_paths.output_dir is not None
         )
-        output_dir = selected.output_dir or (
-            selected.comfyui_path / "output"
-            if selected.comfyui_path is not None
-            else output_dir
+        and bool(layout.checkpoint_dirs)
+        and bool(layout.lora_dirs)
+    )
+    if not paths_attested:
+        warning = (
+            "The selected Comfy Desktop instance uses shared storage, but its "
+            "effective folders could not be proven. Launch Desktop once, then "
+            "refresh MIVIM before selecting a model."
         )
+        if warning not in warnings:
+            warnings.append(warning)
+        layout = _EffectiveModelLayout(roots=(), checkpoint_dirs=(), lora_dirs=())
     return replace(
         discovery,
         selected_installation=selected,
-        model_roots=_effective_model_roots(
-            selected,
-            discovery.shared_model_roots,
-            discovery.legacy_model_roots,
-        ),
-        input_dir=input_dir,
-        output_dir=output_dir,
+        model_roots=layout.roots,
+        input_dir=launch_paths.input_dir if paths_attested else None,
+        output_dir=launch_paths.output_dir if paths_attested else None,
         host_candidates=hosts,
-        warnings=warnings,
+        warnings=tuple(warnings),
+        checkpoint_dirs=layout.checkpoint_dirs,
+        lora_dirs=layout.lora_dirs,
     )
 
 
@@ -709,6 +1556,35 @@ def _port_lock_hints(
     return tuple(hints)
 
 
+def _desktop_settings_changed_after_start(
+    desktop_dir: Path | None,
+    started_at_ms: int,
+    warnings: list[str],
+) -> bool:
+    """Fail closed when live input/output settings lack a launch snapshot."""
+
+    if desktop_dir is None:
+        return False
+    settings_path = desktop_dir / "settings.json"
+    if not _path_is_file(settings_path):
+        return False
+    try:
+        changed = settings_path.stat().st_mtime_ns // 1_000_000 > started_at_ms
+    except OSError as exc:
+        warnings.append(
+            "MIVIM could not compare the running ComfyUI instance with Desktop "
+            f"storage settings: {exc}. Restart the selected instance."
+        )
+        return True
+    if changed:
+        warnings.append(
+            "Comfy Desktop storage settings changed after the selected ComfyUI "
+            "instance started. Restart that instance before training so MIVIM "
+            "can verify its active input, output, and model folders."
+        )
+    return changed
+
+
 def _process_is_running(pid: int) -> bool:
     """Return whether ``pid`` currently identifies a running local process."""
 
@@ -758,7 +1634,14 @@ def _port_lock_hosts(desktop_dir: Path, warnings: list[str]) -> tuple[str, ...]:
     return tuple(hint.host for hint in _port_lock_hints(desktop_dir, warnings))
 
 
-def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery:
+def discover_comfy_desktop(
+    appdata: Path | None = None,
+    *,
+    desktop_executable: Path | None = None,
+    home_dir: Path | None = None,
+    local_appdata: Path | None = None,
+    system_drive: str | None = None,
+) -> ComfyDesktopDiscovery:
     """Discover Comfy Desktop state without modifying it.
 
     ``appdata`` is injectable for tests and portable tools.  When omitted, the
@@ -767,6 +1650,7 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
     """
 
     warnings: list[str] = []
+    injected_appdata = appdata is not None
     roaming = appdata
     if roaming is None:
         configured_appdata = os.environ.get("APPDATA")
@@ -787,11 +1671,44 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
             warnings=("APPDATA is unavailable; Comfy Desktop was not auto-detected.",),
         )
 
+    if home_dir is None or local_appdata is None:
+        if injected_appdata:
+            if (
+                roaming.name.casefold() == "roaming"
+                and roaming.parent.name.casefold() == "appdata"
+            ):
+                inferred_home = roaming.parent.parent
+                inferred_local = roaming.parent / "Local"
+            else:
+                fixture_root = (
+                    roaming.parent if roaming.name.casefold() == "roaming" else roaming
+                )
+                inferred_home = fixture_root
+                inferred_local = fixture_root / "Local"
+        else:
+            inferred_home = Path.home()
+            configured_local = os.environ.get("LOCALAPPDATA")
+            inferred_local = (
+                Path(configured_local)
+                if configured_local
+                else inferred_home / "AppData" / "Local"
+            )
+        home_dir = home_dir or inferred_home
+        local_appdata = local_appdata or inferred_local
+    assert home_dir is not None
+    assert local_appdata is not None
+    system_drive = system_drive or os.environ.get("SystemDrive", "")
+
     desktop_dir = roaming / "Comfy Desktop"
     legacy_dir = roaming / "ComfyUI"
     desktop_files_found = any(
         _path_is_file(desktop_dir / name)
-        for name in ("settings.json", "installations.json", "last-session.json")
+        for name in (
+            "settings.json",
+            "installations.json",
+            "last-session.json",
+            _DESKTOP_DATA_LOCATION_FILE,
+        )
     )
     legacy_file_found = _path_is_file(legacy_dir / "config.json")
 
@@ -832,9 +1749,58 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
     )
     selected = _selected_local_installation(installations, settings, last_session)
 
+    configured_model_paths = _model_paths_from_settings(settings, desktop_dir)
+    configured_input_dir = _configured_path(settings.get("inputDir"), desktop_dir)
+    configured_output_dir = _configured_path(settings.get("outputDir"), desktop_dir)
+    needs_default_root = desktop_files_found and (
+        not configured_model_paths
+        or not any(_path_exists(path) for path in configured_model_paths)
+        or configured_input_dir is None
+        or not _path_exists(configured_input_dir)
+        or configured_output_dir is None
+        or not _path_exists(configured_output_dir)
+    )
+    resolved_desktop_executable = (
+        desktop_executable
+        if desktop_executable is not None
+        else (
+            _registered_comfy_desktop_executable(warnings)
+            if not injected_appdata
+            else None
+        )
+    )
+    default_data_root = (
+        _desktop_default_data_root(
+            desktop_dir,
+            settings,
+            installations,
+            desktop_executable=resolved_desktop_executable,
+            home_dir=home_dir,
+            local_appdata=local_appdata,
+            system_drive=system_drive,
+            warnings=warnings,
+        )
+        if needs_default_root
+        else None
+    )
+    default_shared_root = (
+        default_data_root / "ComfyUI-Shared" if default_data_root is not None else None
+    )
+    if not configured_model_paths or not any(
+        _path_exists(path) for path in configured_model_paths
+    ):
+        configured_model_paths = (
+            _deduplicate_paths(
+                (
+                    default_shared_root / "models",
+                    *configured_model_paths,
+                )
+            )
+            if default_shared_root is not None
+            else ()
+        )
     shared_roots = _make_model_roots(
-        (path, "Comfy Desktop settings")
-        for path in _model_paths_from_settings(settings, desktop_dir)
+        (path, "Comfy Desktop settings") for path in configured_model_paths
     )
 
     legacy_base = _configured_path(
@@ -845,22 +1811,33 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
         if legacy_base is not None
         else ()
     )
-    effective_roots = _effective_model_roots(selected, shared_roots, legacy_roots)
-
-    input_dir = _configured_path(settings.get("inputDir"), desktop_dir)
-    output_dir = _configured_path(settings.get("outputDir"), desktop_dir)
-    if selected is not None and not selected.use_shared_input_output:
-        input_dir = selected.input_dir or (
-            selected.comfyui_path / "input"
-            if selected.comfyui_path is not None
-            else input_dir
+    shared_input_dir = (
+        configured_input_dir
+        if configured_input_dir is not None and _path_exists(configured_input_dir)
+        else (
+            default_shared_root / "input" if default_shared_root is not None else None
         )
-        output_dir = selected.output_dir or (
-            selected.comfyui_path / "output"
-            if selected.comfyui_path is not None
-            else output_dir
+    )
+    shared_output_dir = (
+        configured_output_dir
+        if configured_output_dir is not None and _path_exists(configured_output_dir)
+        else (
+            default_shared_root / "output" if default_shared_root is not None else None
         )
-    if legacy_base is not None:
+    )
+    input_dir = shared_input_dir
+    output_dir = shared_output_dir
+    launch_paths: _LaunchPathConfiguration | None = None
+    if selected is not None:
+        launch_paths = _launch_path_configuration(
+            selected,
+            shared_input_dir=shared_input_dir,
+            shared_output_dir=shared_output_dir,
+            warnings=warnings,
+        )
+        input_dir = launch_paths.input_dir
+        output_dir = launch_paths.output_dir
+    elif legacy_base is not None:
         input_dir = input_dir or _configured_path(
             legacy.get("inputDirectory") or legacy.get("inputDir"), legacy_dir
         )
@@ -871,6 +1848,72 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
         output_dir = output_dir or legacy_base / "output"
 
     runtime_hints = _port_lock_hints(desktop_dir, warnings)
+    selected_name_is_unique = bool(
+        selected is not None
+        and sum(
+            1
+            for installation in installations
+            if installation.is_local
+            and installation.name.casefold() == selected.name.casefold()
+        )
+        == 1
+    )
+    selected_runtime_hints = (
+        tuple(
+            hint
+            for hint in runtime_hints
+            if selected is not None
+            and hint.installation_name.casefold() == selected.name.casefold()
+        )
+        if selected_name_is_unique
+        else ()
+    )
+    running_since_ms = (
+        min(hint.timestamp for hint in selected_runtime_hints)
+        if selected_runtime_hints
+        else None
+    )
+    effective_layout = _effective_model_layout(
+        selected,
+        shared_roots,
+        legacy_roots,
+        desktop_config_dir=desktop_dir,
+        legacy_config_dir=legacy_dir,
+        output_dir=output_dir,
+        launch_paths=launch_paths,
+        running_since_ms=running_since_ms,
+        warnings=warnings,
+    )
+    if running_since_ms is not None and _desktop_settings_changed_after_start(
+        desktop_dir,
+        running_since_ms,
+        warnings,
+    ):
+        effective_layout = _EffectiveModelLayout(
+            roots=(),
+            checkpoint_dirs=(),
+            lora_dirs=(),
+        )
+    selected_paths_attested = selected is None or (
+        (not selected.use_shared_models or bool(shared_roots))
+        and (not selected.use_shared_input_output or shared_output_dir is not None)
+        and bool(effective_layout.checkpoint_dirs)
+        and bool(effective_layout.lora_dirs)
+    )
+    if not selected_paths_attested:
+        warnings.append(
+            "The selected Comfy Desktop instance uses shared storage, but its "
+            "effective folders could not be proven. Launch Desktop once, then "
+            "refresh MIVIM before selecting a model."
+        )
+        effective_layout = _EffectiveModelLayout(
+            roots=(),
+            checkpoint_dirs=(),
+            lora_dirs=(),
+        )
+        input_dir = None
+        output_dir = None
+
     saved_hosts: list[str] = [hint.host for hint in runtime_hints]
     for document in (settings, last_session, legacy):
         saved_hosts.extend(_saved_host_candidates(document))
@@ -891,7 +1934,7 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
         legacy_config_dir=legacy_dir if legacy_file_found else None,
         installations=installations,
         selected_installation=selected,
-        model_roots=effective_roots,
+        model_roots=effective_layout.roots,
         input_dir=input_dir,
         output_dir=output_dir,
         host_candidates=_deduplicate_hosts(saved_hosts),
@@ -900,6 +1943,11 @@ def discover_comfy_desktop(appdata: Path | None = None) -> ComfyDesktopDiscovery
         runtime_hints=runtime_hints,
         shared_model_roots=shared_roots,
         legacy_model_roots=legacy_roots,
+        checkpoint_dirs=effective_layout.checkpoint_dirs,
+        lora_dirs=effective_layout.lora_dirs,
+        shared_input_dir=shared_input_dir,
+        shared_output_dir=shared_output_dir,
+        desktop_executable=resolved_desktop_executable,
     )
 
 

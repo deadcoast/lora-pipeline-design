@@ -19,6 +19,7 @@ datasets/*/
 outputs/checkpoints/*
 outputs/configs/*
 outputs/grids/*
+outputs/.mivim-run-locks/
 !**/.gitkeep
 
 # Models

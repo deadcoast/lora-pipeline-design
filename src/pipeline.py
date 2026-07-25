@@ -30,7 +30,10 @@ from . import config
 from . import prepare_dataset as prep
 from . import train as trainer
 from . import validate as validator
+from .comfy_activity import check_orphaned_comfy_prompts
 from .io_utils import artifact_fingerprint, atomic_copy, atomic_write_text
+from .process_control import arm_desktop_owner_guard
+from .run_guardian import pipeline_run_guard
 
 RECOVERY_SCHEMA_VERSION = 2
 
@@ -152,6 +155,70 @@ def _write_validation_recovery(
 
 
 def run(args: argparse.Namespace) -> Path | None:
+    """Run one pipeline invocation while holding its cross-process safety leases."""
+
+    arm_desktop_owner_guard()
+    name = config.validate_project_name(args.name)
+    if args.skip_prep and args.skip_train and args.skip_validate:
+        raise ValueError("All pipeline stages are skipped; there is nothing to run.")
+    if args.lora and not args.skip_train:
+        raise ValueError(
+            "--lora selects an existing checkpoint and requires --skip-train."
+        )
+    if not args.skip_train and not args.skip_validate:
+        mode = "full"
+    elif not args.skip_train:
+        mode = "train"
+    elif not args.skip_validate:
+        mode = "validate"
+    else:
+        mode = "prepare"
+    use_accelerator = (
+        not args.skip_train
+        or not args.skip_validate
+        or (not args.skip_prep and args.vision)
+    )
+    workspace = config.RUN_CONFIGS_DIR.resolve().parent
+    dataset_dir = (config.DATASETS_DIR / name).resolve()
+    mutable_roots = {
+        config.DATASETS_DIR.resolve().parent,
+        config.RUN_CONFIGS_DIR.resolve().parent,
+    }
+    resources = {
+        (config.RUN_CONFIGS_DIR / f"{name}.yaml").resolve(),
+        (config.RUN_CONFIGS_DIR / f"{name}-recovery.json").resolve(),
+        (config.RUN_CONFIGS_DIR / f"{name}-result.json").resolve(),
+    }
+    if not args.skip_prep or not args.skip_train:
+        resources.add(dataset_dir)
+    if not args.skip_train:
+        mutable_roots.add(config.CHECKPOINTS_DIR.resolve().parent)
+        resources.add(config.CHECKPOINTS_DIR.resolve())
+    if not args.skip_validate:
+        mutable_roots.add(config.GRIDS_DIR.resolve().parent)
+        resources.add(config.GRIDS_DIR.resolve())
+        if args.skip_train and not args.lora:
+            resources.add(config.CHECKPOINTS_DIR.resolve())
+        if config.COMFY_LORA_DIR is not None:
+            mutable_roots.add(config.COMFY_LORA_DIR.resolve().parent)
+            resources.add(config.COMFY_LORA_DIR.resolve())
+    base_model = getattr(args, "base_model", None)
+    if base_model is not None:
+        resources.add(Path(base_model).resolve())
+    with pipeline_run_guard(
+        project=name,
+        workspace=workspace,
+        mode=mode,
+        use_accelerator=use_accelerator,
+        project_scopes=mutable_roots,
+        resource_paths=resources,
+    ):
+        if use_accelerator:
+            check_orphaned_comfy_prompts()
+        return _run_with_guard(args)
+
+
+def _run_with_guard(args: argparse.Namespace) -> Path | None:
     name = config.validate_project_name(args.name)
     attempt_id = getattr(args, "attempt_id", "") or str(uuid.uuid4())
     try:
@@ -423,7 +490,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = ap.parse_args(argv)
     try:
         run(args)
-    except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:
+    except (
+        FileNotFoundError,
+        RuntimeError,
+        TimeoutError,
+        TypeError,
+        ValueError,
+    ) as exc:
         ap.error(str(exc))
 
 

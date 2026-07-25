@@ -1,6 +1,6 @@
 [project]
 name = "lora-pipeline-design"
-version = "0.5.0"
+version = "0.6.0"
 description = "MIVIM LoRA Studio: a guided SDXL training companion for Comfy Desktop"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -49,3 +49,9 @@ packages = ["src"]
 
 [tool.ruff.lint.per-file-ignores]
 "src/__init__.py" = ["TC004"]
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
