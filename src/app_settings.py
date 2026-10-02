@@ -161,6 +161,9 @@ def _run_result_from_json(value: object) -> RunResult | None:
         return None
     return RunResult(
         project_name=project_name,
+        training_project_name=_text(
+            value.get("training_project_name"), "", allow_empty=True
+        ),
         mode=mode,
         result_path=result_path,
         completed_at=completed_at,
@@ -333,6 +336,7 @@ def _run_result_to_json(result: RunResult | None) -> dict[str, object] | None:
         return None
     return {
         "project_name": result.project_name,
+        "training_project_name": result.training_project_name,
         "mode": result.mode,
         "result_path": _path_for_json(result.result_path),
         "completed_at": result.completed_at,

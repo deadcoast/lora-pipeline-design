@@ -419,25 +419,35 @@ def test_desktop_command_uses_real_pipeline_entrypoint_and_preset(
     assert command.expected_result == tmp_path / "user-data" / "datasets" / "quick_v1"
 
 
+@pytest.mark.parametrize("mode", ["prepare", "full", "validate"])
 def test_packaged_desktop_reuses_its_executable_as_pipeline_worker(
     tmp_path: Path,
     monkeypatch,
+    mode,
 ) -> None:
     photos = tmp_path / "photos"
     _write_images(photos, 1)
     monkeypatch.setenv("MIVIM_PACKAGED_APP", "1")
+    studio = tmp_path / "Studio package" / "MIVIMLoRAStudio.exe"
+    monkeypatch.setattr(app_service.sys, "argv", [str(studio)])
+    monkeypatch.setattr(
+        app_service.sys, "executable", str(studio.with_name("python.exe"))
+    )
     draft = ProjectDraft(
         project_name="packaged_v1",
         source_dir=photos,
         preset=TrainingPreset.BALANCED,
     )
 
-    command = ApplicationService(root=tmp_path).build_command(
-        AppSettings(datasets_dir=tmp_path / "datasets"),
-        draft,
-        mode="prepare",
+    service = ApplicationService(root=tmp_path)
+    settings = AppSettings(datasets_dir=tmp_path / "datasets")
+    command = (
+        service.build_validation_command(settings, draft, "packaged_v1.safetensors")
+        if mode == "validate"
+        else service.build_command(settings, draft, mode=mode)
     )
 
+    assert command.program == str(studio)
     assert command.arguments[0] == "--pipeline-worker"
     assert "-m" not in command.arguments[:2]
 
@@ -940,6 +950,35 @@ def test_prepared_dataset_allows_caption_edits_but_rejects_image_replacement(
     assert not changed.ready
     assert changed.manifest_error is not None
     assert "001.png changed after preparation" in changed.manifest_error
+
+
+@pytest.mark.parametrize("filename", ["extra.png", "003.jpg", "holiday.WEBP"])
+def test_prepared_dataset_rejects_an_added_complete_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 2, size=1024)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    prepared = prepare_dataset.prepare(photos, "added_pair_v1", trigger="mivim person")
+    draft = ProjectDraft(
+        project_name="added_pair_v1", source_dir=photos, trigger="mivim person"
+    )
+    assert app_service.inspect_prepared_dataset(prepared, draft).ready
+    extra = prepared / filename
+    Image.new("RGB", (1024, 924), "blue").save(extra)
+    extra.with_suffix(".txt").write_text(
+        "mivim person, added photo\n", encoding="utf-8"
+    )
+
+    summary = app_service.inspect_prepared_dataset(prepared, draft)
+
+    assert summary.inventory.structure_ready
+    assert not summary.ready
+    assert summary.manifest_error is not None
+    assert filename in summary.manifest_error
+    assert "not created by this preparation run" in summary.manifest_error
 
 
 def test_prepared_dataset_rejects_a_deleted_complete_pair(

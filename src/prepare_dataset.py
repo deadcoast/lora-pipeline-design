@@ -34,6 +34,7 @@ from PIL import Image, ImageOps
 from . import config
 from .caption import BLIP_MODEL_ID, BLIP_MODEL_REVISION, make_caption
 from .comfy_activity import check_orphaned_comfy_prompts
+from .dataset_pairs import scan_dataset_pairs
 from .io_utils import atomic_write_bytes, atomic_write_text
 from .run_guardian import active_run_guard_covers, pipeline_run_guard
 
@@ -208,11 +209,7 @@ def prepared_output_manifest_issue(folder: Path, manifest: object) -> str | None
         return "The preparation record does not list any prepared images."
 
     try:
-        actual = {
-            path.name: path
-            for path in folder.iterdir()
-            if path.is_file() and path.stem.isdigit() and path.suffix == ".png"
-        }
+        actual = {path.name: path for path in scan_dataset_pairs(folder).image_files}
         missing = sorted(expected.keys() - actual.keys())
         if missing:
             return f"The prepared image {missing[0]} is missing."
@@ -510,6 +507,23 @@ def _prepare_with_guard(
             "Source and prepared dataset directories cannot contain each other."
         )
     out.mkdir(parents=True, exist_ok=True)
+
+    # Rebuild replaces only our numbered pairs. Preserve other photos, but do
+    # not report a ready dataset while leaving extra trainer inputs in place.
+    inventory = scan_dataset_pairs(out)
+    unmanaged_images = [
+        path
+        for path in (*inventory.image_files, *inventory.unsupported_image_files)
+        if not _is_generated_pair(path)
+    ]
+    if unmanaged_images:
+        names = ", ".join(path.name for path in unmanaged_images)
+        raise ValueError(
+            f"The prepared folder contains photos this preparation cannot replace: "
+            f"{names}. Move those photos out of {out} or use a new project name. "
+            "To include them in training, add them to the source photo folder "
+            "and prepare again. No existing prepared files were changed."
+        )
 
     candidates = list(_iter_images(src))
     if not candidates:

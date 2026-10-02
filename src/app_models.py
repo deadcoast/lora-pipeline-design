@@ -127,6 +127,7 @@ class RunResult:
     published_workflow_fingerprint: str = ""
     workflow_user_id: str = ""
     workflow_user_name: str = ""
+    training_project_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,7 @@ class ValidationRecovery:
     validation_signature: str = ""
     strengths: tuple[float, ...] = ()
     seed: int = 42
+    training_project_name: str = ""
 
 
 @dataclass(slots=True)

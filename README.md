@@ -154,13 +154,22 @@ a terminal.
 Prepared projects are manifest-validated and reused automatically. The app
 offers thumbnails and an editable caption for every prepared photo; continuing
 the full run uses `--skip-prep`, so a prepare-only run or a failure after
-preparation does not force users to repeat that work. Reuse and training share
-one image/`.txt` pair contract; duplicate stems, missing partners, and
-unsupported image files are named before Start can launch a process. The
+preparation does not force users to repeat that work. Caption review reserves
+the same dataset used by preparation and training: another Studio window or
+CLI run cannot change or train that dataset until the review closes. A busy
+dataset cannot open for editing, and failed opens release the reservation.
+Reuse and training share one image/`.txt` pair contract; duplicate stems,
+missing partners, and unsupported image files are named before Start can
+launch a process. The
 manifest also binds reuse to the requested description method and the exact
 generated image bytes. The trainer rechecks those hashes immediately before
 materializing its run config. Captions remain editable, but replaced or deleted
 prepared images require a visible rebuild instead of being trusted silently.
+The preparation record covers every supported image the trainer can consume,
+including added photos with different names or formats. Unrecorded photos block
+reuse and training. Rebuild preserves photos outside the generated numbered
+pairs and asks the user to move them out or choose a new project name; photos
+intended for training belong in the source folder before preparation.
 
 ### Result
 
@@ -323,6 +332,10 @@ worker, so it does not depend on a system Python interpreter after deployment.
 Distribute the complete `dist\MIVIMLoRAStudio.dist` folder, not the executable
 by itself.
 
+After building, `uv run pytest tests/test_packaging.py -q` checks the package,
+including native Windows UI actions that start its real photo-preparation
+worker. This acceptance test requires a Windows desktop.
+
 The script permits unsigned local test builds but prints a release warning.
 Before publishing the folder to casual users, Authenticode-sign
 `MIVIMLoRAStudio.exe` with the MIVIM publisher certificate and confirm
@@ -384,10 +397,16 @@ Important source files:
   prompt and equivalent editable UI workflow. Publication of the verified 0.4
   workflow through ComfyUI's supported user-data API is implemented; Workflow
   JSON 1.0 export is not claimed.
-- Automated integration uses a mock ComfyUI API. A live Desktop/GPU training
-  run and manual workflow import remain environment acceptance checks.
-  Multi-checkpoint and automatic strength-winner selection remain subsequent
-  product work.
+- Automated API integration uses a mock ComfyUI API. The separate
+  [September 16 Windows/GPU acceptance](docs/windows-gpu-acceptance-20260916.md)
+  completed a real 2,000-step SDXL run, 16 validation images, workflow
+  publication, and generation from the opened workflow in Comfy Desktop.
+- **Result → Compare training checkpoints** now compares saved training previews
+  at the same prompt index. Choose **Validate this checkpoint** to generate a
+  separate baseline/strength grid and ready ComfyUI workflow without retraining.
+  The original result stays intact. Interrupted choices retain validation-only
+  recovery, and the comparison remains linked to the original training project.
+  Automatic checkpoint ranking and strength-winner selection remain future work.
 
 The local ComfyUI routes used by the integration are documented in the
 [official server route reference](https://docs.comfy.org/development/comfyui-server/comms_routes).

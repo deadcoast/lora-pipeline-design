@@ -101,6 +101,7 @@ def _write_validation_recovery(
     known_lora_fingerprint: str | None = None,
     known_checkpoint_fingerprint: str | None = None,
     updated_at: str | None = None,
+    training_project_name: str = "",
 ) -> dict[str, object]:
     """Atomically record the installed handoff before ComfyUI validation starts."""
 
@@ -124,6 +125,7 @@ def _write_validation_recovery(
     payload: dict[str, object] = {
         "schema_version": RECOVERY_SCHEMA_VERSION,
         "project_name": name,
+        "training_project_name": training_project_name,
         "state": state,
         "lora_name": lora_name,
         "installed_lora_path": str(installed_lora),
@@ -203,6 +205,9 @@ def run(args: argparse.Namespace) -> Path | None:
             mutable_roots.add(config.COMFY_LORA_DIR.resolve().parent)
             resources.add(config.COMFY_LORA_DIR.resolve())
     base_model = getattr(args, "base_model", None)
+    checkpoint_choice = getattr(args, "checkpoint_choice", None)
+    if checkpoint_choice is not None:
+        resources.add(Path(checkpoint_choice).resolve())
     if base_model is not None:
         resources.add(Path(base_model).resolve())
     with pipeline_run_guard(
@@ -220,6 +225,24 @@ def run(args: argparse.Namespace) -> Path | None:
 
 def _run_with_guard(args: argparse.Namespace) -> Path | None:
     name = config.validate_project_name(args.name)
+    training_project = getattr(args, "training_project", "")
+    if training_project:
+        config.validate_project_name(training_project)
+    choice = getattr(args, "checkpoint_choice", None)
+    if choice is not None and (
+        not args.skip_prep or not args.skip_train or args.skip_validate or args.lora
+    ):
+        raise ValueError(
+            "A checkpoint choice requires validation only, without --lora."
+        )
+    if choice is not None and (
+        (config.RUN_CONFIGS_DIR / f"{name}-result.json").exists()
+        or (config.RUN_CONFIGS_DIR / f"{name}-recovery.json").exists()
+        or (config.GRIDS_DIR / f"{name}_grid.png").exists()
+    ):
+        raise ValueError(
+            "This checkpoint choice already has outputs. Use a new version name."
+        )
     attempt_id = getattr(args, "attempt_id", "") or str(uuid.uuid4())
     try:
         attempt_id = str(uuid.UUID(attempt_id))
@@ -274,7 +297,32 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
     validation_recovery: dict[str, object] | None = None
     if not args.skip_validate:
         lora_name = args.lora
-        if lora_name:
+        if choice is not None:
+            source = Path(choice).resolve()
+            expected = getattr(args, "expected_lora_fingerprint", "")
+            if (
+                source.suffix.lower() != ".safetensors"
+                or not expected
+                or artifact_fingerprint(source) != expected
+            ):
+                raise ValueError(
+                    "The selected checkpoint changed after review. Compare it again."
+                )
+            if config.COMFY_LORA_DIR is None or not config.COMFY_LORA_DIR.is_dir():
+                raise ValueError("Reconnect the ComfyUI LoRA folder before validation.")
+            lora_name = f"{name}.safetensors"
+            destination = config.COMFY_LORA_DIR / lora_name
+            if destination.exists():
+                raise ValueError(
+                    "A LoRA already uses this choice name. Use a new version name."
+                )
+            atomic_copy(source, destination)
+            if artifact_fingerprint(destination) != expected:
+                raise ValueError(
+                    "The checkpoint changed while being copied. Validation was not started."
+                )
+            print(f"[pipeline] Copied selected checkpoint -> {destination}")
+        elif lora_name:
             local_lora = Path(lora_name)
             if local_lora.is_file():
                 lora_name = _copy_lora_to_comfy(local_lora)
@@ -324,6 +372,7 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
         )
         validation_recovery = _write_validation_recovery(
             name=name,
+            training_project_name=training_project,
             state="validation_pending",
             lora_name=installed_lora_name,
             installed_lora_path=installed_lora_path,
@@ -388,6 +437,7 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
     outcome = {
         "schema_version": 3,
         "project_name": name,
+        "training_project_name": training_project,
         "attempt_id": attempt_id,
         "mode": outcome_mode,
         "result_path": str(result_path.resolve()),
@@ -422,6 +472,7 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
     if validation_recovery is not None:
         _write_validation_recovery(
             name=name,
+            training_project_name=training_project,
             state="complete",
             lora_name=installed_lora_name,
             installed_lora_path=Path(str(validation_recovery["installed_lora_path"])),
@@ -487,6 +538,21 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--skip-prep", action="store_true")
     ap.add_argument("--skip-train", action="store_true")
     ap.add_argument("--skip-validate", action="store_true")
+    ap.add_argument(
+        "--checkpoint-choice",
+        type=Path,
+        help="Saved training checkpoint to validate as a new version.",
+    )
+    ap.add_argument(
+        "--expected-lora-fingerprint",
+        default="",
+        help="Reviewed checkpoint content identity.",
+    )
+    ap.add_argument(
+        "--training-project",
+        default="",
+        help="Original training project for checkpoint comparison.",
+    )
     args = ap.parse_args(argv)
     try:
         run(args)

@@ -30,6 +30,7 @@ from . import config
 from .app_models import (
     AppSettings,
     ProjectDraft,
+    RunResult,
     TrainingPreset,
     ValidationRecovery,
 )
@@ -52,6 +53,7 @@ from .prepare_dataset import (
     prepared_output_manifest_issue,
     source_files_match_manifest,
 )
+from .training_checkpoints import TrainingCheckpoint, discover_training_checkpoints
 
 ReadinessState = Literal["ready", "warning", "error"]
 RunMode = Literal["full", "prepare", "validate"]
@@ -62,6 +64,15 @@ SourceIssueKind = Literal[
     "near_duplicate",
     "blurry",
 ]
+
+
+def _pipeline_program() -> str:
+    """Relaunch the shipped executable, or Python when running from source."""
+    if os.environ.get("MIVIM_PACKAGED_APP") == "1":
+        # Nuitka standalone points sys.executable at an absent python.exe in
+        # the distribution. argv[0] names the actual Studio executable.
+        return str(Path(sys.argv[0]).resolve())
+    return sys.executable
 
 
 class ReadinessActionKind(StrEnum):
@@ -328,6 +339,7 @@ class PipelineOutcome:
     checkpoint_path: Path | None = None
     checkpoint_fingerprint: str = ""
     starting_strength: float = 0.8
+    training_project_name: str = ""
 
 
 def _normalise_host(host: str) -> str:
@@ -1123,6 +1135,11 @@ class ApplicationService:
             starting_strength = float(raw_strength)
         return PipelineOutcome(
             project_name=project_name,
+            training_project_name=(
+                value.get("training_project_name", "")
+                if isinstance(value.get("training_project_name", ""), str)
+                else ""
+            ),
             mode=mode,
             result_path=Path(cast(str, fields["result_path"])),
             trigger=cast(str, fields["trigger"]),
@@ -1290,6 +1307,11 @@ class ApplicationService:
             seed = raw_seed
         return ValidationRecovery(
             project_name=project_name,
+            training_project_name=(
+                value.get("training_project_name", "")
+                if isinstance(value.get("training_project_name", ""), str)
+                else ""
+            ),
             state=cast(
                 Literal["validation_pending", "complete"],
                 string_fields["state"],
@@ -2629,7 +2651,7 @@ class ApplicationService:
             else self.project_path(settings.datasets_dir) / draft.project_name
         )
         return PipelineCommand(
-            sys.executable,
+            _pipeline_program(),
             tuple(args),
             environment,
             self.root,
@@ -2637,6 +2659,66 @@ class ApplicationService:
             expected,
             attempt_id,
         )
+
+    def build_checkpoint_validation_command(
+        self,
+        settings: AppSettings,
+        result: RunResult,
+        choice: TrainingCheckpoint,
+    ) -> tuple[ProjectDraft, PipelineCommand]:
+        """Validate a deliberate checkpoint choice in a fresh artifact namespace."""
+        project = result.training_project_name or result.project_name
+        config.validate_project_name(project)
+        folder = (self.project_path(settings.checkpoints_dir) / project).resolve()
+        if choice.path.parent.resolve() != folder:
+            raise ValueError(
+                "This checkpoint does not belong to the displayed training project."
+            )
+        if not any(
+            item == choice
+            for item in discover_training_checkpoints(folder.parent, project)
+        ):
+            raise ValueError(
+                "The checkpoint changed after review. Open the comparison again."
+            )
+        if (
+            result.mode != "full"
+            or settings.comfy_installation_id != result.comfy_installation_id
+            or settings.comfy_lora_dir is None
+            or result.installed_lora_path is None
+            or self.project_path(settings.comfy_lora_dir).resolve()
+            != result.installed_lora_path.parent.resolve()
+            or settings.training_base_model is None
+            or result.checkpoint_path is None
+            or self.project_path(settings.training_base_model).resolve()
+            != result.checkpoint_path.resolve()
+            or settings.comfy_checkpoint != result.checkpoint
+            or artifact_fingerprint(result.checkpoint_path)
+            != result.checkpoint_fingerprint
+        ):
+            raise ValueError(
+                "Reconnect the original ComfyUI installation and SDXL model before validating a checkpoint."
+            )
+        suffix = f"_step{choice.step}_{uuid.uuid4().hex[:12]}"
+        name = project[: config.MAX_PROJECT_NAME_LENGTH - len(suffix)] + suffix
+        draft = ProjectDraft(
+            project_name=name, trigger=result.trigger, preset=result.preset
+        )
+        command = self.build_validation_command(settings, draft, f"{name}.safetensors")
+        args = list(command.arguments)
+        offset = args.index("--lora")
+        del args[offset : offset + 2]
+        args.extend(
+            (
+                "--checkpoint-choice",
+                str(choice.path),
+                "--expected-lora-fingerprint",
+                choice.fingerprint,
+                "--training-project",
+                project,
+            )
+        )
+        return draft, replace(command, arguments=tuple(args))
 
     def build_validation_command(
         self,
@@ -2714,7 +2796,7 @@ class ApplicationService:
             self.project_path(settings.grids_dir) / f"{draft.project_name}_grid.png"
         )
         return PipelineCommand(
-            sys.executable,
+            _pipeline_program(),
             tuple(arguments),
             environment,
             self.root,

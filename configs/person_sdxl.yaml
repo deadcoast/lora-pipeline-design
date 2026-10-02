@@ -64,6 +64,7 @@ config:
       # ---- In-training preview samples (watch it learn!) ----
       sample:
         sampler: "ddpm"
+        neg: ""            # SDXL needs an empty string, not ai-toolkit's null default.
         sample_every: 250    # render preview images every N steps
         width: 1024
         height: 1024

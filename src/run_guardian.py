@@ -146,10 +146,13 @@ class RunLeaseBusyError(RunLeaseError):
             )
         else:
             detail = "."
-        super().__init__(
-            f"{subject}{detail} Wait for that run to finish, or close it safely, "
+        recovery = (
+            "Close the photo and caption review in the other Studio window, "
             "then try again."
+            if holder is not None and holder.mode == "caption-review"
+            else "Wait for that run to finish, or close it safely, then try again."
         )
+        super().__init__(f"{subject}{detail} {recovery}")
 
 
 class RunLeaseSelfConflictError(RunLeaseError):

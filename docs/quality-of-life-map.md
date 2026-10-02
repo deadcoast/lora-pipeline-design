@@ -16,12 +16,13 @@ acceptance checks.
 | Trainer | A CUDA-enabled-looking environment fails after training starts | Run a real CUDA kernel in the trainer's own Python; show GPU architecture and guided repair |
 | Source photos | Bad files are reported only as counts | Name and preview unreadable, small, blurry, duplicate, and likely near-duplicate files |
 | Exact copies | Users must manually clean harmless duplicates | Preserve originals and automatically prepare one copy |
-| Captions | A removed identity phrase silently ruins training | Require the phrase in every caption and offer to restore it automatically |
-| Prepared work | A failed later stage forces photo preparation again, or changed generated images are trusted silently | Validate the complete source set, requested description method, generated image identities, and editable caption pairs, then continue with `--skip-prep` |
+| Captions | A removed identity phrase ruins training, or another window edits captions during a run | Require the phrase and offer to restore it automatically; reserve the exact dataset throughout review, block conflicting preparation/training/editing, and explain which review to close |
+| Prepared work | A failed later stage forces photo preparation again, or changed and unrecorded images are trusted silently | Validate the complete source set, requested description method, every supported training image against the preparation record, and editable caption pairs, then continue with `--skip-prep`; block unmanaged photos during rebuild without deleting them |
 | Project names | Old checkpoints, grids, or LoRAs mix with a new run | Detect the whole project artifact namespace; require a new version name or explicit rebuild |
 | Guided recovery | A button opens the wrong screen or silently changes advanced settings | Bind every readiness label to one typed operation; save successful repairs and rerun checks; keep photo review, folder selection, storage cleanup, and workspace relocation distinct |
 | Long training | Progress appears frozen, another window mutates the same work, a killed Studio leaves GPU work behind, Stop affects another ComfyUI user, or OOM recovery silently discards work | Show elapsed/indeterminate progress and durable logs; hold OS project/resource/GPU leases; bind worker and trainer lifetimes to the Studio; recover durable owned prompts; target a running prompt only on ComfyUI 0.3.56+; require approval before Fast recovery rebuilds |
 | Validation | Users cannot compare against the unchanged model | Include a clearly labelled no-LoRA baseline and plain-language prompt/strength axes |
+| Checkpoint choice | The final training step is the only usable result | Compare earlier and final saved previews for the same prompt in Results; explicitly validate a selected checkpoint under a fresh version name, preserving the original result and exact selected weights through installation and validation recovery |
 | Failed validation | Restarting causes unnecessary retraining or regeneration | Persist the exact handoff; retry missing or corrupt cells only when the full signature, including both model content identities, matches |
 | Result handoff | Casual users do not know what to enter or build in ComfyUI | Export editable Workflow JSON v0.4, then add its exact bytes through ComfyUI's user-data API under **Workflows → MIVIM**; select the profile when necessary, use a content-fingerprinted filename so concurrent saves cannot overwrite each other, read the file back, and retain **Show JSON file** as a manual fallback |
 | Restored result | Large files freeze the UI or stale model bytes are trusted | Hash the LoRA and checkpoint in a worker; keep handoff actions disabled until the original Desktop context and exact bytes are verified |
@@ -78,6 +79,6 @@ not used.
 These items remain future work and are not represented as complete:
 
 - face-count and multi-person source-photo checks;
-- guided selection of the best intermediate training checkpoint;
+- automatic ranking of training checkpoints (manual preview comparison and validation of a selected checkpoint are implemented);
 - managed ai-toolkit installation and updates;
 - video, remote, and cloud training paths.

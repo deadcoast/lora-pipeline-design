@@ -326,6 +326,60 @@ def test_trainer_rejects_valid_image_bytes_replaced_after_review(
         train_module._validate_dataset_pairs(prepared)
 
 
+@pytest.mark.parametrize("filename", ["extra.png", "002.jpg", "holiday.WEBP"])
+def test_trainer_rejects_unrecorded_complete_pairs_before_writing_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    Image.new("RGB", (80, 40), "white").save(source / "photo.png")
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    prepared = prepare_dataset.prepare(source, "reviewed_v1", size=32)
+    assert train_module._validate_dataset_pairs(prepared) == 1
+    extra = prepared / filename
+    Image.new("RGB", (32, 16), "blue").save(extra)
+    extra.with_suffix(".txt").write_text("ohwx person, added photo\n", encoding="utf-8")
+    destination = tmp_path / "config.yaml"
+
+    with pytest.raises(
+        ValueError, match="not created by this preparation run"
+    ) as error:
+        train_module.materialize_config(
+            config.ROOT / "configs" / "person_sdxl.yaml",
+            run_name="reviewed_v1",
+            dataset_dir=prepared,
+            output_dir=tmp_path / "checkpoints",
+            destination=destination,
+        )
+
+    assert filename in str(error.value)
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("overwrite", [False, True])
+def test_prepare_preserves_unmanaged_images_and_refuses_to_mix_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overwrite: bool,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    Image.new("RGB", (80, 40), "white").save(source / "photo.png")
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    prepared = prepare_dataset.prepare(source, "reviewed_v1", size=32)
+    extra = prepared / "holiday.jpg"
+    Image.new("RGB", (32, 16), "blue").save(extra)
+    extra.with_suffix(".txt").write_text("ohwx person, added photo\n", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in prepared.iterdir()}
+
+    with pytest.raises(ValueError, match="holiday.jpg"):
+        prepare_dataset.prepare(source, "reviewed_v1", size=32, overwrite=overwrite)
+
+    assert {path.name: path.read_bytes() for path in prepared.iterdir()} == before
+
+
 def test_blip_loader_pins_the_model_revision(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

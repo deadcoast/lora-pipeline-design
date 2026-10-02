@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 from pytestqt.exceptions import TimeoutError as QtBotTimeout
 
-from src import __version__, app_service, dataset_review
+from src import __version__, app_service, config, dataset_review, prepare_dataset
 from src.app_models import (
     AppSettings,
     ProjectDraft,
@@ -36,6 +36,7 @@ from src.app_models import (
 )
 from src.app_service import ApplicationService, PipelineCommand
 from src.app_settings import load_settings, save_settings
+from src.checkpoint_review import CheckpointReviewDialog
 from src.comfy_client import (
     ComfyUserProfile,
     PromptCancellationResult,
@@ -53,6 +54,7 @@ from src.dataset_review import PreparedDatasetDialog
 from src.desktop import NAV_RESULTS, NAV_RUN, MainWindow, _build_parser
 from src.io_utils import artifact_fingerprint
 from src.photo_review import PhotoIssueDialog
+from src.training_checkpoints import TrainingCheckpoint
 
 
 class _OfflineLocalService(ApplicationService):
@@ -600,6 +602,84 @@ def test_background_setup_failure_is_saved_for_recovery(
     assert opened == [tmp_path / "logs"]
 
 
+def test_unrecorded_prepared_photo_blocks_reuse_and_offers_a_new_version(
+    qtbot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(False, None, (), (), "offline"),
+    )
+    photos = tmp_path / "photos"
+    _write_training_photos(photos)
+    datasets = tmp_path / "datasets"
+    monkeypatch.setattr(config, "DATASETS_DIR", datasets)
+    prepared = prepare_dataset.prepare(photos, "added_photo_v1", trigger="ohwx person")
+    extra = prepared / "holiday.jpg"
+    Image.new("RGB", (128, 128), "blue").save(extra)
+    extra.with_suffix(".txt").write_text("ohwx person, added photo\n", encoding="utf-8")
+    before = {path.name: path.read_bytes() for path in prepared.iterdir()}
+    window = MainWindow(
+        settings=AppSettings(
+            comfy_checkpoint="",
+            datasets_dir=datasets,
+            checkpoints_dir=tmp_path / "checkpoints",
+            grids_dir=tmp_path / "grids",
+            run_configs_dir=tmp_path / "configs",
+        ),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=Path(__file__).resolve().parents[1]),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    qtbot.mouseClick(
+        window.findChild(QPushButton, "continueToProjectButton"),
+        Qt.MouseButton.LeftButton,
+    )
+    window.photo_drop.set_folder(photos)
+    window.project_name_edit.setText("added_photo_v1")
+    window.trigger_edit.setText("ohwx person")
+    qtbot.mouseClick(
+        window.findChild(QPushButton, "reviewSetupButton"),
+        Qt.MouseButton.LeftButton,
+    )
+    qtbot.waitUntil(lambda: window.readiness_report is not None, timeout=10_000)
+    assert window.readiness_report is not None
+    assert window.readiness_report.prepared is not None
+    assert not window.readiness_report.prepared.ready
+    collision = next(
+        item for item in window.readiness_report.items if item.code == "collision"
+    )
+    assert collision.state == "error"
+    assert "holiday.jpg was not created by this preparation run" in collision.detail
+    assert not window.start_button.isEnabled()
+    assert window.pipeline_process is None
+    with pytest.raises(ValueError, match="holiday.jpg"):
+        window.service.build_command(
+            window._collect_settings(), window._build_draft(), mode="full"
+        )
+
+    repair = next(
+        button
+        for button in window.diagnostics_widget.findChildren(QPushButton)
+        if button.text() == "Use the next version name"
+    )
+    qtbot.mouseClick(repair, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(
+        lambda: (
+            window.readiness_report is not None
+            and window.project_name_edit.text() == "added_photo_v2"
+            and window.prepare_button.isEnabled()
+        ),
+        timeout=10_000,
+    )
+    assert {path.name: path.read_bytes() for path in prepared.iterdir()} == before
+    assert window.pipeline_process is None
+
+
 def test_invalid_prepared_pairs_disable_start_before_qprocess(
     qtbot,
     tmp_path: Path,
@@ -1021,7 +1101,13 @@ def test_typed_external_and_trainer_repairs_keep_their_action_contracts(
 def test_offline_model_hint_explains_how_to_load_the_real_model_list(
     qtbot,
     tmp_path: Path,
+    monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        app_service,
+        "probe_comfy_api",
+        lambda *_args, **_kwargs: ComfyApiStatus(False, None, (), (), "offline"),
+    )
     window = MainWindow(
         settings=AppSettings(),
         settings_path=tmp_path / "settings.json",
@@ -3388,3 +3474,93 @@ def test_unexpected_recovery_verifier_output_never_enables_retry(
     assert window.pipeline_command is None
     assert not window.retry_validation_button.isEnabled()
     assert "unexpected result" in window.run_detail_label.text()
+
+
+def test_checkpoint_comparison_shows_same_prompt_and_selects_earlier_weights(
+    qtbot, tmp_path: Path
+) -> None:
+    earlier = tmp_path / "earlier.jpg"
+    final = tmp_path / "final.jpg"
+    Image.new("RGB", (256, 512), "red").save(earlier)
+    Image.new("RGB", (256, 512), "blue").save(final)
+    choices = (
+        TrainingCheckpoint(
+            tmp_path / "early.safetensors", 250, False, "a", ((0, earlier),)
+        ),
+        TrainingCheckpoint(
+            tmp_path / "final.safetensors", 500, True, "b", ((0, final), (1, final))
+        ),
+    )
+    dialog = CheckpointReviewDialog(choices)
+    qtbot.addWidget(dialog)
+    dialog.show()
+    qtbot.waitExposed(dialog)
+    assert dialog.selected_checkpoint == choices[0]
+    assert dialog.reference_combo.currentIndex() == 1
+    assert dialog.images[0].pixmap().toImage().pixelColor(5, 5).blue() > 200
+    assert dialog.images[1].pixmap().toImage().pixelColor(5, 5).red() > 200
+    dialog.prompt_combo.setCurrentIndex(1)
+    assert "No saved preview" in dialog.images[1].text()
+    qtbot.mouseClick(dialog.validate_button, Qt.MouseButton.LeftButton)
+    assert dialog.result() == CheckpointReviewDialog.DialogCode.Accepted
+    assert dialog.selected_checkpoint.path.name == "early.safetensors"
+
+
+def test_results_checkpoint_action_launches_selected_validation_and_saves_recovery_project(
+    qtbot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    _wait_for_initial_setup(qtbot, window)
+    record = RunResult(
+        project_name="person",
+        mode="full",
+        result_path=tmp_path / "grid.png",
+        completed_at="now",
+        trigger="ohwx person",
+        preset=TrainingPreset.BALANCED,
+    )
+    Image.new("RGB", (32, 32)).save(record.result_path)
+    window._show_result(record.result_path, record)
+    window.pages.setCurrentIndex(NAV_RESULTS)
+    window.show()
+    choice = TrainingCheckpoint(
+        tmp_path / "early.safetensors", 250, False, "identity", ()
+    )
+    draft = ProjectDraft(project_name="person_step250_version", trigger=record.trigger)
+    command = _script_pipeline_command(tmp_path, "pass")
+    command = replace(command, mode="validate")
+    captured: list[tuple[PipelineCommand, str]] = []
+    monkeypatch.setattr(
+        "src.desktop.discover_training_checkpoints", lambda *_args: (choice,)
+    )
+    monkeypatch.setattr(
+        CheckpointReviewDialog,
+        "exec",
+        lambda _self: CheckpointReviewDialog.DialogCode.Accepted,
+    )
+    monkeypatch.setattr(window, "_result_comfy_context_issue", lambda _record: None)
+    monkeypatch.setattr(
+        window.service,
+        "build_checkpoint_validation_command",
+        lambda _settings, _record, selected: (
+            (draft, command) if selected == choice else pytest.fail("wrong choice")
+        ),
+    )
+    monkeypatch.setattr(
+        window,
+        "_launch_pipeline_command",
+        lambda cmd, label: captured.append((cmd, label)),
+    )
+    assert window.compare_checkpoints_button.isVisible()
+    qtbot.mouseClick(window.compare_checkpoints_button, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: bool(captured), timeout=5000)
+    assert captured == [(command, "Validating training step 250")]
+    assert window._validated_draft == draft
+    assert (
+        load_settings(window.settings_path).last_project.project_name
+        == draft.project_name
+    )

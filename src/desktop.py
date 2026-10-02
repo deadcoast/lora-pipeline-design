@@ -100,6 +100,7 @@ from .app_settings import (
     save_settings,
     with_user_storage_defaults,
 )
+from .checkpoint_review import CheckpointReviewDialog
 from .comfy_client import (
     ComfyClient,
     ComfyUserProfile,
@@ -118,7 +119,9 @@ from .process_control import (
     DESKTOP_OWNER_MUTEX_ENV,
     DesktopOwnerLifetime,
 )
+from .run_guardian import RunLeaseBusyError, RunLeaseError, pipeline_run_guard
 from .studio_logging import StudioLog, log_directory_for
+from .training_checkpoints import TrainingCheckpoint, discover_training_checkpoints
 
 NAV_SETUP, NAV_PROJECT, NAV_RUN, NAV_RESULTS = range(4)
 RunFailureKind = Literal[
@@ -1152,6 +1155,13 @@ class MainWindow(QMainWindow):
         result_header.addWidget(self.result_title_label)
         result_header.addWidget(self.result_subtitle_label)
         page.addLayout(result_header)
+        self.compare_checkpoints_button = _button("Compare training checkpoints")
+        self.compare_checkpoints_button.setObjectName("compareCheckpointsButton")
+        self.compare_checkpoints_button.clicked.connect(
+            self.compare_training_checkpoints
+        )
+        self.compare_checkpoints_button.setVisible(False)
+        page.addWidget(self.compare_checkpoints_button, 0, Qt.AlignmentFlag.AlignLeft)
         result_card = _card()
         result_layout = QVBoxLayout(result_card)
         result_layout.setContentsMargins(18, 18, 18, 18)
@@ -3086,7 +3096,11 @@ class MainWindow(QMainWindow):
         self._result_before = _artifact_snapshot(command.expected_result)
         self.studio_log.info(
             "pipeline.started",
-            (f"mode={command.mode}; expected_result={command.expected_result}"),
+            (
+                f"mode={command.mode}; program={command.program}; "
+                f"cwd={command.working_directory}; "
+                f"expected_result={command.expected_result}"
+            ),
         )
         self.pages.setCurrentIndex(NAV_RUN)
         for position, button in enumerate(self.nav_buttons):
@@ -3947,6 +3961,15 @@ class MainWindow(QMainWindow):
                 strengths=(recovery.strengths if recovery is not None else None),
                 seed=(recovery.seed if recovery is not None else 42),
             )
+            if recovery is not None and recovery.training_project_name:
+                command = replace(
+                    command,
+                    arguments=(
+                        *command.arguments,
+                        "--training-project",
+                        recovery.training_project_name,
+                    ),
+                )
         except (TypeError, ValueError) as exc:
             self.retry_validation_button.setEnabled(True)
             self._show_error("Validation could not start", str(exc))
@@ -4017,6 +4040,14 @@ class MainWindow(QMainWindow):
             mismatches.append("trigger phrase")
         if outcome.preset != draft.preset.value:
             mismatches.append("training plan")
+        if "--training-project" in command.arguments:
+            parent_index = command.arguments.index("--training-project") + 1
+            if outcome.training_project_name != command.arguments[parent_index]:
+                mismatches.append("original training project")
+        if "--expected-lora-fingerprint" in command.arguments:
+            choice_index = command.arguments.index("--expected-lora-fingerprint") + 1
+            if outcome.lora_fingerprint != command.arguments[choice_index]:
+                mismatches.append("selected training checkpoint")
         if expected_checkpoint and outcome.checkpoint != expected_checkpoint:
             mismatches.append("checkpoint")
         if command.mode != "prepare" and (
@@ -4118,6 +4149,7 @@ class MainWindow(QMainWindow):
         )
         record = RunResult(
             project_name=draft.project_name,
+            training_project_name=outcome.training_project_name,
             mode=mode,
             result_path=command.expected_result,
             completed_at=outcome.completed_at,
@@ -4178,6 +4210,9 @@ class MainWindow(QMainWindow):
         self.result_path_label.setText(str(result))
         self.result_path_label.setCursorPosition(0)
         self.result_image.clear_source_pixmap()
+        self.compare_checkpoints_button.setVisible(
+            record is not None and record.mode == "full"
+        )
         self.result_image.setStyleSheet("")
         self.comfy_handoff_card.setVisible(False)
         self.review_prepared_button.setVisible(False)
@@ -4258,6 +4293,112 @@ class MainWindow(QMainWindow):
         else:
             self.result_image.setText("The result is ready.")
 
+    def compare_training_checkpoints(self) -> None:
+        record = self._displayed_result_record
+        if record is None or record.mode != "full":
+            return
+        settings = self._collect_settings()
+        self.compare_checkpoints_button.setEnabled(False)
+
+        def failed(message: str) -> None:
+            self.compare_checkpoints_button.setEnabled(True)
+            self._show_error("Checkpoint comparison could not open", message)
+
+        def show_choices(value: object) -> None:
+            self.compare_checkpoints_button.setEnabled(True)
+            if (
+                self._displayed_result_record != record
+                or self._collect_settings() != settings
+            ):
+                return
+            choices = cast(tuple[TrainingCheckpoint, ...], value)
+            if not choices:
+                failed(
+                    "No readable checkpoints remain in this project's training folder. The completed validation result is still available."
+                )
+                return
+            dialog = CheckpointReviewDialog(choices, self)
+            try:
+                if dialog.exec() == CheckpointReviewDialog.DialogCode.Accepted:
+                    self._validate_checkpoint_choice(
+                        record, settings, dialog.selected_checkpoint
+                    )
+            finally:
+                dialog.deleteLater()
+
+        self._run_worker(
+            lambda: discover_training_checkpoints(
+                self.service.project_path(settings.checkpoints_dir),
+                record.training_project_name or record.project_name,
+            ),
+            show_choices,
+            failed,
+            operation="checkpoints.discover",
+        )
+
+    def _validate_checkpoint_choice(
+        self, record: RunResult, settings: AppSettings, choice: TrainingCheckpoint
+    ) -> None:
+        issue = self._result_comfy_context_issue(record)
+        if issue is not None:
+            self._show_error("Reconnect before validating", issue)
+            return
+        self.compare_checkpoints_button.setEnabled(False)
+        self.result_subtitle_label.setText(
+            f"Checking {choice.label.lower()} before validation…"
+        )
+
+        def failed(message: str) -> None:
+            self.compare_checkpoints_button.setEnabled(True)
+            self.result_subtitle_label.setText(
+                "Checkpoint validation could not start. Your existing result is still available."
+            )
+            self._show_error("Checkpoint validation could not start", message)
+
+        def launch(value: object) -> None:
+            self.compare_checkpoints_button.setEnabled(True)
+            if (
+                self._displayed_result_record != record
+                or self._collect_settings() != settings
+            ):
+                return
+            issue = self._result_comfy_context_issue(record)
+            if issue is not None:
+                failed(issue)
+                return
+            if (
+                self.pipeline_process is not None
+                and self.pipeline_process.state() != QProcess.ProcessState.NotRunning
+            ):
+                failed(
+                    "Another run is active. Wait for it to finish before validating this checkpoint."
+                )
+                return
+            draft, command = cast(tuple[ProjectDraft, PipelineCommand], value)
+            self.settings = replace(settings, last_project=draft)
+            self.draft = draft
+            self._populate_last_project()
+            self._validated_draft = draft
+            self._validated_settings = self._collect_settings()
+            try:
+                save_settings(self.settings, self.settings_path)
+            except OSError as exc:
+                failed(str(exc))
+                return
+            self._installed_lora_name = None
+            self._launch_pipeline_command(
+                command, f"Validating training step {choice.step:,}"
+            )
+
+        self._run_worker(
+            lambda: self.service.build_checkpoint_validation_command(
+                settings, record, choice
+            ),
+            launch,
+            failed,
+            operation="checkpoints.validate",
+        )
+
     def review_prepared_dataset(self) -> None:
         draft = self.draft or self.settings.last_project
         record = (
@@ -4289,8 +4430,24 @@ class MainWindow(QMainWindow):
                 "editing prepared captions.",
             )
             return
-        PreparedDatasetDialog(result, required_trigger, self).exec()
-        self._invalidate_readiness()
+        try:
+            # Own the displayed dataset before reading any of its pairs. Keep
+            # that ownership through edits, save prompts, and the final close,
+            # so another Studio or CLI run cannot train on changing captions.
+            with pipeline_run_guard(
+                project=result.name,
+                workspace=result.parent,
+                mode="caption-review",
+                use_accelerator=False,
+                resource_paths=(result,),
+            ):
+                PreparedDatasetDialog(result, required_trigger, self).exec()
+        except RunLeaseBusyError as exc:
+            self._show_error("Prepared photos are in use", str(exc))
+        except (RunLeaseError, OSError) as exc:
+            self._show_error("Prepared photos could not be opened", str(exc))
+        finally:
+            self._invalidate_readiness()
 
     def continue_prepared_training(self) -> None:
         record = self._displayed_result_record
