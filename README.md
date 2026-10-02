@@ -365,22 +365,22 @@ PySide6 desktop
 
 Important source files:
 
-| File                    | Responsibility                                         |
-|-------------------------|--------------------------------------------------------|
-| `src/desktop.py`        | Guided UI, background process, cancellation, results   |
-| `src/dataset_review.py` | Prepared-photo preview and atomic caption editing      |
-| `src/photo_review.py`   | Filename-level source quality review                   |
-| `src/app_service.py`    | Readiness, source review, command construction         |
-| `src/app_models.py`     | Typed UI-independent settings and project state        |
-| `src/app_settings.py`   | Atomic per-user persistence                            |
-| `src/studio_logging.py` | Local rotating setup, recovery, and pipeline logs      |
-| `src/comfy_desktop.py`  | Desktop 2/legacy discovery and live API models         |
-| `src/run_guardian.py`   | Cross-process project, resource, and accelerator leases |
+| File                     | Responsibility                                          |
+|--------------------------|---------------------------------------------------------|
+| `src/desktop.py`         | Guided UI, background process, cancellation, results    |
+| `src/dataset_review.py`  | Prepared-photo preview and atomic caption editing       |
+| `src/photo_review.py`    | Filename-level source quality review                    |
+| `src/app_service.py`     | Readiness, source review, command construction          |
+| `src/app_models.py`      | Typed UI-independent settings and project state         |
+| `src/app_settings.py`    | Atomic per-user persistence                             |
+| `src/studio_logging.py`  | Local rotating setup, recovery, and pipeline logs       |
+| `src/comfy_desktop.py`   | Desktop 2/legacy discovery and live API models          |
+| `src/run_guardian.py`    | Cross-process project, resource, and accelerator leases |
 | `src/process_control.py` | Studio/worker/trainer crash-lifetime ownership          |
-| `src/comfy_activity.py` | Durable ownership of remotely queued ComfyUI prompts     |
-| `src/pipeline.py`       | Preparation → training → installation → validation     |
-| `src/train.py`          | Concrete ai-toolkit config and real preset overrides   |
-| `src/comfy_client.py`   | ComfyUI prompt/WebSocket/history client                |
+| `src/comfy_activity.py`  | Durable ownership of remotely queued ComfyUI prompts    |
+| `src/pipeline.py`        | Preparation → training → installation → validation      |
+| `src/train.py`           | Concrete ai-toolkit config and real preset overrides    |
+| `src/comfy_client.py`    | ComfyUI prompt/WebSocket/history client                 |
 
 ## Deliberate current limits
 
