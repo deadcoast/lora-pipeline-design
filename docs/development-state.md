@@ -234,3 +234,45 @@ The next useful feature gaps are automatic anime tagging and editable preview
 prompt sets. Existing source imports and the four built-in shots do not imply
 those features are already present. Actual NoobAI training quality still needs
 a run with model weights and visual review of its saved checkpoints.
+
+## Automatic anime tagging delivered — 2026-10-11, 0.8.0
+
+NoobAI Epsilon and V-pred projects now enable automatic anime tagging by
+default. Preparation imports existing captions and runs WD ViT v3 locally on
+uncaptioned images. The core app includes ONNX Runtime and NumPy, including in
+the Windows distribution. The model and vocabulary download once into the
+user's MIVIM cache; images stay local. General tags are prepended with the
+project trigger and remain editable through the existing caption editor.
+
+The Project checkbox persists its opt-out, and the run view shows download and
+image progress. Both CLI preparation entry points support `--caption-mode`;
+NoobAI defaults to anime, and explicit `--vision` retains BLIP compatibility.
+The existing preparation record identifies the real tagger revision and threshold.
+
+Real inference used the publisher's example illustration and the downloaded
+WD ViT v3 v2.0 ONNX weights. The packaged app's normal Prepare flow generated
+tags for that illustration and preserved a second image's authored caption.
+The final rebuilt executable's worker repeated this successfully, producing
+28 tags including hair, shirt, necktie, jacket, and pose descriptors. A separate
+fresh source process repeated inference with downloads disabled and cached
+weights. This is actual tagger execution, not a model stub or mocked output.
+
+Existing source checks: 326 passed, three packaged cases deselected. Final
+package checks: four passed. Ruff, Mypy, Pyright, wheel build and whitespace
+checks passed. The native Project form was inspected at 1040×740 with its
+tagging control and actions visible. An offscreen Qt capture could not load
+Windows fonts and was discarded as visual evidence; native capture succeeded.
+An earlier source-check process stalled without output and was interrupted;
+the fresh diagnostic run completed in 26.95 seconds.
+
+- Executable: `dist/anime-tags-0.8.0-final/MIVIMLoRAStudio.dist/MIVIMLoRAStudio.exe`.
+- SHA-256: `494D679809D44322C48444AA3C6991681357EEA88CA4EC3F9EC2C1194E1AC13F`.
+- Feature evidence: `dist/anime-tags-desktop/feature-results.json` and
+  `dist/anime-tags-desktop/final-worker.log`.
+- Source/model evidence: `dist/anime-tagger-live.log`,
+  `dist/anime-tags-desktop/cli.log`, and `dist/anime-tags-diagnostic.log`.
+- Final package checks: `dist/anime-tags-final-package.log`.
+- UI: `dist/anime-tags-project.png`, `dist/anime-tags-project-minimum-native.png`.
+
+Automatic tagging is shipped. User-editable preview sets remain future work;
+NoobAI LoRA generation quality still requires its own training run and review.

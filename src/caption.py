@@ -18,9 +18,11 @@ CAPTION_MODES = ("auto", "anime", "template", "blip")
 def resolve_caption_mode(mode: str, model_profile: str, *, vision: bool = False) -> str:
     if mode != "auto":
         return mode
+    if vision:
+        return "blip"
     if model_profile != "sdxl":
         return "anime"
-    return "blip" if vision else "template"
+    return "template"
 
 
 def caption_contains_trigger(caption: str, trigger: str) -> bool:
