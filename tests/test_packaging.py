@@ -13,7 +13,12 @@ from src.app_settings import save_settings
 from src.io_utils import artifact_fingerprint
 
 REPOSITORY = Path(__file__).resolve().parents[1]
-PACKAGED_APP = REPOSITORY / "dist" / "MIVIMLoRAStudio.dist" / "MIVIMLoRAStudio.exe"
+PACKAGED_APP = Path(
+    os.environ.get(
+        "MIVIM_TEST_PACKAGED_APP",
+        str(REPOSITORY / "dist" / "MIVIMLoRAStudio.dist" / "MIVIMLoRAStudio.exe"),
+    )
+)
 
 
 def test_windows_icon_is_a_real_multiresolution_ico(tmp_path: Path) -> None:
@@ -44,6 +49,7 @@ def test_built_windows_package_prepares_photos_through_its_native_ui(
     originals = {path.name: path.read_bytes() for path in photos.iterdir()}
     settings_path = save_settings(
         AppSettings(
+            model_profile="noobai-xl-vpred",
             datasets_dir=tmp_path / "datasets",
             checkpoints_dir=tmp_path / "checkpoints",
             grids_dir=tmp_path / "grids",
@@ -93,6 +99,8 @@ def test_built_windows_package_prepares_photos_through_its_native_ui(
     assert {path.name: path.read_bytes() for path in photos.iterdir()} == originals
     saved = json.loads(settings_path.read_text(encoding="utf-8"))
     assert saved["last_result"]["mode"] == "prepare"
+    assert saved["model_profile"] == "noobai-xl-vpred"
+    assert saved["last_result"]["model_profile"] == "noobai-xl-vpred"
     assert Path(saved["last_result"]["result_path"]) == prepared
 
 
@@ -100,8 +108,10 @@ def test_built_windows_package_prepares_photos_through_its_native_ui(
     not PACKAGED_APP.is_file(),
     reason="Build the Windows package before running packaged UI acceptance.",
 )
+@pytest.mark.parametrize("model_profile", ["sdxl", "noobai-xl-vpred"])
 def test_built_windows_package_renders_the_real_result_handoff(
     tmp_path: Path,
+    model_profile: str,
 ) -> None:
     grid = tmp_path / "portrait_grid.png"
     Image.new("RGB", (960, 540), "#29466f").save(grid)
@@ -118,6 +128,7 @@ def test_built_windows_package_renders_the_real_result_handoff(
     installation_id = "packaged-desktop"
     installation_name = "Packaged Acceptance Desktop"
     record = RunResult(
+        model_profile=model_profile,
         project_name="portrait_v1",
         mode="full",
         result_path=grid,
@@ -139,6 +150,7 @@ def test_built_windows_package_renders_the_real_result_handoff(
     )
     settings_path = save_settings(
         AppSettings(
+            model_profile=model_profile,
             comfy_installation_id=installation_id,
             comfy_lora_dir=lora.parent,
             comfy_checkpoint=checkpoint.name,

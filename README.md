@@ -78,10 +78,11 @@ instead of pretending it started one.
 
 Connect includes separate **NoobAI-XL · Epsilon-pred** and **NoobAI-XL · V-pred**
 profiles alongside standard SDXL. The selection controls training configuration,
-validation, and the editable ComfyUI workflow. V-pred training is blocked on
-ai-toolkit versions with an incompatible velocity-target implementation;
-validation-only CLI use remains available. See [model support and the research
-corrections](docs/model-support.md) for verified releases and acceptance limits.
+validation, and the editable ComfyUI workflow. The V-pred launcher corrects the
+known ai-toolkit image-target bug in the trainer process and applies its required
+noise schedule. Unrecognized trainer implementations remain blocked. See
+[model support and the research corrections](docs/model-support.md) for verified
+releases and acceptance limits.
 
 ### New project
 
@@ -328,6 +329,9 @@ Build a standalone Windows application with Qt's official deployment tool:
 .\scripts\build_windows.ps1
 ```
 
+Use `-OutputDirectory dist/noobai-0.6.1` to build into a separate directory
+while preserving an existing package.
+
 The build exports the runtime and deployment tools from the checked-in
 `uv.lock`, verifies package hashes, and synchronizes the private
 `.venv-deploy` before packaging. Run `uv lock` and commit the updated lockfile
@@ -341,9 +345,10 @@ worker, so it does not depend on a system Python interpreter after deployment.
 Distribute the complete `dist\MIVIMLoRAStudio.dist` folder, not the executable
 by itself.
 
-After building, `uv run pytest tests/test_packaging.py -q` checks the package,
+After building, `uv run python -m pytest tests/test_packaging.py -q` checks the package,
 including native Windows UI actions that start its real photo-preparation
-worker. This acceptance test requires a Windows desktop.
+worker. This acceptance test requires a Windows desktop. For a separate build,
+set `MIVIM_TEST_PACKAGED_APP` to its full executable path before running the tests.
 
 The script permits unsigned local test builds but prints a release warning.
 Before publishing the folder to casual users, Authenticode-sign

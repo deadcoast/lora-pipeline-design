@@ -15,7 +15,7 @@ Training and validation continue to use the same local checkpoint.
 | --- | --- | --- | --- |
 | SDXL · Standard | Existing SDXL path | Existing sampler and schedule | Existing behavior |
 | NoobAI-XL · Epsilon-pred | [Laxhar 1.1](https://huggingface.co/Laxhar/noobai-XL-1.1) | Explicit Epsilon prediction; Euler ancestral, normal schedule, 28 steps, CFG 5.5 | SDXL LoRA configuration; DDPM training and Euler ancestral previews |
-| NoobAI-XL · V-pred | [Laxhar V-pred 1.0](https://huggingface.co/Laxhar/noobai-XL-Vpred-1.0) | Explicit V-prediction and zero-terminal-SNR; Euler, normal schedule, 30 steps, CFG 4.5 | Requires a compatible ai-toolkit latent-target implementation; the inspected local/upstream implementation is blocked |
+| NoobAI-XL · V-pred | [Laxhar V-pred 1.0](https://huggingface.co/Laxhar/noobai-XL-Vpred-1.0) | Explicit V-prediction and zero-terminal-SNR; Euler, normal schedule, 30 steps, CFG 4.5 | DDPM training and Euler previews; isolated adapter corrects the known image-target bug |
 
 The upstream Epsilon card recommends Euler ancestral, 25–30 steps and CFG 5–6.
 The V-pred card instead recommends Euler, 28–35 steps and CFG 4–5, and its
@@ -41,24 +41,28 @@ The CLI exposes the same selection through `--model-profile` on `src.pipeline`,
 `sdxl`, `noobai-xl-epsilon`, and `noobai-xl-vpred`. NoobAI training also requires
 `--base-model` pointing to the selected local checkpoint.
 
-### V-pred trainer limitation
+### V-pred trainer correction
 
 The inspected [ai-toolkit trainer](https://github.com/ostris/ai-toolkit/blob/main/extensions_built_in/sd_trainer/SDTrainer.py)
 passes `batch.tensor` to its V-pred velocity target. Its
 [batch loader](https://github.com/ostris/ai-toolkit/blob/main/toolkit/data_transfer_object/data_loader.py)
 uses that field for image pixels and leaves it absent with cached latents.
-Studio detects this implementation and blocks full V-pred runs before preparing
-photos or launching the trainer. Unknown target implementations also fail closed.
-Selecting a different profile is only correct when the checkpoint changes to
-match; relabeling V-pred weights as Epsilon is not a repair.
+The target must use encoded latents; the [Diffusers SDXL training example](https://github.com/huggingface/diffusers/blob/main/examples/text_to_image/train_text_to_image_sdxl.py)
+uses that input for its velocity target. Studio recognizes the exact upstream
+V-pred assignment and replaces only its `batch.tensor` argument with
+`batch.latents` through an in-memory import adapter. An already corrected
+assignment is also accepted. Other velocity calls and loss branches are left
+intact. Unknown control flow or arguments remain blocked before preparation.
 
-For a compatible trainer using `batch.latents`, the isolated V-pred launcher
-patches ai-toolkit's scheduler factory in that child process to enable
+The child checks the trainer file's SHA-256 against the inspected bytes before
+executing it. A changed checkout requires another setup check. The loader never
+reads or writes that module's bytecode cache, and no external source is edited.
+The same isolated launcher patches ai-toolkit's scheduler factory to enable
 zero-terminal-SNR for both DDPM training and Euler previews. It checks prediction
-type, schedule support, and DDPM's terminal alpha before model loading. It never
-edits the external checkout. This compatibility check is not a substitute for
-GPU training qualification. Validation-only CLI runs remain available without
-the trainer.
+type, schedule support, and DDPM's terminal alpha before model loading. These
+checks are not a substitute for training qualification with actual weights.
+Validation-only CLI runs remain available without the trainer. Relabeling
+V-pred weights as Epsilon is not a repair.
 
 ## Corrections to the older model notes
 
@@ -84,22 +88,50 @@ most popular releases in every hosting catalog.
 
 Source tests cover profile persistence, keyboard selection, readiness
 invalidation, prediction/sampler consistency, editable workflow round-trips,
-cache separation, recovery binding, and incompatible trainer rejection.
-The final source suite passed **318 tests**, with **2 tests of existing Windows
-binaries deselected**. Ruff lint/format, Mypy, Pyright, and `git diff --check`
-passed. A wheel was built under `dist/noobai-wheel`. Native Windows Qt captures
-of Connect, the open profile popup, and the sibling Project page are retained
-as `dist/noobai-connect.png`, `dist/noobai-popup.png`, and
-`dist/noobai-project.png`. The static UI audit found no violations; the native
-captures and keyboard test provide the actual desktop interaction evidence.
+cache separation, recovery binding, trainer rejection, and the isolated target
+correction. The adapter tests cover both upstream and already corrected targets,
+cached and uncached inputs, unchanged Epsilon behavior, source drift rejection,
+and preservation of the trainer file and bytecode cache. A regression also
+confirms that checkpoint filename hints ignore parent directory names.
 
-The installed ai-toolkit scheduler probe successfully constructed actual DDPM
-and Euler V-pred schedulers with zero-terminal-SNR before showing `run.py --help`.
-That probe did not load NoobAI weights or train a LoRA.
+The corrected source suite passed **324 tests** (the then-current **2 packaged
+UI tests were deselected**). The rebuilt **0.6.1** executable subsequently passed
+**4 packaging tests**: icon validity, native photo preparation retaining a V-pred
+profile, and result handoff for both standard SDXL and V-pred. The latter uses
+fixture images and model files; it proves the packaged UI/schema path, not model
+generation. Ruff lint/format, Mypy, Pyright, and whitespace checks passed.
 
-Live NoobAI GPU training, ComfyUI image generation, visual quality, and a rebuilt
-Windows executable remain unqualified. An initial suite invocation accidentally
-included the old packaged-result test: the existing executable rejected the new
-settings schema. That failure is retained as a package-version boundary, not
-counted as a passing package test. Use the updated source application until a
-new Windows build is qualified.
+Package: `dist/noobai-0.6.1/MIVIMLoRAStudio.dist/MIVIMLoRAStudio.exe`.
+Distribute its entire sibling folder. The earlier package remains in place.
+Executable SHA-256:
+`FA1D727B7F10F73C62661D691BB125A247718E04B064E9C51BCECD9CA53948DF`.
+The matching wheel is
+`dist/noobai-0.6.1/lora_pipeline_design-0.6.1-py3-none-any.whl`.
+The build launcher now uses the deployment interpreter directly, avoiding stale
+console-launcher paths after a repository move. Logs are retained at
+`dist/noobai-corrections-source-tests.log`,
+`dist/noobai-corrections-package-profiles.log`, and
+`dist/noobai-0.6.1-build-retry.log`. Native result screenshots are in
+`dist/noobai-corrections-package-profiles`; the earlier Connect/profile popup/
+Project captures remain at `dist/noobai-*.png`.
+
+`scripts/verify_vpred_trainer.py` exercised the installed ai-toolkit's real loss
+method and DDPM/Euler schedulers on synthetic CPU tensors, at checkout revision
+`e65c4d0fb69251e692390574c49873297dc4bae5`. The original cached
+V-pred path raised `AttributeError: 'NoneType' object has no attribute 'device'`.
+The corrected loss and backward gradients matched the analytical target for
+cached and uncached V-pred and Epsilon inputs, including the terminal timestep.
+Evidence: `dist/noobai-vpred-numerical.log`. Reproduce with:
+
+```powershell
+uv run python -m scripts.verify_vpred_trainer `
+  --toolkit dist/acceptance-tools/ai-toolkit `
+  --python dist/acceptance-tools/ai-toolkit/.venv/Scripts/python.exe
+```
+
+Live NoobAI training with actual weights, ComfyUI image generation, and visual
+quality remain unqualified. No model weights were downloaded for these checks.
+The initial old-executable handoff failure on the new settings schema is
+preserved as historical evidence; the new executable passes that acceptance
+case. An initial rebuild also failed on the moved environment's stale launcher;
+`dist/noobai-0.6.1-build.log` retains that failure before the launcher repair.

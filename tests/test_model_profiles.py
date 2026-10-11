@@ -16,8 +16,29 @@ from src import config, pipeline, train, validate
 from src.app_models import AppSettings, ProjectDraft, TrainingPreset
 from src.app_service import ApplicationService
 from src.app_settings import load_settings, save_settings
-from src.model_profiles import MODEL_PROFILE_IDS, model_profile, training_profile_issue
-from src.toolkit_vpred import VPRED_RUNNER
+from src.model_profiles import (
+    MODEL_PROFILE_IDS,
+    model_profile,
+    profile_checkpoint_issue,
+    training_profile_issue,
+)
+from src.toolkit_vpred import TRAINER_SOURCE, vpred_runner
+
+
+def _trainer_source(tmp_path: Path, target: str) -> Path:
+    source = tmp_path / TRAINER_SOURCE
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(
+        "class SDTrainer:\n"
+        "    def calculate_loss(self, batch, noise, timesteps):\n"
+        "        if self.sd.prediction_type == 'v_prediction':\n"
+        f"            target = self.sd.noise_scheduler.get_velocity(batch.{target}, noise, timesteps)\n"
+        "        else:\n"
+        "            target = noise\n"
+        "        return target\n",
+        encoding="utf-8",
+    )
+    return source
 
 
 @pytest.mark.parametrize("profile_id", MODEL_PROFILE_IDS)
@@ -114,19 +135,24 @@ def test_wrong_or_unknown_profile_rejected_before_generation(
         validate.load_workflow()
 
 
+def test_checkpoint_variant_hint_ignores_parent_folder_names() -> None:
+    for path in (
+        "C:/NoobAI-Vpred/renamed.safetensors",
+        r"C:\NoobAI-Vpred\renamed.safetensors",
+    ):
+        assert profile_checkpoint_issue("noobai-xl-epsilon", path) is None
+    assert profile_checkpoint_issue(
+        "noobai-xl-epsilon", "checkpoints/NoobAI-Vpred.safetensors"
+    )
+
+
 @pytest.mark.parametrize("target", ["tensor", "latents", "unknown"])
-def test_trainer_requires_verified_latent_velocity_target(
+def test_trainer_requires_recognized_velocity_target(
     tmp_path: Path, target: str
 ) -> None:
-    source = tmp_path / "extensions_built_in/sd_trainer/SDTrainer.py"
-    source.parent.mkdir(parents=True)
-    source.write_text(
-        f"def calculate_loss(self, batch, noise, timesteps):\n"
-        f"    return self.sd.noise_scheduler.get_velocity(batch.{target}, noise, timesteps)\n",
-        encoding="utf-8",
-    )
+    _trainer_source(tmp_path, target)
     issue = training_profile_issue("noobai-xl-vpred", tmp_path)
-    assert (issue is None) == (target == "latents")
+    assert (issue is None) == (target in ("tensor", "latents"))
     assert training_profile_issue("noobai-xl-epsilon", tmp_path) is None
 
 
@@ -212,9 +238,12 @@ def test_recovery_keeps_profile_and_rejects_changed_selection(
 
 
 @pytest.mark.parametrize("broken", [False, True])
+@pytest.mark.parametrize("target", ["tensor", "latents"])
 def test_isolated_vpred_launcher_patches_before_trainer_imports(
-    tmp_path: Path, broken: bool
+    tmp_path: Path, broken: bool, target: str
 ) -> None:
+    trainer_source = _trainer_source(tmp_path, target)
+    original_source = trainer_source.read_bytes()
     toolkit = tmp_path / "toolkit"
     toolkit.mkdir()
     (toolkit / "__init__.py").write_text("", encoding="utf-8")
@@ -229,23 +258,33 @@ def test_isolated_vpred_launcher_patches_before_trainer_imports(
         "    options = dict(kwargs or {})\n"
         f"    options['rescale_betas_zero_snr'] = {rescale}\n"
         "    return SimpleNamespace(config=SimpleNamespace(**options), "
-        "get_velocity=lambda *args: None, alphas_cumprod=[0.0])\n",
+        "get_velocity=lambda latents, noise, steps: latents - noise, alphas_cumprod=[0.0])\n",
         encoding="utf-8",
     )
     run_py = tmp_path / "run.py"
     run_py.write_text(
         "from toolkit.sampler import get_sampler\n"
+        "from extensions_built_in.sd_trainer.SDTrainer import SDTrainer\n"
+        "from types import SimpleNamespace\n"
         "import json, sys\n"
         "from pathlib import Path\n"
         "v = get_sampler('euler', {'prediction_type': 'v_prediction'})\n"
         "eps = get_sampler('euler', {'prediction_type': 'epsilon'})\n"
+        "trainer = SDTrainer()\n"
+        "trainer.sd = SimpleNamespace(prediction_type='v_prediction', noise_scheduler=v)\n"
+        "for tensor in (None, 'RGB image'):\n"
+        "    batch = SimpleNamespace(tensor=tensor, latents=7.0)\n"
+        "    assert trainer.calculate_loss(batch, 2.0, 0) == 5.0\n"
+        "    assert batch.tensor is tensor\n"
+        "trainer.sd.prediction_type = 'epsilon'\n"
+        "assert trainer.calculate_loss(batch, 2.0, 0) == 2.0\n"
         "Path(sys.argv[1]).write_text(json.dumps([v.config.rescale_betas_zero_snr, "
         "eps.config.rescale_betas_zero_snr]))\n",
         encoding="utf-8",
     )
     output = tmp_path / "result.json"
     result = subprocess.run(
-        [sys.executable, "-c", VPRED_RUNNER, str(run_py), str(output)],
+        [sys.executable, "-c", vpred_runner(tmp_path), str(run_py), str(output)],
         cwd=tmp_path,
         capture_output=True,
         text=True,
@@ -259,6 +298,51 @@ def test_isolated_vpred_launcher_patches_before_trainer_imports(
     else:
         assert result.returncode == 0, result.stderr
         assert json.loads(output.read_text()) == [True, False]
+    assert trainer_source.read_bytes() == original_source
+    assert not list(trainer_source.parent.glob("__pycache__/SDTrainer*.pyc"))
+
+
+def test_vpred_adapter_rejects_changed_source_before_trainer_execution(
+    tmp_path: Path,
+) -> None:
+    source = _trainer_source(tmp_path, "tensor")
+    runner = vpred_runner(tmp_path)
+    source.write_text("raise AssertionError('must never execute changed code')\n")
+    # The import hook must reject drift even before torch/schedulers are imported.
+    runner = runner.split("from toolkit import sampler", 1)[0]
+    runner += "\nimport extensions_built_in.sd_trainer.SDTrainer\n"
+    result = subprocess.run(
+        [sys.executable, "-c", runner, str(tmp_path / "run.py")],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode != 0
+    assert "changed after the V-pred compatibility check" in result.stderr
+    assert "AssertionError" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "self.sd.other_type == 'v_prediction'",
+        "self.sd.prediction_type != 'v_prediction'",
+    ],
+)
+def test_unrecognized_velocity_control_flow_stays_blocked(
+    tmp_path: Path, replacement: str
+) -> None:
+    source = _trainer_source(tmp_path, "latents")
+    source.write_text(
+        source.read_text().replace(
+            "self.sd.prediction_type == 'v_prediction'", replacement
+        ),
+        encoding="utf-8",
+    )
+    assert training_profile_issue("noobai-xl-vpred", tmp_path) is not None
+    with pytest.raises(ValueError, match="Unrecognized"):
+        vpred_runner(tmp_path)
 
 
 def test_desktop_profile_keyboard_selection_persists_and_invalidates(

@@ -1,15 +1,23 @@
+param(
+    [string]$OutputDirectory = "dist"
+)
+
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$buildOutput = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDirectory))
+$repoPrefix = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd("\") + "\"
+if (-not $buildOutput.StartsWith($repoPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Build output must be inside the repository: $buildOutput"
+}
 $deployEnvironment = Join-Path $repoRoot ".venv-deploy"
 $deployPython = Join-Path $deployEnvironment "Scripts\python.exe"
-$deployTool = Join-Path $deployEnvironment "Scripts\pyside6-deploy.exe"
 $deploySpec = Join-Path $repoRoot "pysidedeploy.spec"
 $generatedDeploySpec = Join-Path $deployEnvironment "pysidedeploy.generated.spec"
 $lockedDeployRequirements = Join-Path $deployEnvironment "deploy-requirements.lock"
 $iconGenerator = Join-Path $repoRoot "scripts\generate_windows_icon.py"
 $deployIcon = Join-Path $deployEnvironment "mivim-lora-studio.ico"
-$expectedExecutable = Join-Path $repoRoot "dist\MIVIMLoRAStudio.dist\MIVIMLoRAStudio.exe"
+$expectedExecutable = Join-Path $buildOutput "MIVIMLoRAStudio.dist\MIVIMLoRAStudio.exe"
 
 $uv = Get-Command uv -ErrorAction SilentlyContinue
 if ($null -eq $uv) {
@@ -61,16 +69,16 @@ $specContent = Get-Content -LiteralPath $generatedDeploySpec -Raw
 $specContent = $specContent -replace '(?m)^project_dir\s*=.*$', "project_dir = $repoRoot"
 $specContent = $specContent -replace '(?m)^python_path\s*=.*$', "python_path = $deployPython"
 $specContent = $specContent -replace '(?m)^icon\s*=.*$', "icon = $deployIcon"
+$specContent = $specContent -replace '(?m)^exec_directory\s*=.*$', "exec_directory = $buildOutput"
 [System.IO.File]::WriteAllText(
     $generatedDeploySpec,
     $specContent,
     [System.Text.UTF8Encoding]::new($false)
 )
 
-$repoPrefix = [System.IO.Path]::GetFullPath($repoRoot).TrimEnd("\") + "\"
 $staleBuildTargets = @(
-    (Join-Path $repoRoot "dist\MIVIMLoRAStudio.build"),
-    (Join-Path $repoRoot "dist\MIVIMLoRAStudio.dist")
+    (Join-Path $buildOutput "MIVIMLoRAStudio.build"),
+    (Join-Path $buildOutput "MIVIMLoRAStudio.dist")
 )
 foreach ($target in $staleBuildTargets) {
     $resolvedTarget = [System.IO.Path]::GetFullPath($target)
@@ -85,9 +93,12 @@ foreach ($target in $staleBuildTargets) {
     }
 }
 
+New-Item -ItemType Directory -Path $buildOutput -Force | Out-Null
 Push-Location $repoRoot
 try {
-    & $deployTool --config-file $generatedDeploySpec --force
+    # Invoke through the selected interpreter so moved checkouts do not retain
+    # a console launcher's stale absolute Python path.
+    & $deployPython -c "from PySide6.scripts.pyside_tool import deploy; deploy()" --config-file $generatedDeploySpec --force
     if ($LASTEXITCODE -ne 0) {
         throw "pyside6-deploy exited with code $LASTEXITCODE."
     }

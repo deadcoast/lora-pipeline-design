@@ -125,15 +125,23 @@ for the exact behavior and verification boundary.
 Added explicit NoobAI Epsilon and V-pred profiles to Connect, persisted worker
 settings, training configuration, validation graphs, editable ComfyUI export,
 cache signatures, and recovery binding. Standard SDXL remains the default.
-The V-pred trainer compatibility check rejects the inspected ai-toolkit image
-tensor target before preparation or training; a compatible latent-target
-implementation is required. Validation-only CLI use does not require a trainer.
+The initial V-pred compatibility gate was corrected in **0.6.1**: an isolated
+import adapter changes the known image-tensor velocity target to encoded
+latents without editing the external checkout. Unknown implementations remain
+blocked, and source drift is rejected before executing the trainer module.
+The filename mismatch check now ignores parent-directory names.
 
-The final source suite passes **318 tests**, with **2 old packaged-binary tests
-deselected**. Ruff, formatting, Mypy, Pyright, whitespace checks, the wheel build,
-native Qt screenshots, and keyboard selector testing passed. The scheduler
-adapter was exercised against the installed ai-toolkit environment without
-loading weights. No new NoobAI GPU run or Windows executable is qualified.
-An initial old-binary handoff test failed on the new settings schema; it is not
-counted as passing package evidence. See [model support](model-support.md) for
-the research corrections, sources, exact compatibility boundary, and artifacts.
+The corrected source suite passes **324 tests**, with **2 packaged tests
+deselected**. The new executable separately passes **4 packaging tests** after
+adding V-pred result-handoff coverage. Native preparation preserves the V-pred
+profile; standard and V-pred results render correctly with fixture artifacts.
+Ruff, formatting, Mypy, Pyright, and whitespace checks pass. The actual installed
+trainer reproduced the original cached-latent failure; its corrected loss and
+backward gradients pass four analytical cases using synthetic CPU tensors.
+
+Package: `dist/noobai-0.6.1/MIVIMLoRAStudio.dist/MIVIMLoRAStudio.exe`.
+The earlier package is preserved. A moved-environment build-launcher defect was
+also fixed. The original old-binary schema failure and first rebuild failure
+remain documented. Real NoobAI-weight training, ComfyUI generation, and model
+quality remain unqualified. See [model support](model-support.md) for sources,
+reproduction commands, and evidence paths.

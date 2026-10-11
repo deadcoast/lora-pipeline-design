@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import ast
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+from .toolkit_vpred import TRAINER_SOURCE, velocity_target
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,7 +92,12 @@ def apply_validation_profile(graph: dict[str, Any], profile: ModelProfile) -> No
 def profile_checkpoint_issue(profile_id: str, checkpoint: str) -> str | None:
     """Catch an obvious mismatch without treating filenames as model metadata."""
     profile = model_profile(profile_id)
-    name = checkpoint.lower().replace("-", "").replace("_", "")
+    name = (
+        Path(checkpoint.replace("\\", "/"))
+        .name.lower()
+        .replace("-", "")
+        .replace("_", "")
+    )
     if "noob" in name and "vpred" in name and not profile.v_prediction:
         return "This filename indicates NoobAI V-pred. Choose NoobAI-XL · V-pred in Connect."
     if "noob" in name and ("eps" in name or "epsilon" in name) and profile.v_prediction:
@@ -100,57 +106,19 @@ def profile_checkpoint_issue(profile_id: str, checkpoint: str) -> str | None:
 
 
 def training_profile_issue(profile_id: str, toolkit_dir: Path | None) -> str | None:
-    """Admit V-pred only when the trainer uses latents for its velocity target.
-
-    Known ai-toolkit revisions use batch.tensor here, which is an RGB tensor
-    or None when latent caching is enabled. Never spend a run on that path.
-    This is a compatibility check, not evidence of model/GPU qualification.
-    """
+    """Admit only a recognized latent target or the known repairable image target."""
     if not model_profile(profile_id).v_prediction:
         return None
-    source_path = (
-        toolkit_dir / "extensions_built_in/sd_trainer/SDTrainer.py"
-        if toolkit_dir is not None
-        else None
-    )
+    source_path = toolkit_dir / TRAINER_SOURCE if toolkit_dir is not None else None
     try:
         if source_path is None:
             raise FileNotFoundError
-        tree = ast.parse(source_path.read_text(encoding="utf-8"))
+        velocity_target(source_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, SyntaxError):
         return (
             "Choose an ai-toolkit checkout with verified V-pred latent-target support."
         )
-    targets = [
-        call.args[0]
-        for function in ast.walk(tree)
-        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and function.name == "calculate_loss"
-        for call in ast.walk(function)
-        if isinstance(call, ast.Call)
-        and isinstance(call.func, ast.Attribute)
-        and call.func.attr == "get_velocity"
-        and call.args
-    ]
-    if any(
-        isinstance(target, ast.Attribute)
-        and isinstance(target.value, ast.Name)
-        and target.value.id == "batch"
-        and target.attr == "tensor"
-        for target in targets
-    ):
-        return (
-            "This ai-toolkit uses image tensors for V-pred training targets; "
-            "cached-latent training would fail. Choose Epsilon or a compatible "
-            "trainer checkout. V-pred validation remains available through the CLI."
-        )
-    if not any(
-        isinstance(target, ast.Attribute)
-        and isinstance(target.value, ast.Name)
-        and target.value.id == "batch"
-        and target.attr == "latents"
-        for target in targets
-    ):
+    except ValueError:
         return (
             "This ai-toolkit V-pred training path has not been verified. "
             "Choose Epsilon or a trainer with a supported latent-target path."
