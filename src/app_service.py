@@ -37,6 +37,7 @@ from .app_models import (
 from .comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
+    comfy_start_instruction,
     discover_comfy_desktop,
     probe_comfy_api,
     select_comfy_installation,
@@ -1519,6 +1520,10 @@ class ApplicationService:
             )
         probe_order = tuple(dict.fromkeys(value for value in ordered_hosts if value))
         live = probe_comfy_api(probe_order, timeout=0.35)
+        if not probe_order and found.selected_installation is not None:
+            live = replace(
+                live, error=comfy_start_instruction(found.selected_installation)
+            )
         host = (
             live.host
             if live.reachable
@@ -2007,10 +2012,13 @@ class ApplicationService:
             desktop_detected = discovery is not None and discovery.detected
             if has_local_instance:
                 offline_detail = (
-                    "Comfy Desktop is installed but its selected instance is not "
-                    "running."
+                    "Desktop started the selected instance, but its local ComfyUI "
+                    "server has not answered yet. Check its terminal in Desktop "
+                    "if startup does not finish."
+                    if matching_hosts
+                    else comfy_start_instruction(selected_for_probe)
                 )
-                offline_action = "Open Comfy Desktop and check again"
+                offline_action = "Open Comfy Desktop"
             elif desktop_detected:
                 offline_detail = (
                     "Comfy Desktop is installed, but no local ComfyUI instance is "

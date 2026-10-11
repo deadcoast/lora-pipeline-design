@@ -1,6 +1,6 @@
 [project]
 name = "lora-pipeline-design"
-version = "0.6.1"
+version = "0.6.2"
 description = "MIVIM LoRA Studio: a guided SDXL training companion for Comfy Desktop"
 readme = "README.md"
 requires-python = ">=3.11"

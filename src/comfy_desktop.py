@@ -234,6 +234,15 @@ class ComfyApiStatus:
     error: str | None
 
 
+def comfy_start_instruction(installation: ComfyInstallation | None) -> str:
+    """Name the action that starts a server in Desktop's instance dashboard."""
+    target = f'"{installation.name}"' if installation is not None else "selected"
+    return (
+        f"In Comfy Desktop, open the {target} local instance card to start ComfyUI. "
+        "Opening the Desktop dashboard alone does not start that instance."
+    )
+
+
 def _launcher() -> ComfyLauncher:
     shell_target = rf"shell:AppsFolder\{COMFY_DESKTOP_APP_ID}"
     return ComfyLauncher(

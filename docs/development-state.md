@@ -145,3 +145,44 @@ also fixed. The original old-binary schema failure and first rebuild failure
 remain documented. Real NoobAI-weight training, ComfyUI generation, and model
 quality remain unqualified. See [model support](model-support.md) for sources,
 reproduction commands, and evidence paths.
+
+## Comfy Desktop connection flow correction — 2026-10-11
+
+The reported blocked connection was reproduced with Desktop 1.1.6 open at its
+instance dashboard. The selected local `ComfyUI` instance had no running server
+or runtime port record. MIVIM's generic **NOT RUNNING** state did not make the
+next action clear, and its launch retry loop stopped after 18 checks. Repeated
+launch clicks also created overlapping retry chains.
+
+**0.6.2** names the selected instance card to open in Desktop, distinguishes
+**START INSTANCE**, **CONNECTING**, and **CONNECTED**, and keeps one automatic
+check active while connecting. It preserves the selected instance boundary;
+connection requires that instance's actual API response. Setup checks cannot
+overlap, background retries preserve the visible state, and the logs retain
+candidate addresses and probe failures. Readiness and Results use the same
+launch guidance and resume after connection succeeds.
+
+Live acceptance opened the installed local instance through Desktop's own UI.
+MIVIM then detected `127.0.0.1:8188`, one checkpoint, and three LoRAs. The rebuilt
+Windows application showed **CONNECTED** with those values. A second normal
+launch using the user's settings was verified through Windows accessibility
+and left open, with ComfyUI still running. No model generation was performed.
+
+- Source suite: **326 passed, 3 packaged cases deselected**.
+- Rebuilt package suite: **4 passed**, covering the icon, native photo
+  preparation, and standard/V-pred result handoff.
+- Ruff lint/format, Mypy, Pyright, whitespace checks, wheel build, and static
+  UI audit passed. Native screenshots cover the startup instruction at
+  1040 × 740, its sibling Project page, and the live connected package.
+- Package: `dist/comfy-connection-0.6.2/MIVIMLoRAStudio.dist/MIVIMLoRAStudio.exe`.
+- SHA-256: `782EDF6819586C0901201DDC118E38E214A62682815CA11FB33B47FBC3A63221`.
+- Evidence: `dist/comfy-connect-source-final.log`,
+  `dist/comfy-connection-package-tests.log`, `dist/comfy-connection-live.png`,
+  `dist/comfy-connection-start-instance.png`, and
+  `dist/comfy-connection-sibling-project.png`.
+
+The earlier targeted run caught two remaining references to the removed retry
+counter in Results; these were corrected before the passing source/package
+runs. Its failure remains in `dist/comfy-connect-regression.log`. Previous
+package directories were preserved. No manual edits were made to Comfy Desktop
+source or settings; Desktop managed its own normal startup state.

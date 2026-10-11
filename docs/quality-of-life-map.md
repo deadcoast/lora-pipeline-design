@@ -12,6 +12,7 @@ acceptance checks.
 | --- | --- | --- |
 | Comfy Desktop | Wrong instance, port, or model library | Reconstruct executable-drive defaults, saved storage, launch arguments, generated config, local YAML, output folders, and live port as one selected context; block ambiguous or stale state |
 | First setup | Raw paths and ports dominate onboarding, or an installed Desktop is mistaken for missing | Detect the registered app before first launch, open it to create an instance, show model and trainer setup first, and keep paths/custom ports under **Advanced** |
+| Starting ComfyUI | Opening Desktop leaves MIVIM disconnected without a clear next step | Name the selected local instance card to open, distinguish **START INSTANCE**, **CONNECTING**, and **CONNECTED**, and keep one automatic check running until the server answers |
 | Base model | Training and validation silently use different architectures | Require the exact same local checkpoint and an explicit SDXL-base confirmation |
 | Trainer | A CUDA-enabled-looking environment fails after training starts | Run a real CUDA kernel in the trainer's own Python; show GPU architecture and guided repair |
 | Source photos | Bad files are reported only as counts | Name and preview unreadable, small, blurry, duplicate, and likely near-duplicate files |

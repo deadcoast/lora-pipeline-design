@@ -1187,7 +1187,7 @@ def test_desktop_launch_repair_polls_then_returns_to_readiness(
     _wait_for_initial_setup(qtbot, window)
 
     def launch_desktop() -> bool:
-        window._desktop_poll_remaining = 18
+        window._awaiting_comfy_launch = True
         return True
 
     reviews: list[bool] = []
@@ -1216,7 +1216,7 @@ def test_desktop_launch_repair_polls_then_returns_to_readiness(
     QApplication.processEvents()
 
     assert not window._return_to_readiness_when_connected
-    assert window._desktop_poll_remaining == 0
+    assert not window._awaiting_comfy_launch
     assert reviews == [True]
 
 
@@ -1274,6 +1274,129 @@ def test_installed_desktop_without_instance_opens_desktop_not_install_guide(
     assert launched == [
         ["explorer.exe", r"shell:AppsFolder\desktop-app"],
     ]
+
+
+def test_connection_watches_instance_startup_until_the_api_answers(
+    qtbot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    installation = ComfyInstallation(
+        "local",
+        "My local ComfyUI",
+        "standalone",
+        tmp_path / "install",
+        tmp_path / "install/ComfyUI",
+        None,
+        "installed",
+        None,
+        use_shared_models=False,
+        use_shared_input_output=False,
+    )
+    discovery = ComfyDesktopDiscovery(
+        tmp_path,
+        None,
+        (installation,),
+        installation,
+        (),
+        None,
+        None,
+        (),
+        ComfyLauncher("Comfy Desktop", "app", "", ("desktop.exe",), True),
+        (),
+    )
+    service = _FixedDiscoveryService(root=tmp_path, discovery=discovery)
+    online = False
+    probed: list[tuple[str, ...]] = []
+
+    def probe(hosts, **_kwargs):
+        probed.append(tuple(hosts))
+        return ComfyApiStatus(
+            online,
+            "127.0.0.1:8271" if online else None,
+            (),
+            (),
+            None if online else "connection refused",
+        )
+
+    monkeypatch.setattr(app_service, "probe_comfy_api", probe)
+    monkeypatch.setattr("src.desktop.subprocess.Popen", lambda *_args, **_kwargs: None)
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=service,
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    assert window.comfy_badge.text() == "START INSTANCE"
+    assert '"My local ComfyUI" local instance card' in window.comfy_summary_label.text()
+    assert "automatically" in window.comfy_summary_label.text()
+    assert window._comfy_retry_timer.isActive()
+    assert probed == [()]
+
+    timer = window._comfy_retry_timer
+    assert window.open_comfy_desktop()
+    assert window.open_comfy_desktop()
+    assert window._comfy_retry_timer is timer
+    assert timer.isSingleShot() and timer.isActive()
+
+    service.fixed_discovery = replace(
+        discovery,
+        runtime_hints=(
+            ComfyRuntimeHint(
+                "127.0.0.1:8271", installation.name, 123, 9_999_999_999_999
+            ),
+        ),
+    )
+    # More checks than the former 18-attempt limit; each passes through the
+    # production discovery/service callback rather than forcing a UI result.
+    for _ in range(22):
+        count = len(probed)
+        timer.start(1)
+        qtbot.waitUntil(
+            lambda count=count: len(probed) > count and not window._setup_in_progress
+        )
+    assert window.comfy_badge.text() == "CONNECTING"
+    assert "8271" in window.comfy_summary_label.text()
+    assert window.setup_logs_button.isVisible()
+    assert timer.isActive()
+    assert window._awaiting_comfy_launch
+
+    online = True
+    timer.start(1)
+    qtbot.waitUntil(lambda: window.comfy_badge.text() == "CONNECTED")
+    assert window.settings.comfy_host == "127.0.0.1:8271"
+    assert window.open_comfy_button.isEnabled()
+    assert not timer.isActive()
+    assert not window._awaiting_comfy_launch
+    assert all(hosts == ("127.0.0.1:8271",) for hosts in probed[1:])
+    log = window.studio_log.path.read_text(encoding="utf-8")
+    assert "connection refused" in log and "127.0.0.1:8271" in log
+
+
+def test_refresh_does_not_overlap_an_inflight_connection_check(
+    qtbot, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window = MainWindow(
+        settings=AppSettings(),
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    _wait_for_initial_setup(qtbot, window)
+    pending: list[object] = []
+    monkeypatch.setattr(
+        window, "_run_worker", lambda *args, **kwargs: pending.append(args)
+    )
+    window.refresh_setup()
+    window.refresh_setup()
+    window.refresh_setup(background=True)
+    assert len(pending) == 1
+    window._setup_failed_for(window._setup_request, "test connection failure")
+    assert not window._setup_in_progress
+    assert window.retry_comfy_button.isEnabled()
+    window.refresh_setup()
+    assert len(pending) == 2
 
 
 def test_unavailable_saved_desktop_requires_an_explicit_user_choice(
@@ -2971,7 +3094,7 @@ def test_result_adds_and_verifies_workflow_through_the_user_facing_button(
 
     def open_desktop() -> None:
         opened_desktop.append(True)
-        window._desktop_poll_remaining = 18
+        window._awaiting_comfy_launch = True
 
     monkeypatch.setattr(window, "open_comfy_desktop", open_desktop)
 

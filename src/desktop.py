@@ -110,6 +110,7 @@ from .comfy_client import (
 from .comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
+    comfy_start_instruction,
 )
 from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
@@ -514,7 +515,11 @@ class MainWindow(QMainWindow):
         self._setup_request = 0
         self._source_request = 0
         self._readiness_request = 0
-        self._desktop_poll_remaining = 0
+        self._awaiting_comfy_launch = False
+        self._setup_in_progress = False
+        self._comfy_retry_timer = QTimer(self)
+        self._comfy_retry_timer.setSingleShot(True)
+        self._comfy_retry_timer.timeout.connect(self._poll_comfy_connection)
         self._return_to_readiness_when_connected = False
         self._return_to_readiness_after_installation = False
         self._return_to_readiness_after_setup = False
@@ -609,6 +614,13 @@ class MainWindow(QMainWindow):
         self.pages.setCurrentIndex(index)
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
+        if (
+            index == NAV_SETUP
+            and self.discovery is not None
+            and any(item.is_local for item in self.discovery.installations)
+            and not (self.comfy_status is not None and self.comfy_status.reachable)
+        ):
+            self._comfy_retry_timer.start(0)
 
     # --------------------------------------------------------------- setup UI
     def _build_setup_page(self) -> QWidget:
@@ -1346,7 +1358,17 @@ class MainWindow(QMainWindow):
         timer.timeout.connect(invoke)
         timer.start(max(0, delay_ms))
 
-    def refresh_setup(self) -> None:
+    def _poll_comfy_connection(self) -> None:
+        if not self._closing and (
+            self.pages.currentIndex() == NAV_SETUP or self._awaiting_comfy_launch
+        ):
+            self.refresh_setup(background=True)
+
+    def refresh_setup(self, *, background: bool = False) -> None:
+        if self._setup_in_progress or self._closing:
+            return
+        self._comfy_retry_timer.stop()
+        self._setup_in_progress = True
         self._setup_request += 1
         request = self._setup_request
         if self._workflow_publish_busy:
@@ -1365,13 +1387,14 @@ class MainWindow(QMainWindow):
             )
         self.retry_comfy_button.setEnabled(False)
         self.setup_logs_button.setVisible(False)
-        self.comfy_badge.setText("CHECKING")
-        self.comfy_badge.setObjectName("statusWarning")
-        self.comfy_badge.style().unpolish(self.comfy_badge)
-        self.comfy_badge.style().polish(self.comfy_badge)
-        self.comfy_summary_label.setText(
-            "Checking the installed Desktop instances and local ComfyUI API…"
-        )
+        if not background:
+            self.comfy_badge.setText("CHECKING")
+            self.comfy_badge.setObjectName("statusWarning")
+            self.comfy_badge.style().unpolish(self.comfy_badge)
+            self.comfy_badge.style().polish(self.comfy_badge)
+            self.comfy_summary_label.setText(
+                "Checking the installed Desktop instances and local ComfyUI API…"
+            )
         self.studio_log.info(
             "setup.check.started",
             "Checking local Comfy Desktop installations and API availability.",
@@ -1398,6 +1421,7 @@ class MainWindow(QMainWindow):
     ) -> None:
         if request != self._setup_request:
             return
+        self._setup_in_progress = False
         if self._collect_settings() != original:
             self.retry_comfy_button.setEnabled(True)
             self._single_shot(0, self.refresh_setup)
@@ -1420,7 +1444,6 @@ class MainWindow(QMainWindow):
             is None
         )
         displayed = self._displayed_result_record
-        verified = self._verified_result_identity
         local_installations = tuple(
             installation
             for installation in discovery.installations
@@ -1477,12 +1500,26 @@ class MainWindow(QMainWindow):
                 f"{len(status.loras)} LoRA(s) visible."
             )
         elif local_installations:
-            self.comfy_badge.setText("NOT RUNNING")
             state = "warning"
-            self.comfy_summary_label.setText(
-                f"Found {len(local_installations)} local installation(s). "
-                "Open Comfy Desktop and launch the one you want to use."
+            starting_hosts = tuple(
+                hint.host
+                for hint in discovery.runtime_hints
+                if hint.installation_name.casefold() == selected_name.casefold()
             )
+            if starting_hosts:
+                self.comfy_badge.setText("CONNECTING")
+                self.comfy_summary_label.setText(
+                    f'Desktop started "{selected_name}". Waiting for ComfyUI to '
+                    f"answer at {starting_hosts[0]}. MIVIM checks automatically; "
+                    "if startup fails, check that instance's terminal in Desktop."
+                )
+            else:
+                self.comfy_badge.setText("START INSTANCE")
+                self.comfy_summary_label.setText(
+                    "Comfy Desktop was found. "
+                    + comfy_start_instruction(selected_installation)
+                    + " MIVIM will connect automatically when it is ready."
+                )
         elif desktop_detected:
             self.comfy_badge.setText("CREATE INSTANCE")
             state = "warning"
@@ -1507,45 +1544,37 @@ class MainWindow(QMainWindow):
         )
         self.comfy_badge.style().unpolish(self.comfy_badge)
         self.comfy_badge.style().polish(self.comfy_badge)
-        self.setup_logs_button.setVisible(False)
+        self.setup_logs_button.setVisible(
+            bool(status.error and discovery.host_candidates)
+        )
         self.studio_log.info(
             "setup.check.finished",
             (
                 f"state={state}; local_installations={len(local_installations)}; "
                 f"api_reachable={status.reachable}; checkpoints="
-                f"{len(status.checkpoints)}"
+                f"{len(status.checkpoints)}; candidates="
+                f"{','.join(discovery.host_candidates) or 'none'}; "
+                f"detail={status.error or 'connected'}"
             ),
         )
         self.save_current_settings(silent=True)
         if status.reachable:
-            self._desktop_poll_remaining = 0
+            self._awaiting_comfy_launch = False
+            self._comfy_retry_timer.stop()
             if self._return_to_readiness_when_connected:
                 self._return_to_readiness_when_connected = False
                 self._single_shot(0, self.review_project)
             elif self._pending_workflow_publish == self._displayed_result_record:
                 self._single_shot(0, self.add_ready_workflow_to_comfyui)
-        elif self._desktop_poll_remaining > 0:
-            self._desktop_poll_remaining -= 1
-            self._single_shot(5000, self.refresh_setup)
-        elif self._return_to_readiness_when_connected:
-            self._return_to_readiness_when_connected = False
-            self.comfy_summary_label.setText(
-                self.comfy_summary_label.text()
-                + " MIVIM did not detect a running instance yet; launch it in "
-                "Desktop, then choose Retry."
+        elif (
+            not unavailable_selection
+            and not ambiguous_runtime_identity
+            and (
+                self._awaiting_comfy_launch
+                or (local_installations and self.pages.currentIndex() == NAV_SETUP)
             )
-        elif self._pending_workflow_publish is not None:
-            self._pending_workflow_publish = None
-            self.publish_workflow_button.setText("Retry add to ComfyUI")
-            self.publish_workflow_button.setEnabled(
-                verified is not None
-                and verified[0] == displayed
-                and self._result_comfy_context_issue(displayed) is None
-            )
-            self.workflow_handoff_status_label.setText(
-                "LoRA ready; workflow not added yet. Launch the original "
-                "ComfyUI instance, then retry."
-            )
+        ):
+            self._comfy_retry_timer.start(5000)
         if (
             displayed is not None
             and self._pending_workflow_publish is None
@@ -1561,6 +1590,8 @@ class MainWindow(QMainWindow):
             self._setup_failed(message)
 
     def _setup_failed(self, message: str) -> None:
+        self._setup_in_progress = False
+        self._comfy_retry_timer.stop()
         self.studio_log.error_event("setup.check.failed", message)
         self._return_to_readiness_when_connected = False
         self._return_to_readiness_after_setup = False
@@ -2136,10 +2167,11 @@ class MainWindow(QMainWindow):
             self._show_error("Could not open Comfy Desktop", str(exc))
             return False
         self.comfy_summary_label.setText(
-            "Comfy Desktop is opening. The studio will check the local instance again."
+            comfy_start_instruction(self.discovery.selected_installation)
+            + " MIVIM will connect automatically when it is ready."
         )
-        self._desktop_poll_remaining = 18
-        self._single_shot(3000, self.refresh_setup)
+        self._awaiting_comfy_launch = True
+        self._comfy_retry_timer.start(3000)
         return True
 
     def open_result_comfy_desktop(self) -> None:
@@ -2147,7 +2179,7 @@ class MainWindow(QMainWindow):
         if issue is not None:
             self.show_page(NAV_SETUP)
         self.open_comfy_desktop()
-        if issue is not None and self._desktop_poll_remaining > 0:
+        if issue is not None and self._awaiting_comfy_launch:
             self.comfy_summary_label.setText(
                 f"{issue} Comfy Desktop is opening so you can reconnect it."
             )
@@ -4681,7 +4713,7 @@ class MainWindow(QMainWindow):
                 "adding the workflow automatically."
             )
             self.open_comfy_desktop()
-            if self._desktop_poll_remaining <= 0:
+            if not self._awaiting_comfy_launch:
                 self._pending_workflow_publish = None
                 self.publish_workflow_button.setText("Retry add to ComfyUI")
                 self.publish_workflow_button.setEnabled(True)

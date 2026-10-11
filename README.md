@@ -67,6 +67,9 @@ You can also launch it directly:
 - Offers to create a missing `loras` folder only when it is the exact folder
   declared by the selected, verified Desktop model root.
 - Opens Comfy Desktop, the verified ComfyUI URL, and result folders.
+- Names the local instance card to open in Desktop, keeps checking while you
+  connect, and shows **CONNECTING** while its server starts. Repeated opens
+  reuse one connection check; the wait no longer stops after 90 seconds.
 - Keeps ai-toolkit in its own environment.
 
 Comfy Desktop remains responsible for starting and stopping its own instances.

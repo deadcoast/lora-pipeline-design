@@ -371,5 +371,26 @@ Segoe UI typography, and shared combo/field states. The new selector uses those
 rules directly, with the existing `_hint` label and `_body` explanatory text.
 The sibling project form keeps the same visual language and scroll behavior.
 
+## Connection startup correction — 2026-10-11
+
+The Connect page and readiness repair share `comfy_start_instruction` so both
+name the selected local instance card in Desktop. `MainWindow` owns a single
+retry timer and permits one setup check at a time. Connect keeps checking while
+offline; an explicit Desktop launch also keeps the readiness/result continuation
+pending until connection succeeds or the window closes. Returning to Connect
+restarts checking. Background checks retain the displayed state while in flight.
+
+The existing status badge, body text, logs action, and native buttons retain
+their theme and keyboard behavior. **START INSTANCE** gives the card-opening
+instruction; **CONNECTING** names the selected instance's runtime address and
+startup-terminal recovery; **CONNECTED** requires a successful API response.
+Unavailable or ambiguous installation identities retain their existing repair
+states. Connection logs include candidate addresses and the actual probe error.
+
+Verification covers repeated launch clicks, startup taking more than the old
+18 attempts, one check in flight, late API success, failed-check retry, readiness
+continuation, and result workflow publication. Live acceptance uses the installed
+Comfy Desktop instance and a rebuilt Windows app; model generation is separate.
+
 See [model support](model-support.md) for source authority, variant-specific
 settings, the V-pred training gate, and the qualification boundary.
