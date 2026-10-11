@@ -32,7 +32,14 @@ from typing import TypedDict, cast
 from PIL import Image, ImageOps
 
 from . import config
-from .caption import BLIP_MODEL_ID, BLIP_MODEL_REVISION, make_caption, source_caption
+from .caption import (
+    BLIP_MODEL_ID,
+    BLIP_MODEL_REVISION,
+    CAPTION_MODES,
+    make_caption,
+    resolve_caption_mode,
+    source_caption,
+)
 from .comfy_activity import check_orphaned_comfy_prompts
 from .dataset_pairs import scan_dataset_pairs
 from .io_utils import atomic_write_bytes, atomic_write_text
@@ -122,6 +129,10 @@ def _commit_staged_dataset(staging: Path, out: Path) -> None:
 def captioner_identity(caption_mode: str) -> str:
     """Return the exact caption implementation identity recorded for reuse."""
 
+    if caption_mode == "anime":
+        from .anime_tagger import CAPTIONER_ID
+
+        return CAPTIONER_ID
     if caption_mode == "blip":
         return f"{BLIP_MODEL_ID}@{BLIP_MODEL_REVISION}"
     if caption_mode == "template":
@@ -272,7 +283,7 @@ def source_files_match_manifest(src: Path, manifest: object) -> bool:
         or size <= 0
         or not isinstance(trigger, str)
         or not trigger.strip()
-        or caption_mode not in {"template", "blip"}
+        or caption_mode not in {"template", "blip", "anime"}
     ):
         return False
 
@@ -417,6 +428,12 @@ def _prepare_images(
                 print(f"  [warn] Existing pair is invalid ({e}); rebuilding")
         elif (img_out.exists() or txt_out.exists()) and not overwrite:
             print(f"  [warn] Incomplete pair for {stem}; rebuilding both files")
+        if caption_mode == "anime" and source_caption(path, trigger) is None:
+            from .anime_tagger import load_tagger
+
+            # A failed first download stops once, instead of retrying per image.
+            load_tagger()
+            print(f"[tagger] Image {i}/{len(images)}: {path.name}", flush=True)
         try:
             with Image.open(path) as orig:
                 if max(orig.size) < size:
@@ -452,9 +469,10 @@ def prepare(
     name: str,
     size: int = 1024,
     trigger: str = config.DEFAULT_TRIGGER,
-    caption_mode: str = "template",
+    caption_mode: str = "auto",
     overwrite: bool = False,
 ) -> Path:
+    caption_mode = resolve_caption_mode(caption_mode, config.MODEL_PROFILE)
     name = config.validate_project_name(name)
     output = (config.DATASETS_DIR / name).resolve()
     workspace = config.RUN_CONFIGS_DIR.resolve().parent
@@ -510,8 +528,8 @@ def _prepare_with_guard(
     if not trigger.strip():
         raise ValueError("Caption trigger cannot be empty.")
     trigger = trigger.strip()
-    if caption_mode not in {"template", "blip"}:
-        raise ValueError("Caption mode must be 'template' or 'blip'.")
+    if caption_mode not in {"template", "blip", "anime"}:
+        raise ValueError("Caption mode must be 'template', 'blip', or 'anime'.")
     out = config.DATASETS_DIR / name
     source_path = src.resolve()
     output_path = out.resolve()
@@ -641,7 +659,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument(
         "--overwrite", action="store_true", help="Rewrite existing outputs."
     )
+    ap.add_argument(
+        "--caption-mode",
+        choices=CAPTION_MODES,
+        default="auto",
+        help="Caption missing sidecars: auto uses anime tags for NoobAI profiles.",
+    )
     args = ap.parse_args(argv)
+    caption_mode = resolve_caption_mode(
+        args.caption_mode, config.MODEL_PROFILE, vision=args.vision
+    )
 
     try:
         project = config.validate_project_name(args.name)
@@ -650,18 +677,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             project=project,
             workspace=workspace,
             mode="prepare",
-            use_accelerator=args.vision,
+            use_accelerator=caption_mode == "blip",
             project_scopes=(config.DATASETS_DIR.resolve().parent,),
             resource_paths=((config.DATASETS_DIR / project).resolve(),),
         ):
-            if args.vision:
+            if caption_mode == "blip":
                 check_orphaned_comfy_prompts()
             prepare(
                 src=Path(args.src),
                 name=project,
                 size=args.size,
                 trigger=args.trigger,
-                caption_mode="blip" if args.vision else "template",
+                caption_mode=caption_mode,
                 overwrite=args.overwrite,
             )
     except (FileNotFoundError, RuntimeError, ValueError) as exc:

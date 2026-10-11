@@ -120,6 +120,7 @@ def _project_from_json(value: object, default: ProjectDraft) -> ProjectDraft:
         source_dir=_path(value.get("source_dir"), default.source_dir),
         trigger=_text(value.get("trigger"), default.trigger),
         preset=preset,
+        use_anime_tags=_boolean(value.get("use_anime_tags"), default.use_anime_tags),
         training_steps=(
             steps
             if isinstance(steps, int) and not isinstance(steps, bool) and steps > 0
@@ -335,6 +336,7 @@ def _project_to_json(project: ProjectDraft) -> dict[str, object]:
         "trigger": project.trigger,
         "preset": project.preset.value,
         "training_steps": project.training_steps,
+        "use_anime_tags": project.use_anime_tags,
         "use_vision_captions": project.use_vision_captions,
         "overwrite_existing": project.overwrite_existing,
     }

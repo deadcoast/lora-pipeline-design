@@ -77,11 +77,10 @@ not used.
 
 ## Explicit next roadmap
 
-Anime projects now import source tag captions, show caption coverage, expose
-training steps independently from the plan, and compare consistent anime shots
-during training and final review. The next feature gaps are an optional anime
-tagger for uncaptioned datasets and user-editable comparison prompt sets.
-Neither is represented as shipped in 0.7.0.
+Anime projects now generate WD ViT v3 tags for uncaptioned images automatically,
+import existing captions, show caption coverage, expose training steps independently
+from the plan, and compare consistent anime shots during training and final review.
+User-editable comparison prompt sets remain a feature gap.
 
 These items remain future work and are not represented as complete:
 

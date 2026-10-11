@@ -411,3 +411,18 @@ the ComfyUI strength grid, and the exported workflow. Standard SDXL keeps its
 photo suite. Existing source captions are always preferred, with editable
 prepared captions as the normal follow-up. Flat illustrations skip the photo
 blur heuristic. The form remains scrollable at the minimum window size.
+
+## Automatic anime tagging — 2026-10-11
+
+The NoobAI Project form now defaults **Tag uncaptioned anime images automatically**
+to on. A short hint explains the one-time download and local processing. The
+checkbox and hint appear only for anime profiles; BLIP is disabled while anime
+tagging is selected. The persisted draft carries this choice into the actual
+preparation worker. Automatic tagging does not add a confirmation gate.
+
+The run view shows model-download progress and the current image count. Existing
+source captions are imported unchanged apart from a missing trigger; otherwise
+WD ViT v3 produces general tags locally. Generated captions feed the same dataset
+editor, training files, and reuse record as imported captions. Ready-state copy
+distinguishes a cached tagger from its first download, without requiring users
+to install Python or a vision runtime in the packaged application.

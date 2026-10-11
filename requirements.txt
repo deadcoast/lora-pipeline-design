@@ -8,6 +8,8 @@ pyside6>=6.10.0
 websocket-client>=1.7
 python-dotenv>=1.0
 PyYAML>=6.0
+numpy>=1.26,<3
+onnxruntime>=1.17,<2
 
 # --- Optional: local auto-captioning with BLIP (heavy; only if you use --vision) ---
 # transformers>=5.14

@@ -160,3 +160,31 @@ Training duration is a separate project choice. `--steps N` works in both
 The override changes steps, not learning rate, rank, or training resolution.
 For a short run, checkpoint/preview intervals shrink to at most one quarter of
 the step count. No optimum step count is inferred from image count alone.
+
+## Automatic anime captions in 0.8.0
+
+Both NoobAI profiles now enable local anime tagging by default. Existing source
+`.txt` descriptions retain priority; images without usable sidecars receive the
+trigger followed by inferred general tags. Users can review and edit these in
+the existing caption editor before training. The Project checkbox disables
+automatic anime tagging when only imported/template captions are wanted.
+
+The tagger is [SmilingWolf WD ViT v3](https://huggingface.co/SmilingWolf/wd-vit-tagger-v3),
+publisher release `v2.0`, revision `790b0e92cefd2a0221451604e7831fe643ab7c4f`.
+Its ONNX runtime is included in the Windows app. The first uncaptioned image
+downloads the model and vocabulary into the user's MIVIM model cache; later
+runs work offline. Inference uses CPU, so it does not depend on ComfyUI, CUDA,
+or a separate PyTorch installation.
+
+Preprocessing follows the publisher's [ONNX example](https://huggingface.co/spaces/SmilingWolf/wd-tagger/blob/main/app.py):
+white-backed alpha compositing, centered square padding, bicubic resizing, and
+float32 BGR input. General tags use the example's 0.35 threshold. Rating labels
+and predicted franchise identities are omitted from generated captions; the
+project's trigger supplies identity. Tags are suggestions that remain editable.
+
+CLI: `src.pipeline` and `src.prepare_dataset` accept
+`--caption-mode auto|anime|template|blip`. Auto selects anime tagging for NoobAI
+profiles; `--caption-mode anime` explicitly selects it for a separate preparation
+run. `MIVIM_TAGGER_CACHE` can point to an existing downloaded model/vocabulary
+folder. Model/vocabulary download failures stop preparation with a retry message
+instead of silently producing trigger-only captions.

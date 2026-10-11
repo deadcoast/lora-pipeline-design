@@ -30,6 +30,7 @@ from . import config
 from . import prepare_dataset as prep
 from . import train as trainer
 from . import validate as validator
+from .caption import CAPTION_MODES, resolve_caption_mode
 from .comfy_activity import check_orphaned_comfy_prompts
 from .io_utils import artifact_fingerprint, atomic_copy, atomic_write_text
 from .model_profiles import (
@@ -199,7 +200,15 @@ def run(args: argparse.Namespace) -> Path | None:
     use_accelerator = (
         not args.skip_train
         or not args.skip_validate
-        or (not args.skip_prep and args.vision)
+        or (
+            not args.skip_prep
+            and resolve_caption_mode(
+                getattr(args, "caption_mode", "auto"),
+                config.MODEL_PROFILE,
+                vision=args.vision,
+            )
+            == "blip"
+        )
     )
     workspace = config.RUN_CONFIGS_DIR.resolve().parent
     dataset_dir = (config.DATASETS_DIR / name).resolve()
@@ -294,7 +303,11 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
             name=name,
             size=size,
             trigger=trigger,
-            caption_mode="blip" if args.vision else "template",
+            caption_mode=resolve_caption_mode(
+                getattr(args, "caption_mode", "auto"),
+                config.MODEL_PROFILE,
+                vision=args.vision,
+            ),
             overwrite=args.overwrite,
         )
 
@@ -581,6 +594,12 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--training-project",
         default="",
         help="Original training project for checkpoint comparison.",
+    )
+    ap.add_argument(
+        "--caption-mode",
+        choices=CAPTION_MODES,
+        default="auto",
+        help="Caption missing sidecars: auto uses anime tags for NoobAI profiles.",
     )
     args = ap.parse_args(argv)
     try:

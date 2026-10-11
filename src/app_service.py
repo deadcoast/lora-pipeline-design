@@ -675,6 +675,7 @@ def inspect_source(
 def inspect_prepared_dataset(
     folder: Path,
     draft: ProjectDraft,
+    model_profile: str = "sdxl",
 ) -> PreparedDatasetSummary:
     """Verify generated image/caption pairs before reusing them for training."""
 
@@ -710,7 +711,7 @@ def inspect_prepared_dataset(
             or not isinstance(sources, list)
         ):
             raise ValueError("unsupported manifest format")
-        expected_caption_mode = "blip" if draft.use_vision_captions else "template"
+        expected_caption_mode = draft.caption_mode(model_profile)
         output_issue = prepared_output_manifest_issue(folder, manifest)
         if settings.get("trigger") != draft.trigger.strip():
             manifest_error = "The prepared captions use a different identity phrase."
@@ -720,13 +721,17 @@ def inspect_prepared_dataset(
             )
         elif settings.get("caption_mode") != expected_caption_mode:
             requested = (
-                "Automatic descriptions"
+                "Automatic anime tags"
+                if expected_caption_mode == "anime"
+                else "Automatic descriptions"
                 if expected_caption_mode == "blip"
                 else "Simple template captions"
             )
             prepared_mode = settings.get("caption_mode")
             prepared = (
-                "Automatic descriptions"
+                "Automatic anime tags"
+                if prepared_mode == "anime"
+                else "Automatic descriptions"
                 if prepared_mode == "blip"
                 else "Simple template captions"
                 if prepared_mode == "template"
@@ -888,8 +893,26 @@ def _source_readiness_item(source: SourceSummary) -> ReadinessItem:
     )
 
 
-def _caption_readiness_item(draft: ProjectDraft) -> ReadinessItem:
-    if not draft.use_vision_captions:
+def _caption_readiness_item(
+    draft: ProjectDraft, profile: str = "sdxl"
+) -> ReadinessItem:
+    mode = draft.caption_mode(profile)
+    if mode == "anime":
+        from .anime_tagger import model_is_cached
+
+        detail = (
+            "The WD ViT v3 model is downloaded and runs locally."
+            if model_is_cached()
+            else "Preparation downloads the WD ViT v3 model once (361 MB), then runs locally."
+        )
+        return ReadinessItem(
+            "captions",
+            "Automatic anime tags",
+            "ready",
+            "Existing captions are kept. Untagged images get editable anime tags. "
+            + detail,
+        )
+    if mode == "template":
         return ReadinessItem(
             "captions",
             "Photo descriptions",
@@ -1717,7 +1740,9 @@ class ApplicationService:
             artifacts_for_collision = artifacts
             invalid_prepared_reason = ""
             if existing_dataset is not None and not draft.overwrite_existing:
-                prepared = inspect_prepared_dataset(existing_dataset, draft)
+                prepared = inspect_prepared_dataset(
+                    existing_dataset, draft, settings.model_profile
+                )
                 reuse_prepared = prepared.ready
                 if not reuse_prepared:
                     invalid_prepared_reason = prepared.problem_detail
@@ -1913,7 +1938,7 @@ class ApplicationService:
                     illustrations=settings.model_profile != "sdxl",
                 )
                 items.append(_source_readiness_item(source))
-            items.append(_caption_readiness_item(draft))
+            items.append(_caption_readiness_item(draft, settings.model_profile))
 
         local_installations = (
             tuple(
@@ -2621,7 +2646,7 @@ class ApplicationService:
         artifacts = self.project_artifacts(settings, draft.project_name)
         dataset = self.project_path(settings.datasets_dir) / draft.project_name
         prepared = (
-            inspect_prepared_dataset(dataset, draft)
+            inspect_prepared_dataset(dataset, draft, settings.model_profile)
             if dataset.exists() and not draft.overwrite_existing
             else None
         )
@@ -2683,7 +2708,8 @@ class ApplicationService:
             args.append("--skip-prep")
         else:
             args.extend(("--src", str(draft.source_dir)))
-        if draft.use_vision_captions:
+        args.extend(("--caption-mode", draft.caption_mode(settings.model_profile)))
+        if draft.caption_mode(settings.model_profile) == "blip":
             args.append("--vision")
         if draft.training_steps is not None:
             args.extend(("--steps", str(draft.training_steps)))
@@ -2872,6 +2898,20 @@ def stage_from_log(line: str) -> tuple[int, str] | None:
     """Translate actual pipeline output into stable, human-readable progress."""
 
     lowered = line.lower()
+    download = re.search(r"\[tagger\] downloading model: (\d+) / (\d+) mb", lowered)
+    if download is not None:
+        received, total = int(download[1]), max(1, int(download[2]))
+        return 12 + min(
+            5, round(5 * received / total)
+        ), f"Downloading anime tagger ({received}/{total} MB)"
+    tagging = re.search(r"\[tagger\] image (\d+)/(\d+):", lowered)
+    if tagging is not None:
+        current, total = int(tagging[1]), max(1, int(tagging[2]))
+        return 18 + min(
+            9, round(9 * current / total)
+        ), f"Tagging anime images ({current}/{total})"
+    if "[tagger]" in lowered:
+        return 18, "Loading the anime tagger"
     if "[prepare]" in lowered:
         return 12, "Preparing photos"
     if "dataset '" in lowered and "prepared at:" in lowered:

@@ -12,6 +12,15 @@ from typing import Any, cast
 
 BLIP_MODEL_ID = "Salesforce/blip-image-captioning-large"
 BLIP_MODEL_REVISION = "353689b859fcf0523410b1806dace5fb46ecdf41"
+CAPTION_MODES = ("auto", "anime", "template", "blip")
+
+
+def resolve_caption_mode(mode: str, model_profile: str, *, vision: bool = False) -> str:
+    if mode != "auto":
+        return mode
+    if model_profile != "sdxl":
+        return "anime"
+    return "blip" if vision else "template"
 
 
 def caption_contains_trigger(caption: str, trigger: str) -> bool:
@@ -120,6 +129,10 @@ def make_caption(
     mode: str = "template",
     hint: str = "",
 ) -> str:
+    if mode == "anime":
+        from .anime_tagger import anime_caption
+
+        return anime_caption(image_path, trigger)
     if mode == "blip":
         return blip_caption(image_path, trigger)
     return template_caption(trigger, hint)

@@ -66,6 +66,12 @@ class ProjectDraft:
     use_vision_captions: bool = False
     overwrite_existing: bool = False
     training_steps: int | None = None
+    use_anime_tags: bool = True
+
+    def caption_mode(self, model_profile: str = "sdxl") -> str:
+        if model_profile != "sdxl" and self.use_anime_tags:
+            return "anime"
+        return "blip" if self.use_vision_captions else "template"
 
     @property
     def effective_steps(self) -> int:
@@ -81,6 +87,7 @@ class ProjectDraft:
             use_vision_captions=self.use_vision_captions,
             overwrite_existing=self.overwrite_existing,
             training_steps=self.training_steps,
+            use_anime_tags=self.use_anime_tags,
         )
 
     def validation_errors(self, *, require_source: bool = True) -> tuple[str, ...]:

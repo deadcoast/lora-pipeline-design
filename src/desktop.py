@@ -1006,6 +1006,19 @@ class MainWindow(QMainWindow):
         self.preview_suite_hint.setAccessibleName("Preview shots for this model")
         grid.addWidget(self.preview_suite_hint, 8, 0, 1, 2)
 
+        self.anime_tags_checkbox = QCheckBox(
+            "Tag uncaptioned anime images automatically"
+        )
+        self.anime_tags_checkbox.setObjectName("animeTagsCheck")
+        self.anime_tags_checkbox.setChecked(True)
+        self.anime_tagger_hint = _hint(
+            "WD ViT v3 downloads once (361 MB), then runs on this computer. "
+            "Review and edit the generated tags before training."
+        )
+        grid.addWidget(self.anime_tags_checkbox, 9, 0, 1, 2)
+        grid.addWidget(self.anime_tagger_hint, 10, 0, 1, 2)
+        self.anime_tags_checkbox.toggled.connect(self._anime_tagging_changed)
+
         self.vision_checkbox = QCheckBox(
             "Describe untagged images with BLIP (advanced; downloads a vision model)"
         )
@@ -1025,8 +1038,8 @@ class MainWindow(QMainWindow):
             "dataset and allows new checkpoints, grids, run records, and the "
             "installed ComfyUI LoRA to supersede older outputs."
         )
-        grid.addWidget(self.vision_checkbox, 9, 0, 1, 2)
-        grid.addWidget(self.overwrite_checkbox, 10, 0, 1, 2)
+        grid.addWidget(self.vision_checkbox, 11, 0, 1, 2)
+        grid.addWidget(self.overwrite_checkbox, 12, 0, 1, 2)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         page.addWidget(project_card)
@@ -1749,6 +1762,7 @@ class MainWindow(QMainWindow):
         if index >= 0:
             self.preset_combo.setCurrentIndex(index)
         self.training_steps_spin.setValue(last.training_steps or 0)
+        self.anime_tags_checkbox.setChecked(last.use_anime_tags)
         self._update_training_hints()
         self.vision_checkbox.setChecked(
             last.use_vision_captions and os.environ.get("MIVIM_PACKAGED_APP") != "1"
@@ -2778,6 +2792,10 @@ class MainWindow(QMainWindow):
         if self.source_folder is not None:
             self._photo_folder_changed(self.source_folder)
 
+    def _anime_tagging_changed(self, *_args: object) -> None:
+        self._update_training_hints()
+        self._invalidate_readiness()
+
     def _training_steps_changed(self, *_args: object) -> None:
         self._update_training_hints()
         self._invalidate_readiness()
@@ -2792,19 +2810,29 @@ class MainWindow(QMainWindow):
         self.training_duration_hint.setText(
             duration + ". Compare saved checkpoints to choose when to stop learning."
         )
+        anime = self.model_profile_combo.currentData() != "sdxl"
+        auto_tags = anime and self.anime_tags_checkbox.isChecked()
+        self.anime_tags_checkbox.setVisible(anime)
+        self.anime_tagger_hint.setVisible(anime)
+        self.vision_checkbox.setEnabled(not auto_tags)
+        missing_caption_hint = (
+            "Untagged images get automatic anime tags. "
+            if auto_tags
+            else "Missing captions use BLIP if enabled, otherwise the identity phrase. "
+        )
         if self.source_summary:
             captioned = self.source_summary.captioned_count
             self.caption_source_hint.setText(
                 f"{captioned} of {count} unique images have .txt captions to import. "
-                "Missing captions use BLIP if enabled, otherwise the identity phrase. "
-                "Review and edit them after preparation."
+                + missing_caption_hint
+                + "Review and edit them after preparation."
             )
         else:
             self.caption_source_hint.setText(
                 "Existing .txt captions beside your images are imported automatically. "
-                "Untagged images get the identity phrase; edit them after preparation."
+                + missing_caption_hint
+                + "Edit them after preparation."
             )
-        anime = self.model_profile_combo.currentData() != "sdxl"
         self.preview_suite_hint.setText(
             "Anime previews: face, full body, profile and action · 832×1216. "
             "The same shots are used during training and in the final strength comparison. "
@@ -2826,6 +2854,7 @@ class MainWindow(QMainWindow):
             use_vision_captions=self.vision_checkbox.isChecked(),
             overwrite_existing=self.overwrite_checkbox.isChecked(),
             training_steps=self.training_steps_spin.value() or None,
+            use_anime_tags=self.anime_tags_checkbox.isChecked(),
         )
 
     def review_project(self) -> None:

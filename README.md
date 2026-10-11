@@ -91,7 +91,12 @@ releases and acceptance limits.
 
 - Imports existing UTF-8 `.txt` captions beside source images, preserving tag
   order and adding the identity phrase only when it is missing. Images without
-  captions use the phrase or optional BLIP descriptions. Prepared captions remain editable.
+  captions in NoobAI projects are tagged automatically with local WD ViT v3.
+  Prepared captions remain editable. Standard SDXL keeps template/optional BLIP captions.
+- **Automatic anime tagging is on by default** for both NoobAI profiles, in
+  source and packaged Windows versions. The model downloads once (361 MB), then
+  works offline on CPU. Download and per-image progress appear in the run view;
+  no images are uploaded. The Project checkbox can disable automatic tags.
 - Offers a **Training steps** control independent of the rank/resolution plan.
   **Plan default** restores the preset length; the image count shows approximate
   presentations per source at batch size 1. Short runs still save intermediate
