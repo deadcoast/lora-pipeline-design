@@ -69,6 +69,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -315,15 +316,15 @@ class PhotoDropZone(QFrame):
             "font-size: 28px; color: #73bfff; font-weight: 300;"
         )
         self.icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.title_label = QLabel("Choose a folder of training photos")
+        self.title_label = QLabel("Choose a folder of training images")
         self.title_label.setObjectName("dropTitle")
         self.title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detail_label = _hint(
-            "Drop a folder here, or browse. Use 15–40 clear, varied photos of one person."
+            "Drop a folder here, or browse. Use varied images of one person or character."
         )
         self.detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.detail_label.setMaximumWidth(580)
-        self.browse_button = _button("Browse photos", "primaryButton")
+        self.browse_button = _button("Browse images", "primaryButton")
         self.browse_button.setObjectName("choosePhotosButton")
         self.browse_button.clicked.connect(self._browse)
         layout.addWidget(self.icon_label)
@@ -335,7 +336,7 @@ class PhotoDropZone(QFrame):
     def _browse(self) -> bool:
         selected = QFileDialog.getExistingDirectory(
             self,
-            "Choose training photo folder",
+            "Choose training image folder",
             str(Path.home() / "Pictures"),
             QFileDialog.Option.ShowDirsOnly,
         )
@@ -890,7 +891,7 @@ class MainWindow(QMainWindow):
         save_button.setObjectName("saveSettingsButton")
         save_button.clicked.connect(self.save_current_settings)
         footer.addWidget(save_button)
-        continue_button = _button("Continue to photos  →", "primaryButton")
+        continue_button = _button("Continue to images  →", "primaryButton")
         continue_button.setObjectName("continueToProjectButton")
         continue_button.clicked.connect(self.continue_to_project)
         footer.addWidget(continue_button)
@@ -917,7 +918,7 @@ class MainWindow(QMainWindow):
             _page_header(
                 "New project",
                 "Who are you teaching the model?",
-                "Choose varied source photos. Recommended settings are selected "
+                "Choose varied source images. Recommended settings are selected "
                 "for you and the technical controls stay optional.",
             )
         )
@@ -927,7 +928,7 @@ class MainWindow(QMainWindow):
         self.photo_summary = _hint("No folder selected.")
         photo_summary_row = QHBoxLayout()
         photo_summary_row.addWidget(self.photo_summary, 1)
-        self.review_photos_button = _button("Review photo checks")
+        self.review_photos_button = _button("Review images")
         self.review_photos_button.setObjectName("reviewPhotoChecksButton")
         self.review_photos_button.setEnabled(False)
         self.review_photos_button.clicked.connect(self.review_photo_checks)
@@ -970,17 +971,43 @@ class MainWindow(QMainWindow):
             "Balanced — recommended", TrainingPreset.BALANCED.value
         )
         self.preset_combo.addItem("Fast draft", TrainingPreset.FAST.value)
-        self.preset_combo.addItem("High quality", TrainingPreset.QUALITY.value)
+        self.preset_combo.addItem("Extended training", TrainingPreset.QUALITY.value)
         self.preset_combo.setAccessibleName("Training quality plan")
         grid.addWidget(self.preset_combo, 4, 0)
+        steps_label = _title("Training steps")
+        grid.addWidget(steps_label, 3, 1)
+        self.training_steps_spin = QSpinBox()
+        self.training_steps_spin.setObjectName("trainingStepsSpin")
+        self.training_steps_spin.setAccessibleName(
+            "Training steps; zero uses the plan default"
+        )
+        self.training_steps_spin.setRange(0, 100000)
+        self.training_steps_spin.setSingleStep(100)
+        self.training_steps_spin.setGroupSeparatorShown(True)
+        self.training_steps_spin.setSpecialValueText("Plan default (2,000)")
+        steps_label.setBuddy(self.training_steps_spin)
+        grid.addWidget(self.training_steps_spin, 4, 1)
         self.preset_hint = _hint(
-            "Balanced uses 1024 px photos, a no-LoRA baseline, and three strengths."
+            "Balanced uses rank 16, 1024 px preparation, a no-LoRA baseline, and three strengths."
         )
         grid.addWidget(self.preset_hint, 5, 0, 1, 2)
         self.preset_combo.currentIndexChanged.connect(self._preset_changed)
+        self.training_steps_spin.valueChanged.connect(self._training_steps_changed)
+
+        self.training_duration_hint = _hint("")
+        grid.addWidget(self.training_duration_hint, 6, 0, 1, 2)
+        self.caption_source_hint = _hint(
+            "Existing .txt captions beside your images are imported automatically. "
+            "Untagged images get the identity phrase; edit them after preparation."
+        )
+        self.caption_source_hint.setAccessibleName("Source caption summary")
+        grid.addWidget(self.caption_source_hint, 7, 0, 1, 2)
+        self.preview_suite_hint = _hint("")
+        self.preview_suite_hint.setAccessibleName("Preview shots for this model")
+        grid.addWidget(self.preview_suite_hint, 8, 0, 1, 2)
 
         self.vision_checkbox = QCheckBox(
-            "Describe each photo automatically (advanced; downloads a vision model)"
+            "Describe untagged images with BLIP (advanced; downloads a vision model)"
         )
         self.vision_checkbox.setObjectName("visionCaptionCheck")
         self.vision_checkbox.setToolTip(
@@ -998,8 +1025,8 @@ class MainWindow(QMainWindow):
             "dataset and allows new checkpoints, grids, run records, and the "
             "installed ComfyUI LoRA to supersede older outputs."
         )
-        grid.addWidget(self.vision_checkbox, 6, 0, 1, 2)
-        grid.addWidget(self.overwrite_checkbox, 7, 0, 1, 2)
+        grid.addWidget(self.vision_checkbox, 9, 0, 1, 2)
+        grid.addWidget(self.overwrite_checkbox, 10, 0, 1, 2)
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         page.addWidget(project_card)
@@ -1721,6 +1748,8 @@ class MainWindow(QMainWindow):
         index = self.preset_combo.findData(last.preset.value)
         if index >= 0:
             self.preset_combo.setCurrentIndex(index)
+        self.training_steps_spin.setValue(last.training_steps or 0)
+        self._update_training_hints()
         self.vision_checkbox.setChecked(
             last.use_vision_captions and os.environ.get("MIVIM_PACKAGED_APP") != "1"
         )
@@ -2563,6 +2592,9 @@ class MainWindow(QMainWindow):
     def _model_profile_changed(self, *_args: object) -> None:
         self._update_model_profile_hint()
         self._invalidate_readiness()
+        self._update_training_hints()
+        if self.source_folder is not None:
+            self._photo_folder_changed(self.source_folder)
 
     def _connection_changed(self, *_args: object) -> None:
         self.comfy_status = None
@@ -2622,6 +2654,7 @@ class MainWindow(QMainWindow):
     def _photo_folder_changed(self, folder: Path) -> None:
         self.source_folder = folder
         self.source_summary = None
+        self._update_training_hints()
         self.review_photos_button.setEnabled(False)
         self._invalidate_readiness()
         if not self.project_name_edit.text().strip():
@@ -2638,10 +2671,13 @@ class MainWindow(QMainWindow):
         )
 
         preset = TrainingPreset(self.preset_combo.currentData())
+        illustrations = self.model_profile_combo.currentData() != "sdxl"
         self._source_request += 1
         request = self._source_request
         self._run_worker(
-            lambda: inspect_source(folder, target_size=preset.image_size),
+            lambda: inspect_source(
+                folder, target_size=preset.image_size, illustrations=illustrations
+            ),
             lambda result: self._source_inspected_for(request, folder, preset, result),
             lambda message: self._source_inspection_failed(
                 request, folder, preset, message
@@ -2692,8 +2728,9 @@ class MainWindow(QMainWindow):
             ),
         )
         self.source_summary = summary
+        self._update_training_hints()
         self.review_photos_button.setEnabled(True)
-        detail = f"{summary.usable_count} usable photo(s)"
+        detail = f"{summary.usable_count} usable image(s)"
         if summary.unreadable_count:
             detail += f" • {summary.unreadable_count} unreadable"
         if summary.small_count:
@@ -2720,22 +2757,62 @@ class MainWindow(QMainWindow):
         preset = TrainingPreset(self.preset_combo.currentData())
         descriptions = {
             TrainingPreset.FAST: (
-                "Fast draft uses 900 training steps, rank 8, 768 px preparation, "
+                "Fast draft uses rank 8, 768 px preparation, "
                 "a no-LoRA baseline, and one validation strength."
             ),
             TrainingPreset.BALANCED: (
-                "Balanced uses 2,000 steps, rank 16, 1024 px preparation, and "
+                "Balanced uses rank 16, 1024 px preparation, and "
                 "a no-LoRA baseline plus three comparison strengths."
             ),
             TrainingPreset.QUALITY: (
-                "High quality uses 3,000 steps, rank 32, and a wider comparison "
-                "sweep. Expect a longer run and larger model."
+                "Extended training uses rank 32 and a wider comparison sweep. "
+                "More steps or rank do not automatically improve the result."
             ),
         }
         self.preset_hint.setText(descriptions[preset])
+        self.training_steps_spin.setSpecialValueText(
+            f"Plan default ({preset.training_steps:,})"
+        )
+        self._update_training_hints()
         self._invalidate_readiness()
         if self.source_folder is not None:
             self._photo_folder_changed(self.source_folder)
+
+    def _training_steps_changed(self, *_args: object) -> None:
+        self._update_training_hints()
+        self._invalidate_readiness()
+
+    def _update_training_hints(self) -> None:
+        preset = TrainingPreset(self.preset_combo.currentData())
+        steps = self.training_steps_spin.value() or preset.training_steps
+        count = self.source_summary.unique_usable_count if self.source_summary else 0
+        duration = f"{steps:,} training steps"
+        if count:
+            duration += f" · about {steps / count:,.1f} image presentations per source (batch 1)"
+        self.training_duration_hint.setText(
+            duration + ". Compare saved checkpoints to choose when to stop learning."
+        )
+        if self.source_summary:
+            captioned = self.source_summary.captioned_count
+            self.caption_source_hint.setText(
+                f"{captioned} of {count} unique images have .txt captions to import. "
+                "Missing captions use BLIP if enabled, otherwise the identity phrase. "
+                "Review and edit them after preparation."
+            )
+        else:
+            self.caption_source_hint.setText(
+                "Existing .txt captions beside your images are imported automatically. "
+                "Untagged images get the identity phrase; edit them after preparation."
+            )
+        anime = self.model_profile_combo.currentData() != "sdxl"
+        self.preview_suite_hint.setText(
+            "Anime previews: face, full body, profile and action · 832×1216. "
+            "The same shots are used during training and in the final strength comparison. "
+            "Use a unique character trigger; keep clothing, pose and background tags in captions."
+            if anime
+            else "Photo previews compare portraits, studio and outdoor scenes. "
+            "Choose a NoobAI profile in Connect for anime character previews."
+        )
 
     def _build_draft(self) -> ProjectDraft:
         missing = self.service.root / ".no-photo-folder-selected"
@@ -2748,6 +2825,7 @@ class MainWindow(QMainWindow):
             preset=preset,
             use_vision_captions=self.vision_checkbox.isChecked(),
             overwrite_existing=self.overwrite_checkbox.isChecked(),
+            training_steps=self.training_steps_spin.value() or None,
         )
 
     def review_project(self) -> None:

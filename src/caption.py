@@ -1,16 +1,7 @@
-"""Captioning helpers.
+"""Import existing captions, or create template/BLIP captions for untagged images.
 
-Two strategies:
-  1. template   (default) — writes "<trigger>, <class>" plus any per-image hint.
-                 Fast, dependency-free, and for a single-person identity LoRA it's
-                 often ALL you need: the identity is carried by the trigger token,
-                 and over-describing the face can actually hurt.
-  2. blip       (--vision) — uses a local BLIP model to describe each image, then
-                 prepends the trigger token. Requires transformers + torch.
-
-For a person LoRA the recommended default is:  trigger="ohwx person".
-Use a RARE token ("ohwx", "sks", a made-up string) so it doesn't collide with
-concepts the base model already knows.
+UTF-8 .txt files beside source images take priority. This preserves manually
+edited descriptions and tagger output, including native anime tags.
 """
 
 from __future__ import annotations
@@ -21,6 +12,38 @@ from typing import Any, cast
 
 BLIP_MODEL_ID = "Salesforce/blip-image-captioning-large"
 BLIP_MODEL_REVISION = "353689b859fcf0523410b1806dace5fb46ecdf41"
+
+
+def caption_contains_trigger(caption: str, trigger: str) -> bool:
+    """Return whether a caption contains the required phrase as complete words."""
+    normalized_caption = " ".join(caption.casefold().split())
+    normalized_trigger = " ".join(trigger.casefold().split())
+    if not normalized_caption or not normalized_trigger:
+        return False
+    start = 0
+    while (position := normalized_caption.find(normalized_trigger, start)) >= 0:
+        before = normalized_caption[position - 1] if position else ""
+        end = position + len(normalized_trigger)
+        after = normalized_caption[end] if end < len(normalized_caption) else ""
+        if not (before.isalnum() or before == "_") and not (
+            after.isalnum() or after == "_"
+        ):
+            return True
+        start = position + 1
+    return False
+
+
+def source_caption(image_path: Path, trigger: str) -> str | None:
+    """Read the original sidecar without changing its tags or their order."""
+    sidecar = image_path.with_suffix(".txt")
+    if not sidecar.is_file():
+        return None
+    caption = sidecar.read_text(encoding="utf-8-sig").strip()
+    if not caption:
+        return None
+    if caption_contains_trigger(caption, trigger):
+        return caption
+    return template_caption(trigger, caption)
 
 
 def template_caption(trigger: str, hint: str = "") -> str:

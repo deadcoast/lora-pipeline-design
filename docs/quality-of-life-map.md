@@ -77,6 +77,12 @@ not used.
 
 ## Explicit next roadmap
 
+Anime projects now import source tag captions, show caption coverage, expose
+training steps independently from the plan, and compare consistent anime shots
+during training and final review. The next feature gaps are an optional anime
+tagger for uncaptioned datasets and user-editable comparison prompt sets.
+Neither is represented as shipped in 0.7.0.
+
 These items remain future work and are not represented as complete:
 
 - face-count and multi-person source-photo checks;

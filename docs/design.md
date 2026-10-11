@@ -394,3 +394,20 @@ Comfy Desktop instance and a rebuilt Windows app; model generation is separate.
 
 See [model support](model-support.md) for source authority, variant-specific
 settings, the V-pred training gate, and the qualification boundary.
+
+## Anime project controls — 2026-10-11
+
+The Project form retains the existing native Qt grid and theme. Training plan
+and Training steps sit side by side: plan selects rank/resolution and the
+comparison sweep; an optional step count controls run length. Zero displays
+**Plan default**, including that plan's numeric value. Explicit overrides
+survive plan changes and project reloads. The source summary supplies the
+per-image presentation estimate and imported-caption coverage; neither is a
+new approval gate. **Extended training** replaces the misleading **High quality** label.
+
+NoobAI profiles show their four anime review shots and portrait canvas on the
+Project page. The same prompt definitions feed bundled ai-toolkit previews,
+the ComfyUI strength grid, and the exported workflow. Standard SDXL keeps its
+photo suite. Existing source captions are always preferred, with editable
+prepared captions as the normal follow-up. Flat illustrations skip the photo
+blur heuristic. The form remains scrollable at the minimum window size.

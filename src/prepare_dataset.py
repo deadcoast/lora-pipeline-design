@@ -32,7 +32,7 @@ from typing import TypedDict, cast
 from PIL import Image, ImageOps
 
 from . import config
-from .caption import BLIP_MODEL_ID, BLIP_MODEL_REVISION, make_caption
+from .caption import BLIP_MODEL_ID, BLIP_MODEL_REVISION, make_caption, source_caption
 from .comfy_activity import check_orphaned_comfy_prompts
 from .dataset_pairs import scan_dataset_pairs
 from .io_utils import atomic_write_bytes, atomic_write_text
@@ -147,12 +147,18 @@ def _source_manifest(
                 f"{digests[sha256]} and {image}."
             )
         digests[sha256] = image
+        sidecar = image.with_suffix(".txt")
         sources.append(
             {
                 "path": image.relative_to(src).as_posix(),
                 "size": image.stat().st_size,
                 "mtime_ns": image.stat().st_mtime_ns,
                 "sha256": sha256,
+                **(
+                    {"caption_sha256": _sha256_file(sidecar)}
+                    if sidecar.is_file()
+                    else {}
+                ),
             }
         )
 
@@ -244,8 +250,8 @@ def source_files_match_manifest(src: Path, manifest: object) -> bool:
     The desktop uses this before reusing already-prepared pairs.  Rebuilding the
     source entries through the same path as preparation catches added/removed
     unique content and changes even when a file's size and timestamp were
-    preserved.  Paths, renames, and exact duplicate files do not matter because
-    they cannot change the already-prepared training pairs.
+    preserved. Source caption edits also require preparation again; edits to
+    the prepared captions remain available without rebuilding.
     """
 
     if (
@@ -290,8 +296,14 @@ def source_files_match_manifest(src: Path, manifest: object) -> bool:
     ):
         return False
     return {
-        entry["sha256"] for entry in current_sources if isinstance(entry, dict)
-    } == {entry["sha256"] for entry in previous_sources if isinstance(entry, dict)}
+        (entry["sha256"], entry.get("caption_sha256", ""))
+        for entry in current_sources
+        if isinstance(entry, dict)
+    } == {
+        (entry["sha256"], entry.get("caption_sha256", ""))
+        for entry in previous_sources
+        if isinstance(entry, dict)
+    }
 
 
 def _validate_source_manifest(
@@ -320,7 +332,7 @@ def _validate_source_manifest(
             )
         if previous.get("sources") != current["sources"]:
             raise ValueError(
-                "Source images changed since this dataset was prepared; "
+                "Source images changed or captions were edited since preparation; "
                 "use --overwrite to rebuild it safely."
             )
         if previous.get("settings") != current["settings"]:
@@ -416,7 +428,12 @@ def _prepare_images(
             encoded = io.BytesIO()
             img.save(encoded, "PNG")
             atomic_write_bytes(img_out, encoded.getvalue())
-            caption = make_caption(img_out, trigger=trigger, mode=caption_mode)
+            imported_caption = source_caption(path, trigger)
+            if imported_caption is None:
+                caption = make_caption(img_out, trigger=trigger, mode=caption_mode)
+            else:
+                caption = imported_caption
+                print(f"  [caption] Imported {path.with_suffix('.txt').name}")
             atomic_write_text(txt_out, caption)
             report["ok"] += 1
             report["caption_lengths"].append(len(caption.split()))

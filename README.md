@@ -1,11 +1,11 @@
 # MIVIM LoRA Studio
 
-MIVIM LoRA Studio is a guided Windows companion for training a person LoRA and
-using it with Comfy Desktop. The normal workflow is visual: choose photos,
+MIVIM LoRA Studio is a guided Windows companion for training a person or anime
+character LoRA and using it with Comfy Desktop. The normal workflow is visual: choose images,
 review readiness, start the run, and inspect the comparison grid. Casual users
 do not need to edit YAML, `.env`, API ports, or ComfyUI node IDs.
 
-The current release covers one-person SDXL LoRAs:
+The current release covers SDXL identity LoRAs, including NoobAI anime profiles:
 
 ```text
 photos → quality checks → preparation → ai-toolkit training
@@ -89,6 +89,18 @@ releases and acceptance limits.
 
 ### New project
 
+- Imports existing UTF-8 `.txt` captions beside source images, preserving tag
+  order and adding the identity phrase only when it is missing. Images without
+  captions use the phrase or optional BLIP descriptions. Prepared captions remain editable.
+- Offers a **Training steps** control independent of the rank/resolution plan.
+  **Plan default** restores the preset length; the image count shows approximate
+  presentations per source at batch size 1. Short runs still save intermediate
+  checkpoints and previews.
+- NoobAI training previews and final comparisons share four shots: face, full
+  body, profile, and action at 832×1216. Photographic prompts remain available
+  with standard SDXL; custom training YAML retains its own prompts.
+- Disables photographic blur heuristics for anime profiles so flat shading is
+  not treated as a blurry photograph. Aspect ratio is preserved during preparation.
 - Native folder picker and drag-and-drop photo selection.
 - Plain-language project name and identity phrase.
 - Checks unreadable files, exact duplicates, image count, and undersized photos

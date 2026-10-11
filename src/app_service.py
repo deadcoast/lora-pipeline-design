@@ -34,6 +34,7 @@ from .app_models import (
     TrainingPreset,
     ValidationRecovery,
 )
+from .caption import caption_contains_trigger, source_caption
 from .comfy_desktop import (
     ComfyApiStatus,
     ComfyDesktopDiscovery,
@@ -144,6 +145,7 @@ class SourceSummary:
     small_count: int
     duplicate_count: int
     issues: tuple[SourceIssue, ...] = ()
+    captioned_count: int = 0
 
     @property
     def usable_count(self) -> int:
@@ -524,27 +526,6 @@ def _project_model_files(folder: Path | None, project_name: str) -> tuple[Path, 
         return ()
 
 
-def caption_contains_trigger(caption: str, trigger: str) -> bool:
-    """Return whether a caption contains the required phrase as complete words."""
-
-    normalized_caption = " ".join(caption.casefold().split())
-    normalized_trigger = " ".join(trigger.casefold().split())
-    if not normalized_caption or not normalized_trigger:
-        return False
-
-    start = 0
-    while (position := normalized_caption.find(normalized_trigger, start)) >= 0:
-        before = normalized_caption[position - 1] if position else ""
-        end = position + len(normalized_trigger)
-        after = normalized_caption[end] if end < len(normalized_caption) else ""
-        before_is_word = before.isalnum() or before == "_"
-        after_is_word = after.isalnum() or after == "_"
-        if not before_is_word and not after_is_word:
-            return True
-        start = position + 1
-    return False
-
-
 def _photo_signature(image: Image.Image) -> tuple[int, bytes]:
     """Return small local-only signatures used for conservative similarity checks."""
 
@@ -587,7 +568,9 @@ def _near_duplicate(
     return rms <= 8.0
 
 
-def inspect_source(folder: Path, *, target_size: int = 1024) -> SourceSummary:
+def inspect_source(
+    folder: Path, *, target_size: int = 1024, illustrations: bool = False
+) -> SourceSummary:
     """Inspect real inputs without modifying them.
 
     Verifying every selected image is intentionally part of the product flow:
@@ -599,6 +582,7 @@ def inspect_source(folder: Path, *, target_size: int = 1024) -> SourceSummary:
     unreadable = 0
     small = 0
     duplicate = 0
+    captioned = 0
     issues: list[SourceIssue] = []
     digests: dict[str, Path] = {}
     signatures: list[tuple[Path, tuple[int, bytes]]] = []
@@ -636,6 +620,10 @@ def inspect_source(folder: Path, *, target_size: int = 1024) -> SourceSummary:
                 )
             else:
                 digests[fingerprint] = path
+                try:
+                    captioned += source_caption(path, "") is not None
+                except (OSError, UnicodeError):
+                    pass  # Preparation reports a caption that cannot be imported.
                 signature = _photo_signature(image)
                 similar = next(
                     (
@@ -656,7 +644,7 @@ def inspect_source(folder: Path, *, target_size: int = 1024) -> SourceSummary:
                         )
                     )
                 signatures.append((path, signature))
-            if _looks_blurry(image):
+            if not illustrations and _looks_blurry(image):
                 issues.append(
                     SourceIssue(
                         "blurry",
@@ -680,6 +668,7 @@ def inspect_source(folder: Path, *, target_size: int = 1024) -> SourceSummary:
         small,
         duplicate,
         tuple(issues),
+        captioned,
     )
 
 
@@ -762,9 +751,7 @@ def inspect_prepared_dataset(
             and draft.source_dir.is_dir()
             and not source_files_match_manifest(draft.source_dir, manifest)
         ):
-            manifest_error = (
-                "The source photo set changed after preparation; rebuild it."
-            )
+            manifest_error = "The source photo set changed or source captions were edited; rebuild it."
     except (
         FileNotFoundError,
         KeyError,
@@ -907,7 +894,8 @@ def _caption_readiness_item(draft: ProjectDraft) -> ReadinessItem:
             "captions",
             "Photo descriptions",
             "ready",
-            "Using the built-in local caption template.",
+            "Imports existing .txt captions; untagged images get the trigger phrase. "
+            "You can edit every caption before training.",
         )
     if _module_available("torch") and _module_available("transformers"):
         return ReadinessItem(
@@ -1922,6 +1910,7 @@ class ApplicationService:
                 source = inspect_source(
                     source_path,
                     target_size=draft.preset.image_size,
+                    illustrations=settings.model_profile != "sdxl",
                 )
                 items.append(_source_readiness_item(source))
             items.append(_caption_readiness_item(draft))
@@ -2696,6 +2685,8 @@ class ApplicationService:
             args.extend(("--src", str(draft.source_dir)))
         if draft.use_vision_captions:
             args.append("--vision")
+        if draft.training_steps is not None:
+            args.extend(("--steps", str(draft.training_steps)))
         if draft.overwrite_existing:
             args.append("--overwrite")
         if settings.training_base_model is not None:

@@ -308,6 +308,7 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
             output_dir=config.CHECKPOINTS_DIR,
             preset=preset,
             base_model=getattr(args, "base_model", None),
+            steps=getattr(args, "steps", None),
         )
         if code != 0:
             raise RuntimeError(
@@ -385,7 +386,7 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
         validation_signature = validator.validation_signature(
             lora=installed_lora_name,
             strengths=args.strengths,
-            prompts=validator.DEFAULT_PROMPTS,
+            prompts=validator.default_prompts(),
             trigger=trigger,
             seed=args.seed,
             lora_content_identity=verified_lora_fingerprint,
@@ -414,7 +415,7 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
         grid_path = validator.validate(
             lora=lora_name,
             strengths=args.strengths,
-            prompts=validator.DEFAULT_PROMPTS,
+            prompts=validator.default_prompts(),
             trigger=trigger,
             seed=args.seed,
             run_name=name,
@@ -545,6 +546,9 @@ def main(argv: Sequence[str] | None = None) -> None:
         "--base-model",
         type=Path,
         help="Local SDXL checkpoint path passed to the trainer.",
+    )
+    ap.add_argument(
+        "--steps", type=int, help="Override the training plan's step count."
     )
     ap.add_argument(
         "--strengths",

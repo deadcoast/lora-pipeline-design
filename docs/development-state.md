@@ -186,3 +186,51 @@ counter in Results; these were corrected before the passing source/package
 runs. Its failure remains in `dist/comfy-connect-regression.log`. Previous
 package directories were preserved. No manual edits were made to Comfy Desktop
 source or settings; Desktop managed its own normal startup state.
+
+## Anime workflow feature review — 2026-10-11, 0.7.0
+
+The review found three product gaps: source tag captions were discarded,
+NoobAI still used photographic review prompts, and training length could not
+be changed independently of the plan. All three are now implemented in the
+desktop and underlying pipeline:
+
+- Import matching UTF-8 sidecars before caption generation, retain tag order,
+  and prepend only a missing trigger. Project shows caption coverage; the
+  existing editor remains the place to adjust prepared captions.
+- Use matching anime face/full-body/profile/action shots during bundled
+  training and final comparison, at 832×1216, with profile-specific sampling.
+  Custom training YAML preserves its own prompts.
+- Persist a per-project step override, pass it through both CLI entry points,
+  and shorten save/sample intervals for short experiments. The form estimates
+  presentations per source image, and zero restores the current plan default.
+- Skip photographic blur warnings in anime mode, preserve aspect ratio, and
+  label the longer plan **Extended training** rather than promising quality.
+
+The built Windows app prepared a 12-image mixed-caption fixture through its
+normal controls: ten tag captions imported (including a UTF-8 BOM and a caption
+already containing the trigger), two trigger-only fallbacks, unchanged source
+files, and preserved aspect ratios. Its caption editor displayed the imported
+tags. Native step editing showed 400 → 600 → Plan default (2,000) → 400.
+Both NoobAI config outputs use 400 steps, 100-step snapshots, and the same
+four prompts/dimensions/negative prompt as their exported ComfyUI workflows.
+The model-file placeholder used for config checks is explicitly not weights;
+no GPU training or generated-image quality claim is made.
+
+Existing source checks: 326 passed, three packaged cases deselected. Rebuilt
+package checks: four passed. Ruff, Mypy, Pyright, wheel build and whitespace
+checks passed. Project screenshots were inspected at the normal size and at
+1040×740 with the form scrolled to its actions. No new test suite or security
+gate was added. Earlier checks caught outdated copy assertions and accidentally
+ran the older default package; those logs remain available.
+
+- Executable: `dist/anime-core-0.7.0-final/MIVIMLoRAStudio.dist/MIVIMLoRAStudio.exe`.
+- SHA-256: `13B9C3FE4319509D666CC78171764CE3A41CA869088F0B06C1F77C3D2A0E1D9A`.
+- Feature record: `dist/anime-core-acceptance/feature-results.json`.
+- UI: `dist/anime-core-native-controls.log`, `dist/anime-core-project-final.png`,
+  `dist/anime-core-project-minimum.png`.
+- Checks: `dist/anime-core-source-release.log`, `dist/anime-core-package.log`.
+
+The next useful feature gaps are automatic anime tagging and editable preview
+prompt sets. Existing source imports and the four built-in shots do not imply
+those features are already present. Actual NoobAI training quality still needs
+a run with model weights and visual review of its saved checkpoints.

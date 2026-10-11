@@ -135,3 +135,28 @@ The initial old-executable handoff failure on the new settings schema is
 preserved as historical evidence; the new executable passes that acceptance
 case. An initial rebuild also failed on the moved environment's stale launcher;
 `dist/noobai-0.6.1-build.log` retains that failure before the launcher repair.
+
+## Anime workflow improvements in 0.7.0
+
+The anime profiles now change the review content as well as the sampler. The
+bundled training template and final strength grid use the same face, full-body,
+profile, and action prompts. Their 832×1216 canvas follows the publisher's
+[Epsilon recommendations](https://huggingface.co/Laxhar/noobai-XL-1.1) and
+[V-pred example](https://huggingface.co/Laxhar/noobai-XL-Vpred-1.0).
+These are character consistency comparisons, not a benchmark proving model quality.
+The prompts do not force a particular linework or shading style over the learned identity.
+Custom training YAML keeps its authored prompts; its previews may therefore
+differ from the final built-in comparison suite.
+
+Preparation imports matching UTF-8 `.txt` sidecars before considering BLIP or
+the trigger-only fallback. Tag spelling, underscores, and order are retained;
+the trigger is prepended only if absent. Originals remain untouched. A source
+caption edit is included in the existing preparation record, while edits made
+in the prepared-caption editor remain reusable. Untagged anime images still
+need caption review: this release does not include an automatic anime tagger.
+
+Training duration is a separate project choice. `--steps N` works in both
+`src.train` and `src.pipeline`, and the desktop persists the same choice.
+The override changes steps, not learning rate, rank, or training resolution.
+For a short run, checkpoint/preview intervals shrink to at most one quarter of
+the step count. No optimum step count is inferred from image count alone.

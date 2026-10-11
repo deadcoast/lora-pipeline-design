@@ -8,6 +8,32 @@ from typing import Any
 
 from .toolkit_vpred import TRAINER_SOURCE, velocity_target
 
+# Shared by the training previews and the final strength comparison. Keep the
+# prompts neutral about drawing style so they can reveal what the LoRA learned.
+ANIME_PREVIEW_PROMPTS = (
+    (
+        "masterpiece, best quality, {trigger}, solo, portrait, looking at viewer, "
+        "neutral expression, simple background"
+    ),
+    (
+        "masterpiece, best quality, {trigger}, solo, full body, standing, "
+        "shirt, pants, shoes, simple background"
+    ),
+    (
+        "masterpiece, best quality, {trigger}, solo, upper body, profile, "
+        "looking to the side, simple background"
+    ),
+    (
+        "masterpiece, best quality, {trigger}, solo, full body, running, "
+        "jacket, pants, outdoors, park"
+    ),
+)
+ANIME_PREVIEW_LABELS = ("Face", "Full body", "Profile", "Action")
+ANIME_PREVIEW_NEGATIVE = (
+    "worst quality, low quality, lowres, blurry, bad anatomy, extra fingers, "
+    "signature, watermark, text"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
@@ -55,7 +81,9 @@ def model_profile(value: str) -> ModelProfile:
     )
 
 
-def apply_training_profile(process: dict[str, Any], profile: ModelProfile) -> None:
+def apply_training_profile(
+    process: dict[str, Any], profile: ModelProfile, *, default_previews: bool = False
+) -> None:
     if profile.id == "sdxl":
         return
     process["model"]["is_v_pred"] = profile.v_prediction
@@ -66,7 +94,11 @@ def apply_training_profile(process: dict[str, Any], profile: ModelProfile) -> No
     sample["sampler"] = "euler" if profile.v_prediction else "euler_a"
     sample["guidance_scale"] = profile.cfg
     sample["sample_steps"] = profile.steps
-    sample["width"] = sample["height"] = 1024
+    sample["width"], sample["height"] = 832, 1216
+    if default_previews:
+        sample.pop("prompts", None)
+        sample["samples"] = [{"prompt": prompt} for prompt in ANIME_PREVIEW_PROMPTS]
+        sample["neg"] = ANIME_PREVIEW_NEGATIVE
 
 
 def apply_validation_profile(graph: dict[str, Any], profile: ModelProfile) -> None:
@@ -78,6 +110,8 @@ def apply_validation_profile(graph: dict[str, Any], profile: ModelProfile) -> No
         cfg=profile.cfg,
         steps=profile.steps,
     )
+    graph["5"]["inputs"].update(width=832, height=1216)
+    graph["7"]["inputs"]["text"] = ANIME_PREVIEW_NEGATIVE
     graph["11"] = {
         "class_type": "ModelSamplingDiscrete",
         "inputs": {

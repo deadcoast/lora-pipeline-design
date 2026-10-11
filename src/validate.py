@@ -34,6 +34,9 @@ from .comfy_activity import check_orphaned_comfy_prompts
 from .comfy_client import ComfyClient
 from .io_utils import atomic_write_bytes, atomic_write_text
 from .model_profiles import (
+    ANIME_PREVIEW_LABELS,
+    ANIME_PREVIEW_NEGATIVE,
+    ANIME_PREVIEW_PROMPTS,
     MODEL_PROFILE_IDS,
     apply_validation_profile,
     model_profile,
@@ -155,6 +158,17 @@ DEFAULT_PROMPT_LABELS = ("Portrait", "City street", "Studio", "Outdoor")
 NEG = "lowres, bad anatomy, blurry, deformed, extra fingers, watermark, text"
 
 
+def default_prompts() -> list[str]:
+    """Choose the review shots for the selected model family."""
+    if model_profile(config.MODEL_PROFILE).id != "sdxl":
+        return list(ANIME_PREVIEW_PROMPTS)
+    return list(DEFAULT_PROMPTS)
+
+
+def negative_prompt() -> str:
+    return ANIME_PREVIEW_NEGATIVE if config.MODEL_PROFILE != "sdxl" else NEG
+
+
 def _validate_workflow(base: dict[str, Any]) -> None:
     required = {
         "4": ("CheckpointLoaderSimple", ("ckpt_name",)),
@@ -257,7 +271,7 @@ def _build_graph(
     g["10"]["inputs"]["strength_model"] = strength
     g["10"]["inputs"]["strength_clip"] = strength
     g["6"]["inputs"]["text"] = prompt
-    g["7"]["inputs"]["text"] = NEG
+    g["7"]["inputs"]["text"] = negative_prompt()
     g["3"]["inputs"]["seed"] = seed
     g["9"]["inputs"]["filename_prefix"] = "validate"
     return g
@@ -585,7 +599,7 @@ def _validation_signature(
         "checkpoint_content_identity": checkpoint_content_identity,
         "strengths": list(strengths),
         "prompts": list(prompts),
-        "negative_prompt": NEG,
+        "negative_prompt": negative_prompt(),
         "trigger": trigger,
         "seed": seed,
     }
@@ -975,7 +989,9 @@ def _validate_with_guard(
 
     formatted_prompts = [p.replace("{trigger}", trigger) for p in prompts]
     prompt_labels = (
-        list(DEFAULT_PROMPT_LABELS)
+        list(ANIME_PREVIEW_LABELS)
+        if tuple(prompts) == ANIME_PREVIEW_PROMPTS
+        else list(DEFAULT_PROMPT_LABELS)
         if list(prompts) == DEFAULT_PROMPTS
         else [f"Prompt {index + 1}" for index in range(len(prompts))]
     )
@@ -1242,7 +1258,7 @@ def main(argv: Sequence[str] | None = None) -> None:
             validate(
                 lora=args.lora,
                 strengths=args.strengths,
-                prompts=DEFAULT_PROMPTS,
+                prompts=default_prompts(),
                 trigger=args.trigger,
                 seed=args.seed,
                 run_name=run_name,

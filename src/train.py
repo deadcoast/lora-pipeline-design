@@ -291,6 +291,7 @@ def materialize_config(
     destination: Path | None = None,
     preset: str | None = None,
     base_model: Path | None = None,
+    steps: int | None = None,
 ) -> Path:
     """Create the concrete ai-toolkit config used for one pipeline run."""
     template, data = _load_template(template_path)
@@ -339,7 +340,22 @@ def materialize_config(
         validate_sdxl_process(process, template)
         if preset is not None:
             apply_training_preset(process, preset, template)
-        apply_training_profile(process, profile)
+        apply_training_profile(
+            process,
+            profile,
+            default_previews=template.resolve()
+            == (config.ROOT / "configs/person_sdxl.yaml").resolve(),
+        )
+        if steps is not None:
+            if steps <= 0:
+                raise ValueError("Training steps must be greater than zero.")
+            process["train"]["steps"] = steps
+            # Short experiments still need intermediate snapshots to compare.
+            interval = max(1, steps // 4)
+            for section, key in (("save", "save_every"), ("sample", "sample_every")):
+                options = process.get(section)
+                if isinstance(options, dict) and options.get(key, 0) > 0:
+                    options[key] = min(options[key], interval)
         if base_model is not None:
             model = process["model"]
             model["name_or_path"] = str(base_model)
@@ -412,6 +428,7 @@ def train(
     output_dir: Path | None = None,
     preset: str | None = None,
     base_model: Path | None = None,
+    steps: int | None = None,
 ) -> int:
     if not config.AI_TOOLKIT_DIR:
         raise RuntimeError("AI_TOOLKIT_DIR is not set in .env")
@@ -462,6 +479,7 @@ def train(
                 output_dir=resolved_output,
                 preset=preset,
                 base_model=base_model,
+                steps=steps,
             )
     check_orphaned_comfy_prompts()
     return _train_with_guard(
@@ -473,6 +491,7 @@ def train(
         output_dir=resolved_output,
         preset=preset,
         base_model=base_model,
+        steps=steps,
     )
 
 
@@ -486,6 +505,7 @@ def _train_with_guard(
     output_dir: Path,
     preset: str | None,
     base_model: Path | None,
+    steps: int | None,
 ) -> int:
     cfg = materialize_config(
         config_path,
@@ -495,6 +515,7 @@ def _train_with_guard(
         output_dir=output_dir,
         preset=preset,
         base_model=base_model,
+        steps=steps,
     )
     cmd = [config.AI_TOOLKIT_PYTHON, str(run_py), str(cfg)]
     if model_profile(config.MODEL_PROFILE).v_prediction:
@@ -551,6 +572,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=config.CHECKPOINTS_DIR,
         help="Checkpoint directory (default: CHECKPOINTS_DIR).",
     )
+    ap.add_argument("--steps", type=int, help="Override the training step count.")
     args = ap.parse_args(argv)
     config.MODEL_PROFILE = model_profile(args.model_profile).id
     try:
@@ -591,6 +613,7 @@ def main(argv: Sequence[str] | None = None) -> None:
                 dataset_dir=args.dataset,
                 output_dir=output_dir,
                 preset=args.preset,
+                steps=args.steps,
                 base_model=args.base_model,
             )
     except (FileNotFoundError, RuntimeError, TypeError, ValueError) as exc:

@@ -43,6 +43,10 @@ class TrainingPreset(StrEnum):
         return 768 if self is self.FAST else 1024
 
     @property
+    def training_steps(self) -> int:
+        return {self.FAST: 900, self.BALANCED: 2000, self.QUALITY: 3000}[self]
+
+    @property
     def validation_strengths(self) -> tuple[float, ...]:
         return {
             self.FAST: (0.0, 0.8),
@@ -61,6 +65,11 @@ class ProjectDraft:
     preset: TrainingPreset = TrainingPreset.BALANCED
     use_vision_captions: bool = False
     overwrite_existing: bool = False
+    training_steps: int | None = None
+
+    @property
+    def effective_steps(self) -> int:
+        return self.training_steps or self.preset.training_steps
 
     def normalized(self) -> ProjectDraft:
         """Return a copy with user-entered text normalized for the pipeline."""
@@ -71,6 +80,7 @@ class ProjectDraft:
             preset=self.preset,
             use_vision_captions=self.use_vision_captions,
             overwrite_existing=self.overwrite_existing,
+            training_steps=self.training_steps,
         )
 
     def validation_errors(self, *, require_source: bool = True) -> tuple[str, ...]:
@@ -84,6 +94,8 @@ class ProjectDraft:
 
         if not draft.trigger:
             errors.append("Choose a trigger phrase, such as 'ohwx person'.")
+        if draft.training_steps is not None and draft.training_steps <= 0:
+            errors.append("Training steps must be greater than zero.")
 
         if require_source:
             if draft.source_dir is None:
