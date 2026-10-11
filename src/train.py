@@ -28,9 +28,16 @@ from . import config
 from .comfy_activity import check_orphaned_comfy_prompts
 from .dataset_pairs import scan_dataset_pairs
 from .io_utils import atomic_write_text
+from .model_profiles import (
+    MODEL_PROFILE_IDS,
+    apply_training_profile,
+    model_profile,
+    profile_checkpoint_issue,
+)
 from .prepare_dataset import MANIFEST_NAME, prepared_output_manifest_issue
 from .process_control import run_managed_process
 from .run_guardian import active_run_guard_covers, pipeline_run_guard
+from .toolkit_vpred import VPRED_RUNNER
 
 TRAINING_PRESETS = ("fast", "balanced", "quality")
 _PRESET_VALUES: dict[str, dict[str, Any]] = {
@@ -191,7 +198,9 @@ def validate_sdxl_process(process: dict[str, Any], template: Path) -> None:
         )
     if isinstance(sample, dict):
         sampler = sample.get("sampler", scheduler)
-        if sampler != scheduler:
+        if sampler != scheduler and not (
+            scheduler == "ddpm" and sampler in {"euler", "euler_a"}
+        ):
             raise ValueError(
                 f"Training config {template} uses train scheduler {scheduler!r} "
                 f"but sample sampler {sampler!r}."
@@ -284,6 +293,16 @@ def materialize_config(
 ) -> Path:
     """Create the concrete ai-toolkit config used for one pipeline run."""
     template, data = _load_template(template_path)
+    profile = model_profile(config.MODEL_PROFILE)
+    issue = profile_checkpoint_issue(
+        profile.id, str(base_model or config.COMFY_SDXL_CKPT)
+    )
+    if issue:
+        raise ValueError(issue)
+    if profile.id != "sdxl" and base_model is None:
+        raise ValueError(
+            "Choose the local NoobAI checkpoint with --base-model before training."
+        )
     job_config = data["config"]
 
     template_name = job_config.get("name")
@@ -319,6 +338,7 @@ def materialize_config(
         validate_sdxl_process(process, template)
         if preset is not None:
             apply_training_preset(process, preset, template)
+        apply_training_profile(process, profile)
         if base_model is not None:
             model = process["model"]
             model["name_or_path"] = str(base_model)
@@ -350,6 +370,7 @@ def materialize_config(
     meta = data.get("meta")
     if isinstance(meta, dict):
         meta["name"] = run_name
+        meta["mivim_model_profile"] = profile.id
         if preset is not None:
             meta["mivim_preset"] = preset
 
@@ -469,7 +490,9 @@ def _train_with_guard(
         base_model=base_model,
     )
     cmd = [config.AI_TOOLKIT_PYTHON, str(run_py), str(cfg)]
-    print(f"[train] {' '.join(cmd)}")
+    if model_profile(config.MODEL_PROFILE).v_prediction:
+        cmd = [config.AI_TOOLKIT_PYTHON, "-c", VPRED_RUNNER, str(run_py), str(cfg)]
+    print(f"[train] {config.AI_TOOLKIT_PYTHON} {run_py} {cfg}")
     print(f"[train] cwd = {config.AI_TOOLKIT_DIR}")
     # Stream ai-toolkit output live; run in its own directory so relative paths resolve.
     return_code = run_managed_process(cmd, cwd=Path(config.AI_TOOLKIT_DIR))
@@ -482,6 +505,9 @@ def _train_with_guard(
 
 def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="Run an ai-toolkit training config.")
+    ap.add_argument(
+        "--model-profile", choices=MODEL_PROFILE_IDS, default=config.MODEL_PROFILE
+    )
     ap.add_argument(
         "--config", required=True, help="Path to the ai-toolkit YAML config."
     )
@@ -513,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         help="Checkpoint directory (default: CHECKPOINTS_DIR).",
     )
     args = ap.parse_args(argv)
+    config.MODEL_PROFILE = model_profile(args.model_profile).id
     try:
         project = args.name
         if project is None:

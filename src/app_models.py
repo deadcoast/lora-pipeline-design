@@ -128,6 +128,7 @@ class RunResult:
     workflow_user_id: str = ""
     workflow_user_name: str = ""
     training_project_name: str = ""
+    model_profile: str = "sdxl"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,13 +154,14 @@ class ValidationRecovery:
     strengths: tuple[float, ...] = ()
     seed: int = 42
     training_project_name: str = ""
+    model_profile: str = "sdxl"
 
 
 @dataclass(slots=True)
 class AppSettings:
     """Non-secret application settings persisted between desktop sessions."""
 
-    schema_version: int = 5
+    schema_version: int = 6
     comfy_host: str = "127.0.0.1:8188"
     comfy_installation_id: str = ""
     comfy_user_installation_id: str = ""
@@ -167,6 +169,7 @@ class AppSettings:
     comfy_lora_dir: Path | None = None
     comfy_checkpoint: str = "sd_xl_base_1.0.safetensors"
     confirmed_sdxl_checkpoint: str = ""
+    model_profile: str = "sdxl"
     training_base_model: Path | None = None
     ai_toolkit_dir: Path | None = None
     ai_toolkit_python: Path | None = None
@@ -188,6 +191,7 @@ class AppSettings:
         environment = {
             "COMFY_HOST": comfy_host,
             "COMFY_SDXL_CKPT": self.comfy_checkpoint.strip(),
+            "MIVIM_MODEL_PROFILE": self.model_profile,
             "MIVIM_COMFY_INSTALLATION_ID": self.comfy_installation_id.strip(),
             "DATASETS_DIR": str(self.datasets_dir),
             "CHECKPOINTS_DIR": str(self.checkpoints_dir),

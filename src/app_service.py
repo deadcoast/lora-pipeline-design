@@ -47,6 +47,7 @@ from .dataset_pairs import (
     scan_dataset_pairs,
 )
 from .io_utils import artifact_fingerprint
+from .model_profiles import MODEL_PROFILE_IDS, model_profile, profile_checkpoint_issue
 from .prepare_dataset import (
     MANIFEST_SCHEMA_VERSION,
     captioner_identity,
@@ -90,6 +91,7 @@ class ReadinessActionKind(StrEnum):
     SELECT_COMFY_INSTALLATION = "select_comfy_installation"
     OPEN_COMFYUI = "open_comfyui"
     SELECT_CHECKPOINT = "select_checkpoint"
+    SELECT_MODEL_PROFILE = "select_model_profile"
     CONFIRM_CHECKPOINT = "confirm_checkpoint"
     CHOOSE_BASE_MODEL = "choose_base_model"
     CREATE_LORA_FOLDER = "create_lora_folder"
@@ -340,6 +342,7 @@ class PipelineOutcome:
     checkpoint_fingerprint: str = ""
     starting_strength: float = 0.8
     training_project_name: str = ""
+    model_profile: str = "sdxl"
 
 
 def _normalise_host(host: str) -> str:
@@ -1023,7 +1026,14 @@ class ApplicationService:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3}:
+        if not isinstance(value, dict) or value.get("schema_version") not in {
+            1,
+            2,
+            3,
+            4,
+        }:
+            return None
+        if value.get("model_profile", "sdxl") not in MODEL_PROFILE_IDS:
             return None
         mode = value.get("mode")
         fields = {
@@ -1057,7 +1067,7 @@ class ApplicationService:
         checkpoint_path: Path | None = None
         checkpoint_fingerprint = ""
         starting_strength = 0.8
-        if value.get("schema_version") == 3:
+        if value.get("schema_version") in {3, 4}:
             path_fields = {
                 key: value.get(key)
                 for key in (
@@ -1134,6 +1144,7 @@ class ApplicationService:
             )
             starting_strength = float(raw_strength)
         return PipelineOutcome(
+            model_profile=cast(str, value.get("model_profile", "sdxl")),
             project_name=project_name,
             training_project_name=(
                 value.get("training_project_name", "")
@@ -1183,7 +1194,9 @@ class ApplicationService:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
             return None
-        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2}:
+        if not isinstance(value, dict) or value.get("schema_version") not in {1, 2, 3}:
+            return None
+        if value.get("model_profile", "sdxl") not in MODEL_PROFILE_IDS:
             return None
         schema_version = cast(int, value["schema_version"])
         string_fields = {
@@ -1237,7 +1250,7 @@ class ApplicationService:
         validation_signature = ""
         strengths: tuple[float, ...] = ()
         seed = 42
-        if schema_version == 2:
+        if schema_version in {2, 3}:
             extra_strings = {
                 key: value.get(key)
                 for key in (
@@ -1306,6 +1319,7 @@ class ApplicationService:
             strengths = tuple(float(item) for item in raw_strengths)
             seed = raw_seed
         return ValidationRecovery(
+            model_profile=cast(str, value.get("model_profile", "sdxl")),
             project_name=project_name,
             training_project_name=(
                 value.get("training_project_name", "")
@@ -1341,6 +1355,8 @@ class ApplicationService:
     ) -> str | None:
         """Explain why a saved retry cannot safely run against current settings."""
 
+        if settings.model_profile != recovery.model_profile:
+            return "Restore the original model profile in Connect before retrying validation."
         if (
             not recovery.attempt_id
             or not recovery.lora_fingerprint
@@ -2120,6 +2136,27 @@ class ApplicationService:
                 )
 
         selected_checkpoint = settings.comfy_checkpoint.strip()
+        try:
+            profile = model_profile(settings.model_profile)
+            profile_issue = profile_checkpoint_issue(profile.id, selected_checkpoint)
+            profile_detail = profile_issue or profile.label
+        except ValueError as exc:
+            profile_issue = str(exc)
+            profile_detail = profile_issue
+        items.append(
+            ReadinessItem(
+                "model_profile",
+                "Model profile",
+                "error" if profile_issue else "ready",
+                profile_detail,
+                ReadinessAction(
+                    ReadinessActionKind.SELECT_MODEL_PROFILE,
+                    "Choose the matching model profile",
+                )
+                if profile_issue
+                else None,
+            )
+        )
         if not selected_checkpoint:
             if comfy.checkpoints:
                 checkpoint_action = ReadinessAction(
@@ -2532,6 +2569,7 @@ class ApplicationService:
             "training_storage",
         }
         full_codes.add("base_model")
+        full_codes.add("model_profile")
         can_prepare = (
             all(
                 by_code.get(code) is not None and by_code[code].state != "error"
@@ -2561,6 +2599,12 @@ class ApplicationService:
     ) -> PipelineCommand:
         """Build the same supported pipeline invocation documented for the CLI."""
 
+        if mode == "full":
+            issue = profile_checkpoint_issue(
+                settings.model_profile, settings.comfy_checkpoint
+            )
+            if issue:
+                raise ValueError(issue)
         config.validate_project_name(draft.project_name)
         artifacts = self.project_artifacts(settings, draft.project_name)
         dataset = self.project_path(settings.datasets_dir) / draft.project_name
@@ -2693,6 +2737,7 @@ class ApplicationService:
             or self.project_path(settings.training_base_model).resolve()
             != result.checkpoint_path.resolve()
             or settings.comfy_checkpoint != result.checkpoint
+            or settings.model_profile != result.model_profile
             or artifact_fingerprint(result.checkpoint_path)
             != result.checkpoint_fingerprint
         ):
@@ -2742,6 +2787,9 @@ class ApplicationService:
         checkpoint_name = (
             checkpoint if checkpoint is not None else settings.comfy_checkpoint
         ).strip()
+        issue = profile_checkpoint_issue(settings.model_profile, checkpoint_name)
+        if issue:
+            raise ValueError(issue)
         checkpoint_path = Path(checkpoint_name.replace("\\", "/"))
         if (
             not checkpoint_name

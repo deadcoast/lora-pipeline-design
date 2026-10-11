@@ -1,0 +1,97 @@
+"""Explicit SDXL profiles shared by training, validation, and the desktop."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True, slots=True)
+class ModelProfile:
+    id: str
+    label: str
+    description: str
+    v_prediction: bool = False
+    sampler: str = "dpmpp_2m"
+    cfg: float = 6.0
+    steps: int = 28
+
+
+MODEL_PROFILES = (
+    ModelProfile(
+        "sdxl", "SDXL · Standard", "Use for standard Epsilon SDXL checkpoints."
+    ),
+    ModelProfile(
+        "noobai-xl-epsilon",
+        "NoobAI-XL · Epsilon-pred",
+        "Anime illustration; a starting point for crisp linework. "
+        "Choose the Epsilon checkpoint from the model's download page.",
+        sampler="euler_ancestral",
+        cfg=5.5,
+    ),
+    ModelProfile(
+        "noobai-xl-vpred",
+        "NoobAI-XL · V-pred",
+        "Anime illustration; a starting point for a softer finish. "
+        "Requires the V-pred checkpoint; Studio applies its sampling settings.",
+        v_prediction=True,
+        sampler="euler",
+        cfg=4.5,
+        steps=30,
+    ),
+)
+MODEL_PROFILE_IDS = tuple(profile.id for profile in MODEL_PROFILES)
+
+
+def model_profile(value: str) -> ModelProfile:
+    for profile in MODEL_PROFILES:
+        if profile.id == value:
+            return profile
+    raise ValueError(
+        f"Unknown model profile {value!r}. Choose a model profile in Connect."
+    )
+
+
+def apply_training_profile(process: dict[str, Any], profile: ModelProfile) -> None:
+    if profile.id == "sdxl":
+        return
+    process["model"]["is_v_pred"] = profile.v_prediction
+    # DDPM supplies add_noise/get_velocity for training. Preview sampling uses
+    # Euler independently; the V-pred launcher supplies ZSNR to both schedulers.
+    process["train"]["noise_scheduler"] = "ddpm"
+    sample = process["sample"]
+    sample["sampler"] = "euler" if profile.v_prediction else "euler_a"
+    sample["guidance_scale"] = profile.cfg
+    sample["sample_steps"] = profile.steps
+    sample["width"] = sample["height"] = 1024
+
+
+def apply_validation_profile(graph: dict[str, Any], profile: ModelProfile) -> None:
+    if profile.id == "sdxl":
+        return
+    graph["3"]["inputs"].update(
+        sampler_name=profile.sampler,
+        scheduler="normal",
+        cfg=profile.cfg,
+        steps=profile.steps,
+    )
+    graph["11"] = {
+        "class_type": "ModelSamplingDiscrete",
+        "inputs": {
+            "model": ["10", 0],
+            "sampling": "v_prediction" if profile.v_prediction else "eps",
+            "zsnr": profile.v_prediction,
+        },
+    }
+    graph["3"]["inputs"]["model"] = ["11", 0]
+
+
+def profile_checkpoint_issue(profile_id: str, checkpoint: str) -> str | None:
+    """Catch an obvious mismatch without treating filenames as model metadata."""
+    profile = model_profile(profile_id)
+    name = checkpoint.lower().replace("-", "").replace("_", "")
+    if "noob" in name and "vpred" in name and not profile.v_prediction:
+        return "This filename indicates NoobAI V-pred. Choose NoobAI-XL · V-pred in Connect."
+    if "noob" in name and ("eps" in name or "epsilon" in name) and profile.v_prediction:
+        return "This filename indicates NoobAI Epsilon. Choose NoobAI-XL · Epsilon-pred in Connect."
+    return None

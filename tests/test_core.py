@@ -1210,7 +1210,7 @@ def test_pipeline_uses_only_a_new_checkpoint(
     recovery = json.loads(
         (tmp_path / "configs" / "subject_v1-recovery.json").read_text(encoding="utf-8")
     )
-    assert recovery["schema_version"] == 2
+    assert recovery["schema_version"] == 3
     assert recovery["state"] == "complete"
     assert recovery["lora_name"] == captured["lora"]
     assert recovery["lora_fingerprint"] == io_utils.artifact_fingerprint(
@@ -1254,7 +1254,7 @@ def test_pipeline_preserves_installed_lora_recovery_when_validation_fails(
     recovery = json.loads(
         (run_configs / "subject_v1-recovery.json").read_text(encoding="utf-8")
     )
-    assert recovery["schema_version"] == 2
+    assert recovery["schema_version"] == 3
     assert recovery["project_name"] == "subject_v1"
     assert recovery["state"] == "validation_pending"
     assert recovery["lora_name"] == installed.name

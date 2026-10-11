@@ -14,7 +14,7 @@ from typing import Any
 from .app_models import AppSettings, ProjectDraft, RunResult, TrainingPreset
 from .io_utils import atomic_write_text
 
-SETTINGS_SCHEMA_VERSION = 5
+SETTINGS_SCHEMA_VERSION = 6
 DATA_DIR_OVERRIDE = "MIVIM_LORA_PIPELINE_DATA_DIR"
 _APPLICATION_DIRECTORY = Path("MIVIM") / "LoRA Pipeline"
 
@@ -160,6 +160,7 @@ def _run_result_from_json(value: object) -> RunResult | None:
     ):
         return None
     return RunResult(
+        model_profile=_text(value.get("model_profile"), "sdxl"),
         project_name=project_name,
         training_project_name=_text(
             value.get("training_project_name"), "", allow_empty=True
@@ -237,11 +238,12 @@ def _settings_from_json(value: object) -> AppSettings:
     if (
         not isinstance(version, int)
         or isinstance(version, bool)
-        or version not in {1, 2, 3, 4, SETTINGS_SCHEMA_VERSION}
+        or version not in {1, 2, 3, 4, 5, SETTINGS_SCHEMA_VERSION}
     ):
         return defaults
 
     return AppSettings(
+        model_profile=_text(value.get("model_profile"), "sdxl"),
         schema_version=SETTINGS_SCHEMA_VERSION,
         comfy_host=_text(value.get("comfy_host"), defaults.comfy_host),
         comfy_installation_id=_text(
@@ -343,6 +345,7 @@ def _run_result_to_json(result: RunResult | None) -> dict[str, object] | None:
         "trigger": result.trigger,
         "preset": result.preset.value,
         "checkpoint": result.checkpoint,
+        "model_profile": result.model_profile,
         "lora_name": result.lora_name,
         "result_fingerprint": result.result_fingerprint,
         "workflow_path": _path_for_json(result.workflow_path),
@@ -372,6 +375,7 @@ def _settings_to_json(settings: AppSettings) -> dict[str, object]:
         "comfy_user_id": settings.comfy_user_id,
         "comfy_lora_dir": _path_for_json(settings.comfy_lora_dir),
         "comfy_checkpoint": settings.comfy_checkpoint,
+        "model_profile": settings.model_profile,
         "confirmed_sdxl_checkpoint": settings.confirmed_sdxl_checkpoint,
         "training_base_model": _path_for_json(settings.training_base_model),
         "ai_toolkit_dir": _path_for_json(settings.ai_toolkit_dir),

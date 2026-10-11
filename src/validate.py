@@ -33,6 +33,12 @@ from . import config
 from .comfy_activity import check_orphaned_comfy_prompts
 from .comfy_client import ComfyClient
 from .io_utils import atomic_write_bytes, atomic_write_text
+from .model_profiles import (
+    MODEL_PROFILE_IDS,
+    apply_validation_profile,
+    model_profile,
+    profile_checkpoint_issue,
+)
 from .run_guardian import active_run_guard_covers, pipeline_run_guard
 
 WORKFLOW = config.ROOT / "workflows" / "validate_sdxl_api.json"
@@ -48,10 +54,18 @@ CORE_NODE_TYPES = frozenset(
         "KSampler",
         "VAEDecode",
         "SaveImage",
+        "ModelSamplingDiscrete",
     }
 )
 
 _UI_NODE_SPECS: dict[str, dict[str, object]] = {
+    "ModelSamplingDiscrete": {
+        "pos": (410, 500),
+        "size": (330, 110),
+        "inputs": (("model", "MODEL"),),
+        "outputs": (("MODEL", "MODEL"),),
+        "widgets": ("sampling", "zsnr"),
+    },
     "CheckpointLoaderSimple": {
         "pos": (20, 250),
         "size": (330, 110),
@@ -221,6 +235,11 @@ def load_workflow(path: Path = WORKFLOW) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise TypeError(f"Validation workflow {path} must be a JSON object.")
     _validate_workflow(loaded)
+    profile = model_profile(config.MODEL_PROFILE)
+    issue = profile_checkpoint_issue(profile.id, config.COMFY_SDXL_CKPT)
+    if issue:
+        raise ValueError(issue)
+    apply_validation_profile(loaded, profile)
     return loaded
 
 
@@ -281,6 +300,7 @@ def _ready_workflow_graph(
         "KSampler": "Generation settings",
         "VAEDecode": "Decode the image",
         "SaveImage": "Save your image",
+        "ModelSamplingDiscrete": "Checkpoint prediction settings",
     }
     title_overrides = {
         "6": "3 · Describe the image",
@@ -1191,11 +1211,15 @@ def main(argv: Sequence[str] | None = None) -> None:
         default=[0.0, 0.6, 0.8, 1.0],
     )
     ap.add_argument("--trigger", default=config.DEFAULT_TRIGGER)
+    ap.add_argument(
+        "--model-profile", choices=MODEL_PROFILE_IDS, default=config.MODEL_PROFILE
+    )
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--name", default=None, help="Run name for output folder (default: lora stem)."
     )
     args = ap.parse_args(argv)
+    config.MODEL_PROFILE = model_profile(args.model_profile).id
 
     run_name = args.name or Path(args.lora).stem
     try:

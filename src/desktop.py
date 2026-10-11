@@ -114,6 +114,7 @@ from .comfy_desktop import (
 from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
 from .io_utils import artifact_fingerprint
+from .model_profiles import MODEL_PROFILES, model_profile
 from .photo_review import PhotoIssueDialog
 from .process_control import (
     DESKTOP_OWNER_MUTEX_ENV,
@@ -690,6 +691,26 @@ class MainWindow(QMainWindow):
         self.checkpoint_combo.setEditable(True)
         self.checkpoint_combo.setAccessibleName("SDXL validation checkpoint")
         model_layout.addWidget(self.checkpoint_combo)
+        profile_label = _hint("Model profile")
+        model_layout.addWidget(profile_label)
+        self.model_profile_combo = QComboBox()
+        self.model_profile_combo.setObjectName("modelProfileCombo")
+        self.model_profile_combo.setAccessibleName("Model profile")
+        profile_label.setBuddy(self.model_profile_combo)
+        for profile in MODEL_PROFILES:
+            self.model_profile_combo.addItem(profile.label, profile.id)
+        profile_index = self.model_profile_combo.findData(self.settings.model_profile)
+        if profile_index < 0:
+            self.model_profile_combo.addItem(
+                "Unavailable profile · choose a replacement",
+                self.settings.model_profile,
+            )
+            profile_index = self.model_profile_combo.count() - 1
+        self.model_profile_combo.setCurrentIndex(profile_index)
+        model_layout.addWidget(self.model_profile_combo)
+        self.model_profile_hint = _body("")
+        model_layout.addWidget(self.model_profile_hint)
+        self._update_model_profile_hint()
         self.sdxl_confirm_checkbox = QCheckBox(
             "This is an SDXL base checkpoint (not a refiner)"
         )
@@ -1887,6 +1908,7 @@ class MainWindow(QMainWindow):
             ),
             comfy_lora_dir=optional_path(self.lora_dir_edit.text()),
             comfy_checkpoint=checkpoint,
+            model_profile=str(self.model_profile_combo.currentData()),
             confirmed_sdxl_checkpoint=(
                 checkpoint if self.sdxl_confirm_checkbox.isChecked() else ""
             ),
@@ -2492,9 +2514,23 @@ class MainWindow(QMainWindow):
             editor.textEdited.connect(self._invalidate_readiness)
         self.installation_combo.currentIndexChanged.connect(self._installation_changed)
         self.checkpoint_combo.currentTextChanged.connect(self._checkpoint_changed)
+        self.model_profile_combo.currentIndexChanged.connect(
+            self._model_profile_changed
+        )
         self.sdxl_confirm_checkbox.toggled.connect(self._invalidate_readiness)
         self.vision_checkbox.toggled.connect(self._invalidate_readiness)
         self.overwrite_checkbox.toggled.connect(self._invalidate_readiness)
+
+    def _update_model_profile_hint(self) -> None:
+        try:
+            profile = model_profile(str(self.model_profile_combo.currentData()))
+            self.model_profile_hint.setText(profile.description)
+        except ValueError as exc:
+            self.model_profile_hint.setText(str(exc))
+
+    def _model_profile_changed(self, *_args: object) -> None:
+        self._update_model_profile_hint()
+        self._invalidate_readiness()
 
     def _connection_changed(self, *_args: object) -> None:
         self.comfy_status = None
@@ -2939,6 +2975,10 @@ class MainWindow(QMainWindow):
             self._return_to_readiness_after_checkpoint = True
             self.checkpoint_combo.setFocus()
             self.checkpoint_combo.showPopup()
+        elif kind is ReadinessActionKind.SELECT_MODEL_PROFILE:
+            self.show_page(NAV_SETUP)
+            self.model_profile_combo.setFocus()
+            self.model_profile_combo.showPopup()
         elif kind is ReadinessActionKind.CONFIRM_CHECKPOINT:
             self.show_page(NAV_SETUP)
             self.confirm_sdxl_checkpoint()
@@ -4050,6 +4090,10 @@ class MainWindow(QMainWindow):
                 mismatches.append("selected training checkpoint")
         if expected_checkpoint and outcome.checkpoint != expected_checkpoint:
             mismatches.append("checkpoint")
+        if outcome.model_profile != command.environment.get(
+            "MIVIM_MODEL_PROFILE", "sdxl"
+        ):
+            mismatches.append("model profile")
         if command.mode != "prepare" and (
             not outcome.lora_name
             or Path(outcome.lora_name).name != outcome.lora_name
@@ -4156,6 +4200,7 @@ class MainWindow(QMainWindow):
             trigger=outcome.trigger,
             preset=draft.preset,
             checkpoint=outcome.checkpoint,
+            model_profile=outcome.model_profile,
             lora_name=outcome.lora_name,
             result_fingerprint=actual_fingerprint,
             workflow_path=outcome.workflow_path,

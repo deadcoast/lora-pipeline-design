@@ -32,10 +32,11 @@ from . import train as trainer
 from . import validate as validator
 from .comfy_activity import check_orphaned_comfy_prompts
 from .io_utils import artifact_fingerprint, atomic_copy, atomic_write_text
+from .model_profiles import MODEL_PROFILE_IDS, model_profile, profile_checkpoint_issue
 from .process_control import arm_desktop_owner_guard
 from .run_guardian import pipeline_run_guard
 
-RECOVERY_SCHEMA_VERSION = 2
+RECOVERY_SCHEMA_VERSION = 3
 
 
 def _copy_lora_to_comfy(lora_path: Path) -> str:
@@ -132,6 +133,7 @@ def _write_validation_recovery(
         "expected_grid_path": str((config.GRIDS_DIR / f"{name}_grid.png").resolve()),
         "trigger": trigger,
         "preset": preset,
+        "model_profile": config.MODEL_PROFILE,
         "checkpoint": config.COMFY_SDXL_CKPT,
         "attempt_id": attempt_id,
         "comfy_installation_id": config.COMFY_INSTALLATION_ID,
@@ -160,6 +162,13 @@ def run(args: argparse.Namespace) -> Path | None:
     """Run one pipeline invocation while holding its cross-process safety leases."""
 
     arm_desktop_owner_guard()
+    config.MODEL_PROFILE = model_profile(
+        getattr(args, "model_profile", config.MODEL_PROFILE)
+    ).id
+    if not args.skip_train or not args.skip_validate:
+        issue = profile_checkpoint_issue(config.MODEL_PROFILE, config.COMFY_SDXL_CKPT)
+        if issue:
+            raise ValueError(issue)
     name = config.validate_project_name(args.name)
     if args.skip_prep and args.skip_train and args.skip_validate:
         raise ValueError("All pipeline stages are skipped; there is nothing to run.")
@@ -435,7 +444,8 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
         workflow_fingerprint = ""
         starting_strength = 0.8
     outcome = {
-        "schema_version": 3,
+        "schema_version": 4,
+        "model_profile": config.MODEL_PROFILE,
         "project_name": name,
         "training_project_name": training_project,
         "attempt_id": attempt_id,
@@ -495,6 +505,9 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
 
 def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="prep -> train -> validate a person LoRA.")
+    ap.add_argument(
+        "--model-profile", choices=MODEL_PROFILE_IDS, default=config.MODEL_PROFILE
+    )
     ap.add_argument(
         "--attempt-id",
         default="",
