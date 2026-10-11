@@ -206,6 +206,7 @@ def test_settings_and_environment_use_explicit_non_secret_allowlists(
         "COMFY_LORA_DIR",
         "COMFY_SDXL_CKPT",
         "MIVIM_COMFY_INSTALLATION_ID",
+        "MIVIM_MODEL_PROFILE",
         "AI_TOOLKIT_DIR",
         "AI_TOOLKIT_PYTHON",
         "DATASETS_DIR",

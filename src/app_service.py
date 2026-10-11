@@ -47,7 +47,12 @@ from .dataset_pairs import (
     scan_dataset_pairs,
 )
 from .io_utils import artifact_fingerprint
-from .model_profiles import MODEL_PROFILE_IDS, model_profile, profile_checkpoint_issue
+from .model_profiles import (
+    MODEL_PROFILE_IDS,
+    model_profile,
+    profile_checkpoint_issue,
+    training_profile_issue,
+)
 from .prepare_dataset import (
     MANIFEST_SCHEMA_VERSION,
     captioner_identity,
@@ -1035,6 +1040,8 @@ class ApplicationService:
             return None
         if value.get("model_profile", "sdxl") not in MODEL_PROFILE_IDS:
             return None
+        if value.get("schema_version") == 4 and "model_profile" not in value:
+            return None
         mode = value.get("mode")
         fields = {
             key: value.get(key)
@@ -1199,6 +1206,8 @@ class ApplicationService:
         if value.get("model_profile", "sdxl") not in MODEL_PROFILE_IDS:
             return None
         schema_version = cast(int, value["schema_version"])
+        if schema_version == 3 and "model_profile" not in value:
+            return None
         string_fields = {
             key: value.get(key)
             for key in (
@@ -2139,6 +2148,9 @@ class ApplicationService:
         try:
             profile = model_profile(settings.model_profile)
             profile_issue = profile_checkpoint_issue(profile.id, selected_checkpoint)
+            profile_issue = profile_issue or training_profile_issue(
+                profile.id, settings.ai_toolkit_dir
+            )
             profile_detail = profile_issue or profile.label
         except ValueError as exc:
             profile_issue = str(exc)
@@ -2602,6 +2614,9 @@ class ApplicationService:
         if mode == "full":
             issue = profile_checkpoint_issue(
                 settings.model_profile, settings.comfy_checkpoint
+            )
+            issue = issue or training_profile_issue(
+                settings.model_profile, settings.ai_toolkit_dir
             )
             if issue:
                 raise ValueError(issue)

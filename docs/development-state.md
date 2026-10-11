@@ -119,3 +119,21 @@ version name. The Windows package has been rebuilt with this feature. Native
 selection and installation were exercised; new GPU generation remains pending
 because ComfyUI was offline. See [checkpoint selection](checkpoint-selection.md)
 for the exact behavior and verification boundary.
+
+## Model profiles and research correction — 2026-10-11
+
+Added explicit NoobAI Epsilon and V-pred profiles to Connect, persisted worker
+settings, training configuration, validation graphs, editable ComfyUI export,
+cache signatures, and recovery binding. Standard SDXL remains the default.
+The V-pred trainer compatibility check rejects the inspected ai-toolkit image
+tensor target before preparation or training; a compatible latent-target
+implementation is required. Validation-only CLI use does not require a trainer.
+
+The final source suite passes **318 tests**, with **2 old packaged-binary tests
+deselected**. Ruff, formatting, Mypy, Pyright, whitespace checks, the wheel build,
+native Qt screenshots, and keyboard selector testing passed. The scheduler
+adapter was exercised against the installed ai-toolkit environment without
+loading weights. No new NoobAI GPU run or Windows executable is qualified.
+An initial old-binary handoff test failed on the new settings schema; it is not
+counted as passing package evidence. See [model support](model-support.md) for
+the research corrections, sources, exact compatibility boundary, and artifacts.

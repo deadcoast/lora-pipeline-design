@@ -98,6 +98,7 @@ def summary() -> str:
         f"COMFY_HOST        = {COMFY_HOST}\n"
         f"COMFY_LORA_DIR    = {COMFY_LORA_DIR}\n"
         f"COMFY_SDXL_CKPT   = {COMFY_SDXL_CKPT}\n"
+        f"MODEL_PROFILE     = {MODEL_PROFILE}\n"
         f"COMFY_INSTALLATION_ID = {COMFY_INSTALLATION_ID}\n"
         f"AI_TOOLKIT_DIR    = {AI_TOOLKIT_DIR}\n"
         f"AI_TOOLKIT_PYTHON = {AI_TOOLKIT_PYTHON}\n"

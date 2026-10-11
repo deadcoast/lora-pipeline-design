@@ -350,3 +350,26 @@ Ship each milestone before starting the next — it keeps failures isolated to o
   Phase 1.
 
 ---
+
+## Model-profile interaction contract — 2026-10-11
+
+The NoobAI addition extends the existing Connect model card. This document and
+the [quality-of-life map](quality-of-life-map.md) remain the maintained design
+and behavior context; this feature introduces no new visual system. The audience
+is the existing English-language Windows desktop user.
+
+| Capability | Canonical owner | Model-profile behavior | Verification |
+| --- | --- | --- | --- |
+| Select/Listbox | Native Qt `QComboBox`, styled by `src/desktop_theme.py` | Same keyboard, popup, focus, and selection behavior as the Desktop-instance selector; visible label and accessible name | `tests/test_model_profiles.py` keyboard selection and persistence |
+| Form | `MainWindow._collect_settings`, `_invalidate_readiness`, application-service readiness | Persist the explicit profile; changing it invalidates approval; unknown saved profiles remain visible and blocked | Profile/settings tests and source desktop suite |
+| Feedback/recovery | Typed `ReadinessActionKind` and existing readiness cards | Profile errors open the actual profile selector; trainer incompatibility disables a full run but not photo preparation | Service gate and trainer compatibility tests |
+| Layout/scrolling | Existing scrollable Connect page and shared Qt theme | Add the selector inside the existing model card; no new fixed-height page container or screen-local colors | Desktop screenshot and popup inspection |
+
+`src/desktop_theme.py` remains the runtime token owner: `APP_STYLE` supplies the
+dark navy surface (`#0c1220`), card surface (`#141e33`), foreground (`#eef2ff`),
+Segoe UI typography, and shared combo/field states. The new selector uses those
+rules directly, with the existing `_hint` label and `_body` explanatory text.
+The sibling project form keeps the same visual language and scroll behavior.
+
+See [model support](model-support.md) for source authority, variant-specific
+settings, the V-pred training gate, and the qualification boundary.

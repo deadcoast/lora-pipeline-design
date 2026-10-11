@@ -33,6 +33,7 @@ from .model_profiles import (
     apply_training_profile,
     model_profile,
     profile_checkpoint_issue,
+    training_profile_issue,
 )
 from .prepare_dataset import MANIFEST_NAME, prepared_output_manifest_issue
 from .process_control import run_managed_process
@@ -420,6 +421,12 @@ def train(
         raise FileNotFoundError(
             f"ai-toolkit run.py not found at {run_py} (check AI_TOOLKIT_DIR)"
         )
+
+    profile_issue = training_profile_issue(
+        config.MODEL_PROFILE, Path(config.AI_TOOLKIT_DIR)
+    )
+    if profile_issue:
+        raise ValueError(profile_issue)
 
     project = _training_project_name(config_path, run_name)
     resolved_dataset = (dataset_dir or (config.DATASETS_DIR / project)).resolve()

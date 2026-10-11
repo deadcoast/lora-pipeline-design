@@ -74,6 +74,15 @@ There is no supported external API for selecting and launching a particular
 Desktop instance, so the studio opens Desktop and explains the required action
 instead of pretending it started one.
 
+### Model profiles
+
+Connect includes separate **NoobAI-XL · Epsilon-pred** and **NoobAI-XL · V-pred**
+profiles alongside standard SDXL. The selection controls training configuration,
+validation, and the editable ComfyUI workflow. V-pred training is blocked on
+ai-toolkit versions with an incompatible velocity-target implementation;
+validation-only CLI use remains available. See [model support and the research
+corrections](docs/model-support.md) for verified releases and acceptance limits.
+
 ### New project
 
 - Native folder picker and drag-and-drop photo selection.

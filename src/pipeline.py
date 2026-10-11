@@ -32,7 +32,12 @@ from . import train as trainer
 from . import validate as validator
 from .comfy_activity import check_orphaned_comfy_prompts
 from .io_utils import artifact_fingerprint, atomic_copy, atomic_write_text
-from .model_profiles import MODEL_PROFILE_IDS, model_profile, profile_checkpoint_issue
+from .model_profiles import (
+    MODEL_PROFILE_IDS,
+    model_profile,
+    profile_checkpoint_issue,
+    training_profile_issue,
+)
 from .process_control import arm_desktop_owner_guard
 from .run_guardian import pipeline_run_guard
 
@@ -167,6 +172,13 @@ def run(args: argparse.Namespace) -> Path | None:
     ).id
     if not args.skip_train or not args.skip_validate:
         issue = profile_checkpoint_issue(config.MODEL_PROFILE, config.COMFY_SDXL_CKPT)
+        if issue:
+            raise ValueError(issue)
+    if not args.skip_train:
+        issue = training_profile_issue(
+            config.MODEL_PROFILE,
+            Path(config.AI_TOOLKIT_DIR) if config.AI_TOOLKIT_DIR else None,
+        )
         if issue:
             raise ValueError(issue)
     name = config.validate_project_name(args.name)
