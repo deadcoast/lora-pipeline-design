@@ -426,3 +426,24 @@ WD ViT v3 produces general tags locally. Generated captions feed the same datase
 editor, training files, and reuse record as imported captions. Ready-state copy
 distinguishes a cached tagger from its first download, without requiring users
 to install Python or a vision runtime in the packaged application.
+
+## Installed application and setup corrections — 0.8.2
+
+The desktop and Start-menu shortcut are the primary installed entry points.
+Builds use `dist/release`; user projects, settings, and the installed trainer
+live outside build output. The existing source launcher opens the installed
+application when available. Updating the app preserves the user's project and
+model selection.
+
+`ApplicationService` recognizes SDXL base tensor dimensions from the local
+checkpoint header. The existing confirmation checkbox is hidden for a
+recognized file and retained for formats the app cannot identify. The service
+keeps ownership of readiness; the native Qt controls and theme are unchanged.
+`DiagnosticCard` keeps short repair buttons alongside the explanation and
+places long actions below it, rather than clipping their text to 260 pixels.
+
+Trainer discovery includes Studio's per-user trainer directory. The real CUDA
+probe launches its selected Python with `-I` from that interpreter's directory,
+so the installed Studio's Python 3.13 extension modules cannot be imported by
+the trainer's Python 3.12. The same repair is exercised in the installed UI
+using the user's saved project, not a substitute dataset.

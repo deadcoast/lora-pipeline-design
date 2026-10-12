@@ -14,6 +14,18 @@ photos → quality checks → preparation → ai-toolkit training
 
 ## Start the studio
 
+Installed Windows app: open **MIVIM LoRA Studio** from the desktop or Start menu.
+The installed executable stays at
+`%LOCALAPPDATA%\Programs\MIVIM LoRA Studio\MIVIMLoRAStudio.exe`.
+`Start MIVIM LoRA Studio.cmd` also opens that installation when present.
+Projects and settings remain in `%LOCALAPPDATA%\MIVIM\LoRA Pipeline`.
+
+For a developer-built package, `scripts/build_windows.ps1` writes the current
+release to one location, `dist/release`. Run `Setup MIVIM LoRA Studio.cmd` to
+install that release and create the shortcuts. The installer can also accept
+`-TrainerDirectory` to copy an existing ai-toolkit environment into Studio's
+per-user trainer folder; Studio discovers that folder automatically.
+
 For the easiest source checkout setup on Windows:
 
 1. Double-click `Setup MIVIM LoRA Studio.cmd` once.
@@ -70,6 +82,8 @@ is needed; automatic tagging only fills missing captions.
 - Lists the checkpoints and LoRAs reported by the running ComfyUI API.
 - Resolves the selected checkpoint back to its local Desktop model file so
   training and validation use the same SDXL base.
+- Recognizes SDXL base architecture from the local checkpoint's tensor header;
+  manual model-type confirmation is only needed when it cannot be identified.
 - Offers to create a missing `loras` folder only when it is the exact folder
   declared by the selected, verified Desktop model root.
 - Opens Comfy Desktop, the verified ComfyUI URL, and result folders.
@@ -77,6 +91,9 @@ is needed; automatic tagging only fills missing captions.
   connect, and shows **CONNECTING** while its server starts. Repeated opens
   reuse one connection check; the wait no longer stops after 90 seconds.
 - Keeps ai-toolkit in its own environment.
+- Discovers the installed trainer under the per-user application-data folder.
+  Trainer checks run in that Python's isolated mode and directory, preventing
+  the packaged app's Python libraries from interfering with the trainer.
 
 Comfy Desktop remains responsible for starting and stopping its own instances.
 There is no supported external API for selecting and launching a particular

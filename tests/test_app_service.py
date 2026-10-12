@@ -115,7 +115,8 @@ def test_trainer_probe_preserves_older_supported_gpu_architectures(
 
     assert ready
     assert called[0][0] == str(trainer_python)
-    assert "torch.arange" in called[0][2]
+    assert called[0][1:3] == ["-I", "-c"]
+    assert "torch.arange" in called[0][-1]
     assert "RTX 3080 (sm_86)" in detail
 
 
@@ -357,7 +358,7 @@ def test_readiness_allows_full_run_only_after_live_model_verification(
     assert unconfirmed.state == "error"
     assert unconfirmed.action is not None
     assert unconfirmed.action.kind is app_service.ReadinessActionKind.CONFIRM_CHECKPOINT
-    assert unconfirmed.action.label == "Confirm this is an SDXL base checkpoint"
+    assert unconfirmed.action.label == "Confirm model type"
 
     settings.confirmed_sdxl_checkpoint = settings.comfy_checkpoint
     report = ApplicationService(root=tmp_path).readiness(

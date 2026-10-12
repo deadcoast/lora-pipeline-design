@@ -2,6 +2,13 @@
 setlocal
 cd /d "%~dp0"
 
+if exist "dist\release\MIVIMLoRAStudio.dist\MIVIMLoRAStudio.exe" (
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File "scripts\install_windows.ps1"
+    if errorlevel 1 goto :failed
+    call "Start MIVIM LoRA Studio.cmd"
+    exit /b 0
+)
+
 where py >nul 2>nul
 if errorlevel 1 (
     echo Python was not found.

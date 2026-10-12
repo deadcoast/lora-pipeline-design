@@ -2,6 +2,11 @@
 setlocal
 cd /d "%~dp0"
 
+if exist "%LOCALAPPDATA%\Programs\MIVIM LoRA Studio\MIVIMLoRAStudio.exe" (
+    start "MIVIM LoRA Studio" "%LOCALAPPDATA%\Programs\MIVIM LoRA Studio\MIVIMLoRAStudio.exe"
+    exit /b 0
+)
+
 if not exist ".venv\Scripts\pythonw.exe" (
     echo MIVIM LoRA Studio is not installed in this folder yet.
     echo.

@@ -116,7 +116,7 @@ from .comfy_desktop import (
 from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
 from .io_utils import artifact_fingerprint
-from .model_profiles import MODEL_PROFILES, model_profile
+from .model_profiles import MODEL_PROFILES, is_sdxl_base_checkpoint, model_profile
 from .photo_review import PhotoIssueDialog
 from .process_control import (
     DESKTOP_OWNER_MUTEX_ENV,
@@ -442,8 +442,12 @@ class DiagnosticCard(QFrame):
                 button.setAccessibleName(f"{item.title}: {item.action.label}")
                 button.clicked.connect(lambda: action_callback(item))
                 action = button
-            action.setMaximumWidth(260)
-            layout.addWidget(action)
+            # Keep the complete action readable at the minimum window width.
+            # Long repairs belong below the explanation instead of being clipped.
+            if action.sizeHint().width() > 240:
+                text.addWidget(action, alignment=Qt.AlignmentFlag.AlignLeft)
+            else:
+                layout.addWidget(action)
 
 
 class MainWindow(QMainWindow):
@@ -1724,11 +1728,16 @@ class MainWindow(QMainWindow):
             if previous:
                 self.checkpoint_combo.setCurrentText(previous)
         with QSignalBlocker(self.sdxl_confirm_checkbox):
+            detected_sdxl = is_sdxl_base_checkpoint(self.settings.training_base_model)
             self.sdxl_confirm_checkbox.setChecked(
-                bool(previous)
-                and self.settings.confirmed_sdxl_checkpoint.casefold()
-                == previous.casefold()
+                detected_sdxl
+                or (
+                    bool(previous)
+                    and self.settings.confirmed_sdxl_checkpoint.casefold()
+                    == previous.casefold()
+                )
             )
+            self.sdxl_confirm_checkbox.setVisible(not detected_sdxl)
         if names:
             self.model_hint.setText(
                 f"{len(names)} model(s) reported by the running ComfyUI instance."
@@ -2630,13 +2639,18 @@ class MainWindow(QMainWindow):
 
     def _checkpoint_changed(self, checkpoint: str) -> None:
         confirmed = self.settings.confirmed_sdxl_checkpoint
+        resolved = self.service.resolve_checkpoint_path(self.discovery, checkpoint)
+        detected_sdxl = is_sdxl_base_checkpoint(resolved)
         with QSignalBlocker(self.sdxl_confirm_checkbox):
             self.sdxl_confirm_checkbox.setChecked(
-                bool(checkpoint)
-                and bool(confirmed)
-                and checkpoint.casefold() == confirmed.casefold()
+                detected_sdxl
+                or (
+                    bool(checkpoint)
+                    and bool(confirmed)
+                    and checkpoint.casefold() == confirmed.casefold()
+                )
             )
-        resolved = self.service.resolve_checkpoint_path(self.discovery, checkpoint)
+            self.sdxl_confirm_checkbox.setVisible(not detected_sdxl)
         current = self.base_model_edit.text().strip()
         selected_name = Path(checkpoint.replace("\\", "/")).name.casefold()
         if resolved is not None:

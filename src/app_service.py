@@ -34,6 +34,7 @@ from .app_models import (
     TrainingPreset,
     ValidationRecovery,
 )
+from .app_settings import user_app_data_dir
 from .caption import caption_contains_trigger, source_caption
 from .comfy_desktop import (
     ComfyApiStatus,
@@ -51,6 +52,7 @@ from .dataset_pairs import (
 from .io_utils import artifact_fingerprint
 from .model_profiles import (
     MODEL_PROFILE_IDS,
+    is_sdxl_base_checkpoint,
     model_profile,
     profile_checkpoint_issue,
     training_profile_issue,
@@ -478,7 +480,11 @@ def probe_trainer_runtime(executable: Path) -> tuple[bool, str]:
     )
     try:
         result = subprocess.run(
-            [str(executable), "-c", script],
+            [str(executable), "-I", "-c", script],
+            # The installed app contains Python 3.13 extension modules. The
+            # trainer may use another Python version; do not import from the
+            # app's working directory or inherited PYTHONPATH.
+            cwd=executable.parent,
             check=False,
             capture_output=True,
             text=True,
@@ -990,6 +996,7 @@ def discover_ai_toolkit(root: Path = config.ROOT) -> tuple[Path | None, Path | N
     raw_env = os.environ.get("AI_TOOLKIT_DIR", "").strip()
     candidates = [
         Path(raw_env) if raw_env else None,
+        user_app_data_dir() / "trainer" / "ai-toolkit",
         root.parent / "ai-toolkit",
         Path.home() / "ai-toolkit",
         Path.home() / "github" / "ai-toolkit",
@@ -2167,6 +2174,7 @@ class ApplicationService:
                 )
 
         selected_checkpoint = settings.comfy_checkpoint.strip()
+        detected_sdxl = is_sdxl_base_checkpoint(settings.training_base_model)
         try:
             profile = model_profile(settings.model_profile)
             profile_issue = profile_checkpoint_issue(profile.id, selected_checkpoint)
@@ -2252,7 +2260,8 @@ class ApplicationService:
                 )
             )
         elif (
-            settings.confirmed_sdxl_checkpoint.strip().casefold()
+            not detected_sdxl
+            and settings.confirmed_sdxl_checkpoint.strip().casefold()
             != selected_checkpoint.casefold()
         ):
             items.append(
@@ -2260,12 +2269,11 @@ class ApplicationService:
                     "checkpoint",
                     "SDXL base model",
                     "error",
-                    f"ComfyUI reports “{selected_checkpoint}”, but does not expose "
-                    "enough metadata to prove that it is an SDXL base model. "
-                    "Confirm it before spending time on training.",
+                    f"Studio could not identify the architecture of “{selected_checkpoint}”. "
+                    "Check the model's description and confirm its type.",
                     ReadinessAction(
                         ReadinessActionKind.CONFIRM_CHECKPOINT,
-                        "Confirm this is an SDXL base checkpoint",
+                        "Confirm model type",
                     ),
                 )
             )
@@ -2275,7 +2283,11 @@ class ApplicationService:
                     "checkpoint",
                     "SDXL base model",
                     "ready",
-                    f"Confirmed SDXL base model: {selected_checkpoint}",
+                    (
+                        f"Detected SDXL base model: {selected_checkpoint}"
+                        if detected_sdxl
+                        else f"Confirmed SDXL base model: {selected_checkpoint}"
+                    ),
                 )
             )
 

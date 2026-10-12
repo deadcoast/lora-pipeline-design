@@ -2,11 +2,52 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .toolkit_vpred import TRAINER_SOURCE, velocity_target
+
+
+def is_sdxl_base_checkpoint(path: Path | None) -> bool:
+    """Recognize SDXL base weights from a local safetensors header, without loading them."""
+    if path is None or path.suffix.casefold() != ".safetensors":
+        return False
+    try:
+        with path.open("rb") as checkpoint:
+            size = int.from_bytes(checkpoint.read(8), "little")
+            if not 0 < size <= 16 * 1024 * 1024:
+                return False
+            header = json.loads(checkpoint.read(size))
+    except (OSError, ValueError, UnicodeError):
+        return False
+    if not isinstance(header, dict):
+        return False
+    shapes = {
+        name: tensor.get("shape")
+        for name, tensor in header.items()
+        if isinstance(tensor, dict)
+    }
+    # SDXL base uses 2048-wide cross attention and 2816-wide added conditioning.
+    # The refiner uses different dimensions. Accept original and Diffusers keys.
+    conditioning = any(
+        shapes.get(name) == [1280, 2816]
+        for name in (
+            "model.diffusion_model.label_emb.0.0.weight",
+            "unet.add_embedding.linear_1.weight",
+        )
+    )
+    attention = any(
+        name.startswith(("model.diffusion_model.", "unet."))
+        and name.endswith("attn2.to_k.weight")
+        and isinstance(shape, list)
+        and len(shape) == 2
+        and shape[1] == 2048
+        for name, shape in shapes.items()
+    )
+    return conditioning and attention
+
 
 # Shared by the training previews and the final strength comparison. Keep the
 # prompts neutral about drawing style so they can reveal what the LoRA learned.

@@ -316,3 +316,46 @@ removing it corrected that startup syntax error, and the build then succeeded.
   previews are under `dist/caption-worker-081/checkpoints/circle`.
 - Build logs: `dist/full-captions-build.log` (failed),
   `dist/full-captions-build-retry.log` (passed).
+
+## Installed setup repair — 0.8.2, 2026-10-11
+
+The user's saved `ruth-mk01` project exposed two unresolved setup problems:
+the known local SDXL checkpoint still required manual identification, and no
+trainer was connected. The earlier synthetic training run did not exercise
+that saved desktop setup and must not be treated as evidence that it worked.
+
+Studio now recognizes SDXL base tensor dimensions from the local safetensors
+header, discovers its installed per-user trainer, and places long readiness
+actions below the explanation instead of clipping their labels. Builds use
+`dist/release`; installation copies the application to
+`%LOCALAPPDATA%/Programs/MIVIM LoRA Studio` and creates desktop/Start-menu
+shortcuts. The existing source launcher prefers that installation. The trainer
+was copied to `%LOCALAPPDATA%/MIVIM/LoRA Pipeline/trainer/ai-toolkit`; the old
+checkout and historical build outputs were preserved. User project settings,
+source images, captions, and selected base model were retained.
+
+The first installed check exposed a real Python-version conflict: the trainer
+probe inherited Studio's working directory and imported bundled Python 3.13
+extensions in its Python 3.12 environment. The probe now uses `-I` and the
+trainer interpreter's directory. The replacement installed app reported zero
+readiness errors for `ruth-mk01` at 03:46:57 UTC on October 12. A full run was
+then started in the actual app at 03:47:04 UTC. It prepared 111 unique pairs
+from 166 source images, enabled full-caption encoding, generated four baseline
+previews, and entered the 2,000-step training loop. The live native capture at
+`dist/installed-live-082.png` shows it past step 188. This run was still active
+when this entry was written; final LoRA quality and validation are not claimed.
+
+The selected base checkpoint's SHA-256 remains
+`31E35C80FC4829D14F90153F4C74CD59C90B779F6AFE05A74CD6120B893F7E5B`, identical
+to the September 16 baseline. Only the original SDXL base is installed in the
+active ComfyUI checkpoint directory; this is not a NoobAI training run.
+
+The installed executable matches the release build:
+`F0469755D7155BA058CAEF290D2F9A558C490276D54EF72991417D213CB2F1D4`.
+Readiness/training evidence is in the user's normal `logs/studio.log` and
+workspace, not an isolated replacement project. An automation attempt to
+reopen setup became unavailable once the actual run started; it was not
+reported as a passing UI check. Source checks initially hit the active user's
+accelerator lease (14 failures), then passed with a separate test-only guard
+directory: 326 passed, three existing-package cases excluded. Ruff, Mypy, and
+Pyright passed; the installed application itself is the runtime evidence.
