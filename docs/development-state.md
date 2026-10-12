@@ -276,3 +276,43 @@ the fresh diagnostic run completed in 26.95 seconds.
 
 Automatic tagging is shipped. User-editable preview sets remain future work;
 NoobAI LoRA generation quality still requires its own training run and review.
+
+## Full training captions — 0.8.1, 2026-10-11
+
+External tagger output was already imported as image/`.txt` pairs. The defect
+was later: the selected ai-toolkit trainer defaulted to a single CLIP section,
+discarding trailing caption tokens. Studio now installs a process-local SDXL
+encoder adapter in its normal training launcher, including the V-pred launcher.
+It preserves full captions across CLIP sections and aligns positive/negative
+lengths for training previews. Source files and the ai-toolkit checkout are not
+edited. No tagging pass, format conversion, or additional user action is needed.
+
+Verification used the local SDXL checkpoint's pretrained CLIP-L/CLIP-G weights.
+All token IDs from all 166 original `ruth_db` captions survived sectioning;
+155 captions exceeded the old single-section capacity. Short-caption embeddings
+matched exactly. Changing a trailing tag changed the new embedding while the
+original implementation ignored the change. Mixed-length batches, independent
+encoder prompts, dropout, captions beyond four sections, and tail gradients
+passed in both standard and V-pred launcher compositions. This verifies the
+encoder integration using SDXL weights, not training quality on NoobAI weights.
+
+The rebuilt executable's normal pipeline worker prepared two synthetic shape
+images with long sidecars, ran two real SDXL GPU training steps, saved LoRA
+checkpoints, and generated baseline/intermediate/final previews. The command
+was built by `ApplicationService.build_command`, with a bounded two-step run,
+one long preview prompt, and external ComfyUI validation skipped. This checks
+the packaged training path; it is not a full Ruth or NoobAI training run.
+
+Source suite: 326 passed, three existing-binary cases excluded; rebuilt package
+suite: four passed. Ruff, Mypy, Pyright, and wheel build passed. The initial
+package build exposed a stray `no` before the deployment entry point's docstring;
+removing it corrected that startup syntax error, and the build then succeeded.
+
+- Executable: `dist/full-captions-0.8.1/MIVIMLoRAStudio.dist/MIVIMLoRAStudio.exe`.
+- SHA-256: `9DFA351DAA14FD5AEF49404AD39AF8A5123B83650F487A9D1910FD173BB71033`.
+- Encoder evidence: `dist/full-caption-encoding.json`,
+  `dist/full-caption-vpred-encoding.json`.
+- Packaged GPU run: `dist/caption-worker-081/worker.log`; checkpoints and three
+  previews are under `dist/caption-worker-081/checkpoints/circle`.
+- Build logs: `dist/full-captions-build.log` (failed),
+  `dist/full-captions-build-retry.log` (passed).

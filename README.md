@@ -37,6 +37,12 @@ You can also launch it directly:
 
 ## What the app handles
 
+Already tagged your images? Keep each image beside its matching `.txt` file.
+Studio imports those captions automatically, preserving their tags and order.
+From 0.8.1, the training worker encodes long SDXL captions in complete sections
+instead of silently discarding the trailing tags. No retagging or extra setup
+is needed; automatic tagging only fills missing captions.
+
 ### Connect
 
 - Detects current Comfy Desktop 2 and legacy Desktop installations.

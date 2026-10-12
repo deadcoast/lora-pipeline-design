@@ -52,12 +52,14 @@ def velocity_target(source: str) -> ast.Attribute:
     raise ValueError("Unrecognized ai-toolkit V-pred velocity-target implementation.")
 
 
-def vpred_runner(toolkit_dir: Path) -> str:
+def vpred_runner(toolkit_dir: Path, *, before_run: str = "") -> str:
     """Bind the child adapter to the exact inspected source bytes and AST node."""
     source = (toolkit_dir / TRAINER_SOURCE).read_bytes()
     target = velocity_target(source.decode("utf-8"))
     approved = (hashlib.sha256(source).hexdigest(), target.lineno, target.col_offset)
-    return f"approved_target = {approved!r}\n" + _VPRED_RUNNER
+    return (
+        f"approved_target = {approved!r}\n" + _VPRED_RUNNER + before_run + _RUN_TOOLKIT
+    )
 
 
 _VPRED_RUNNER = r"""
@@ -132,6 +134,9 @@ for name in ("ddpm", "euler"):
         if float(scheduler.alphas_cumprod[-1]) > 1e-7:
             raise RuntimeError("The trainer schedule does not end at zero SNR.")
 print("[train] NoobAI V-pred: verified DDPM/Euler zero-terminal-SNR schedulers", flush=True)
+"""
+
+_RUN_TOOLKIT = r"""
 sys.argv = [str(run_path), *sys.argv[2:]]
 runpy.run_path(str(run_path), run_name="__main__")
 """

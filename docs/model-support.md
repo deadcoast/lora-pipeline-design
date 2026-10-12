@@ -163,6 +163,17 @@ the step count. No optimum step count is inferred from image count alone.
 
 ## Automatic anime captions in 0.8.0
 
+**0.8.1 caption correction:** image/`.txt` pairs from an external tagger remain
+the supported input. The SDXL training worker now encodes every caption token
+in complete CLIP sections, including each section's beginning/end tokens and
+padding. Both text encoders use the same section count; the first section
+provides the pooled embedding. Short captions retain the original encoder
+behavior. Training previews align positive and negative embedding lengths.
+This is automatic inside Studio's worker and does not modify the trainer
+checkout or source captions. Longer captions require additional encoder work
+and longer cross-attention sequences. It does not establish that every supplied
+tag is accurate or that a particular training run achieves good likeness.
+
 Both NoobAI profiles now enable local anime tagging by default. Existing source
 `.txt` descriptions retain priority; images without usable sidecars receive the
 trigger followed by inferred general tags. Users can review and edit these in

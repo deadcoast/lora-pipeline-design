@@ -38,7 +38,7 @@ from .model_profiles import (
 from .prepare_dataset import MANIFEST_NAME, prepared_output_manifest_issue
 from .process_control import run_managed_process
 from .run_guardian import active_run_guard_covers, pipeline_run_guard
-from .toolkit_vpred import vpred_runner
+from .toolkit_captions import caption_runner
 
 TRAINING_PRESETS = ("fast", "balanced", "quality")
 _PRESET_VALUES: dict[str, dict[str, Any]] = {
@@ -388,6 +388,7 @@ def materialize_config(
     if isinstance(meta, dict):
         meta["name"] = run_name
         meta["mivim_model_profile"] = profile.id
+        meta["mivim_caption_encoding"] = "clip-sections-v1"
         if preset is not None:
             meta["mivim_preset"] = preset
 
@@ -517,15 +518,15 @@ def _train_with_guard(
         base_model=base_model,
         steps=steps,
     )
-    cmd = [config.AI_TOOLKIT_PYTHON, str(run_py), str(cfg)]
-    if model_profile(config.MODEL_PROFILE).v_prediction:
-        cmd = [
-            config.AI_TOOLKIT_PYTHON,
-            "-c",
-            vpred_runner(run_py.parent),
-            str(run_py),
-            str(cfg),
-        ]
+    cmd = [
+        config.AI_TOOLKIT_PYTHON,
+        "-c",
+        caption_runner(
+            run_py.parent, v_prediction=model_profile(config.MODEL_PROFILE).v_prediction
+        ),
+        str(run_py),
+        str(cfg),
+    ]
     print(f"[train] {config.AI_TOOLKIT_PYTHON} {run_py} {cfg}")
     print(f"[train] cwd = {config.AI_TOOLKIT_DIR}")
     # Stream ai-toolkit output live; run in its own directory so relative paths resolve.
