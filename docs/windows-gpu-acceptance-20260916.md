@@ -1,5 +1,9 @@
 # Windows package and SDXL acceptance — September 16, 2026
 
+> Historical build outputs and logs under `dist/` cited below were removed on
+> 2026-10-13. Only `dist/release` and `dist/milestone-20260916` remain. See
+> `CHANGELOG.md` for the release history.
+
 ## Scope and current result
 
 **Passed on this Windows machine.** The rebuilt Studio completed preparation,

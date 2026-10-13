@@ -372,9 +372,6 @@ Build a standalone Windows application with Qt's official deployment tool:
 .\scripts\build_windows.ps1
 ```
 
-Use `-OutputDirectory dist/noobai-0.6.1` to build into a separate directory
-while preserving an existing package.
-
 The build exports the runtime and deployment tools from the checked-in
 `uv.lock`, verifies package hashes, and synchronizes the private
 `.venv-deploy` before packaging. Run `uv lock` and commit the updated lockfile
@@ -385,8 +382,8 @@ build's dependency authority.
 `pysidedeploy.spec` includes the training config and ComfyUI validation
 workflow. The packaged executable reuses itself as a hidden-console pipeline
 worker, so it does not depend on a system Python interpreter after deployment.
-Distribute the complete `dist\MIVIMLoRAStudio.dist` folder, not the executable
-by itself.
+Distribute the complete `dist\release\MIVIMLoRAStudio.dist` folder, not the
+executable by itself.
 
 After building, `uv run python -m pytest tests/test_packaging.py -q` checks the package,
 including native Windows UI actions that start its real photo-preparation

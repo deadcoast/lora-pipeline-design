@@ -1,5 +1,9 @@
 # Model profiles and compatibility
 
+> Historical build outputs and logs under `dist/` cited below were removed on
+> 2026-10-13. Only `dist/release` and `dist/milestone-20260916` remain. See
+> `CHANGELOG.md` for the release history.
+
 Reviewed against primary sources on **2026-10-11**. This is a compatibility
 reference, not a ranking of image quality. No checkpoint weights are downloaded
 or bundled by Studio.
@@ -125,8 +129,8 @@ Evidence: `dist/noobai-vpred-numerical.log`. Reproduce with:
 
 ```powershell
 uv run python -m scripts.verify_vpred_trainer `
-  --toolkit dist/acceptance-tools/ai-toolkit `
-  --python dist/acceptance-tools/ai-toolkit/.venv/Scripts/python.exe
+  --toolkit "$env:LOCALAPPDATA\MIVIM\LoRA Pipeline\trainer\ai-toolkit" `
+  --python "$env:LOCALAPPDATA\MIVIM\LoRA Pipeline\trainer\ai-toolkit\.venv\Scripts\python.exe"
 ```
 
 Live NoobAI training with actual weights, ComfyUI image generation, and visual

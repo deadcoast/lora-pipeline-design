@@ -1,5 +1,9 @@
 # Choose a saved training checkpoint
 
+> Historical build outputs and logs under `dist/` cited below were removed on
+> 2026-10-13. Only `dist/release` and `dist/milestone-20260916` remain. See
+> `CHANGELOG.md` for the release history.
+
 Results now offers **Compare training checkpoints**. The dialog displays two
 saved training previews at the same prompt index. Both training steps are
 selectable, and missing previews are explicitly labelled. **Validate this
