@@ -16,6 +16,7 @@ dist/
 
 # Data + outputs (large / private — don't commit)
 datasets/*/
+ruth_db/
 outputs/checkpoints/*
 outputs/configs/*
 outputs/grids/*
