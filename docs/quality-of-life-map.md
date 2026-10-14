@@ -28,6 +28,7 @@ acceptance checks.
 | Result handoff | Casual users do not know what to enter or build in ComfyUI | Export editable Workflow JSON v0.4, then add its exact bytes through ComfyUI's user-data API under **Workflows → MIVIM**; select the profile when necessary, use a content-fingerprinted filename so concurrent saves cannot overwrite each other, read the file back, and retain **Show JSON file** as a manual fallback |
 | Restored result | Large files freeze the UI or stale model bytes are trusted | Hash the LoRA and checkpoint in a worker; keep handoff actions disabled until the original Desktop context and exact bytes are verified |
 | Offline restart | A temporary Desktop discovery failure forgets a valid setup or silently chooses another | Retain an unavailable installation ID as **Original instance unavailable**, refuse substitution, and accept a new dynamic port only after the same installation and exact model files are re-established |
+| Library | Only the last result is visible; the user must remember which base model, trigger, and photos each run used, and misspelled style names split one style into several | Scan the result records on disk into a Library grouped by character with an art-style chip and status; require one-word character and art-style tags with autocomplete and a "new word" hint; generate `<character>-<style>-mk<NN>` names; carry a run's full setup into **Train next version**; name each checkpoint's purpose in Connect |
 
 ## Comfy Desktop compatibility boundary
 

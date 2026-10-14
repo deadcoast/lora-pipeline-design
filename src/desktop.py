@@ -32,6 +32,7 @@ from PySide6.QtCore import (
     QProcessEnvironment,
     QRunnable,
     QSignalBlocker,
+    QStringListModel,
     Qt,
     QThreadPool,
     QTimer,
@@ -46,6 +47,8 @@ from PySide6.QtGui import (
     QDropEvent,
     QFont,
     QIcon,
+    QImage,
+    QImageReader,
     QPainter,
     QPixmap,
     QResizeEvent,
@@ -55,6 +58,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -84,6 +88,7 @@ from .app_models import (
     ValidationRecovery,
 )
 from .app_service import (
+    MISSING_SOURCE_NAME,
     ApplicationService,
     PipelineCommand,
     ReadinessAction,
@@ -116,6 +121,30 @@ from .comfy_desktop import (
 from .dataset_review import PreparedDatasetDialog
 from .desktop_theme import APP_STYLE
 from .io_utils import artifact_fingerprint
+from .library import (
+    Library,
+    LibraryEntry,
+    LibraryIndex,
+    LibraryIndexError,
+    RunTags,
+    checkpoint_style,
+    library_index_path,
+    load_library_index,
+    next_version_name,
+    profile_for_checkpoint,
+    save_library_index,
+    scan_library,
+    vocabulary_from,
+)
+from .library_view import (
+    THUMBNAIL_HEIGHT,
+    THUMBNAIL_WIDTH,
+    LibraryPage,
+    TagField,
+    TagRunDialog,
+    profile_label,
+    style_label,
+)
 from .model_profiles import MODEL_PROFILES, is_sdxl_base_checkpoint, model_profile
 from .photo_review import PhotoIssueDialog
 from .process_control import (
@@ -124,9 +153,10 @@ from .process_control import (
 )
 from .run_guardian import RunLeaseBusyError, RunLeaseError, pipeline_run_guard
 from .studio_logging import StudioLog, log_directory_for
+from .tags import normalize_tag, tag_error
 from .training_checkpoints import TrainingCheckpoint, discover_training_checkpoints
 
-NAV_SETUP, NAV_PROJECT, NAV_RUN, NAV_RESULTS = range(4)
+NAV_LIBRARY, NAV_SETUP, NAV_PROJECT, NAV_RUN, NAV_RESULTS = range(5)
 RunFailureKind = Literal[
     "busy",
     "comfy_busy",
@@ -172,6 +202,26 @@ def _file_bytes_fingerprint(data: bytes) -> str:
     digest.update(b"mivim-file-v1\0")
     digest.update(data)
     return f"sha256:{digest.hexdigest()}"
+
+
+def _read_thumbnail(path: Path) -> QImage:
+    """Decode a grid at reduced size off the UI thread."""
+
+    reader = QImageReader(str(path))
+    reader.setAutoTransform(True)
+    size = reader.size()
+    if size.isValid():
+        reader.setScaledSize(
+            size.scaled(
+                THUMBNAIL_WIDTH * 2,
+                THUMBNAIL_HEIGHT * 2,
+                Qt.AspectRatioMode.KeepAspectRatio,
+            )
+        )
+    image = reader.read()
+    if image.isNull():
+        raise ValueError(reader.errorString() or "The grid image could not be read.")
+    return image
 
 
 def _layout_clear(layout: QVBoxLayout | QGridLayout) -> None:
@@ -354,6 +404,17 @@ class PhotoDropZone(QFrame):
         self.icon_label.setText("✓")
         self.folder_selected.emit(folder)
 
+    def clear(self) -> None:
+        """Forget the shown folder without emitting a selection."""
+        self.setProperty("hasPath", False)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.title_label.setText("Choose a folder of training images")
+        self.detail_label.setText(
+            "Drop a folder here, or browse. Use varied images of one person or character."
+        )
+        self.icon_label.setText("＋")
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         urls = event.mimeData().urls()
         if len(urls) == 1 and Path(urls[0].toLocalFile()).is_dir():
@@ -534,6 +595,12 @@ class MainWindow(QMainWindow):
         self._published_workflow: tuple[RunResult, WorkflowPublication] | None = None
         self._workflow_publish_busy = False
         self._workflow_publish_retry_requires_refresh = False
+        self.library_index = LibraryIndex()
+        self.library = Library(())
+        self._library_index_error = ""
+        self._auto_project_name = ""
+        self._thumbnail_cache: dict[tuple[str, int], QImage] = {}
+        self._thumbnail_requests: set[str] = set()
 
         self.setWindowTitle(f"MIVIM LoRA Studio {__version__}")
         self.setWindowIcon(_app_icon())
@@ -541,11 +608,15 @@ class MainWindow(QMainWindow):
         self.resize(1180, 780)
         self.setStyleSheet(APP_STYLE)
         self._build_ui()
+        self._load_library_index()
         self._populate_settings()
         self._populate_last_project()
         self._restore_last_result()
         self._restore_validation_recovery()
         self._connect_form_invalidation()
+        self.refresh_library()
+        if self.library.entries and self.pages.currentIndex() == NAV_SETUP:
+            self.show_page(NAV_LIBRARY)
         self._single_shot(80, self.refresh_setup)
 
     # ------------------------------------------------------------------ shell
@@ -572,13 +643,21 @@ class MainWindow(QMainWindow):
         nav.addSpacing(26)
         self.nav_buttons: list[QPushButton] = []
         for index, text in enumerate(
-            ("1  Connect", "2  New project", "3  Review & run", "4  Result")
+            (
+                "Library",
+                "1  Connect",
+                "2  New project",
+                "3  Review && run",
+                "4  Result",
+            )
         ):
             button = _button(text, "navButton")
             button.setCheckable(True)
             button.setEnabled(index <= NAV_PROJECT)
             button.clicked.connect(lambda _checked, page=index: self.show_page(page))
             nav.addWidget(button)
+            if index == NAV_LIBRARY:
+                nav.addSpacing(10)
             self.nav_buttons.append(button)
         nav.addStretch(1)
         privacy = _hint(
@@ -591,6 +670,7 @@ class MainWindow(QMainWindow):
         nav.addWidget(version)
 
         self.pages = QStackedWidget()
+        self.pages.addWidget(self._build_library_page())
         self.pages.addWidget(self._build_setup_page())
         self.pages.addWidget(self._build_project_page())
         self.pages.addWidget(self._build_run_page())
@@ -614,8 +694,10 @@ class MainWindow(QMainWindow):
         if not self.nav_buttons[index].isEnabled():
             return
         if index == NAV_RUN and self.pages.currentIndex() != NAV_RUN:
-            self.review_project()
+            self.review_project(require_tags=True)
             return
+        if index == NAV_LIBRARY and self.pages.currentIndex() != NAV_LIBRARY:
+            self.refresh_library()
         self.pages.setCurrentIndex(index)
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
@@ -626,6 +708,288 @@ class MainWindow(QMainWindow):
             and not (self.comfy_status is not None and self.comfy_status.reachable)
         ):
             self._comfy_retry_timer.start(0)
+
+    # ---------------------------------------------------------------- library
+    def _build_library_page(self) -> QWidget:
+        self.library_page = LibraryPage()
+        self.library_page.open_requested.connect(self.open_library_entry)
+        self.library_page.next_requested.connect(self.train_next_version)
+        self.library_page.tag_requested.connect(self._tag_library_entry_dialog)
+        return self.library_page
+
+    def _load_library_index(self) -> None:
+        path = library_index_path(self.service, self._collect_settings())
+        try:
+            self.library_index = load_library_index(path)
+            self._library_index_error = ""
+        except LibraryIndexError as exc:
+            self._library_index_error = (
+                f"{path.name} could not be read, so tags you add now will not be "
+                f"saved until it is fixed: {path}. {exc}"
+            )
+            self.studio_log.warning("library.index.unreadable", str(exc))
+
+    def _save_library_index(self) -> bool:
+        if self._library_index_error:
+            self.library_page.set_warning(self._library_index_error)
+            return False
+        path = library_index_path(self.service, self._collect_settings())
+        try:
+            save_library_index(path, self.library_index)
+        except OSError as exc:
+            self._show_error("Library tags were not saved", str(exc))
+            return False
+        return True
+
+    def refresh_library(self) -> None:
+        """Rebuild the library from the small records on disk; no hashing."""
+        settings = self._collect_settings()
+        try:
+            self.library = scan_library(self.service, settings, self.library_index)
+        except OSError as exc:
+            self.studio_log.warning("library.scan.failed", str(exc))
+            self.library = Library(())
+        self.library_page.set_library(self.library)
+        self.library_page.set_warning(self._library_index_error)
+        vocabulary = self._tag_vocabulary()
+        self.character_field.set_vocabulary(vocabulary.characters)
+        self.artstyle_field.set_vocabulary(vocabulary.styles)
+        self._refresh_checkpoint_style_completer(vocabulary.styles)
+        self._load_library_thumbnails()
+
+    def _tag_vocabulary(self) -> LibraryIndex:
+        try:
+            return vocabulary_from(self.library, self.library_index)
+        except ValueError:
+            return self.library_index
+
+    def _run_is_active(self) -> bool:
+        process = self.pipeline_process
+        return (
+            process is not None and process.state() != QProcess.ProcessState.NotRunning
+        )
+
+    def open_library_entry(self, entry: LibraryEntry) -> None:
+        if entry.record is None:
+            return
+        self._show_result(entry.record.result_path, entry.record)
+        self.show_page(NAV_RESULTS)
+
+    def train_next_version(self, entry: LibraryEntry) -> None:
+        """Carry one run's base model, tags, trigger, and photos into a new version."""
+        if self._run_is_active():
+            self._show_error(
+                "A run is already active",
+                "Wait for the current run to finish, or stop it safely first.",
+            )
+            return
+        record = entry.record
+        if entry.checkpoint:
+            self.checkpoint_combo.setCurrentText(entry.checkpoint)
+        if entry.model_profile:
+            profile_index = self.model_profile_combo.findData(entry.model_profile)
+            if profile_index >= 0:
+                self.model_profile_combo.setCurrentIndex(profile_index)
+        if record is not None and record.checkpoint_path is not None:
+            self.base_model_edit.setText(str(record.checkpoint_path))
+        self.save_current_settings(silent=True)
+        self.new_project()
+        self.character_field.set_value(entry.character)
+        self.artstyle_field.set_value(entry.artstyle)
+        if entry.trigger:
+            self.trigger_edit.setText(entry.trigger)
+        preset_index = self.preset_combo.findData(entry.preset)
+        if preset_index >= 0:
+            self.preset_combo.setCurrentIndex(preset_index)
+        preset = TrainingPreset(self.preset_combo.currentData())
+        self.training_steps_spin.setValue(
+            entry.steps if entry.steps and entry.steps != preset.training_steps else 0
+        )
+        if entry.tagged:
+            self._set_auto_project_name(
+                next_version_name(self.library, entry.character, entry.artstyle)
+            )
+        if entry.source_dir is not None and entry.source_dir.is_dir():
+            self.photo_drop.set_folder(entry.source_dir)
+        else:
+            self._clear_photo_folder()
+        self.show_page(NAV_PROJECT)
+
+    def tag_library_entry(self, entry: LibraryEntry, tags: RunTags) -> None:
+        try:
+            self.library_index = self.library_index.with_run_tags(
+                entry.project_name, tags
+            )
+        except ValueError as exc:
+            self._show_error("Tags were not saved", str(exc))
+            return
+        self._save_library_index()
+        self.refresh_library()
+
+    def _tag_library_entry_dialog(self, entry: LibraryEntry) -> None:
+        vocabulary = self._tag_vocabulary()
+        dialog = TagRunDialog(
+            entry.project_name,
+            vocabulary.characters,
+            vocabulary.styles,
+            RunTags(entry.character, entry.artstyle) if entry.tagged else None,
+            self,
+        )
+        try:
+            if dialog.exec() == TagRunDialog.DialogCode.Accepted:
+                self.tag_library_entry(entry, dialog.tags())
+        finally:
+            dialog.deleteLater()
+
+    def _remember_tags(self, draft: ProjectDraft) -> None:
+        """Add a run's words to the vocabulary when the run actually starts."""
+        updated = self.library_index
+        try:
+            if draft.character:
+                updated = updated.with_character(draft.character)
+            if draft.artstyle:
+                updated = updated.with_style(draft.artstyle)
+        except ValueError:
+            return
+        if updated != self.library_index:
+            self.library_index = updated
+            self._save_library_index()
+
+    def _load_library_thumbnails(self) -> None:
+        for entry in self.library_page.entries_needing_thumbnails():
+            path = entry.grid_path
+            if path is None or entry.project_name in self._thumbnail_requests:
+                continue
+            try:
+                key = (str(path), path.stat().st_mtime_ns)
+            except OSError:
+                continue
+            cached = self._thumbnail_cache.get(key)
+            if cached is not None:
+                self.library_page.set_thumbnail(
+                    entry.project_name, QPixmap.fromImage(cached)
+                )
+                continue
+            name = entry.project_name
+            self._thumbnail_requests.add(name)
+
+            def loaded(
+                value: object, name: str = name, key: tuple[str, int] = key
+            ) -> None:
+                self._thumbnail_requests.discard(name)
+                if not isinstance(value, QImage) or value.isNull():
+                    return
+                if len(self._thumbnail_cache) > 64:
+                    self._thumbnail_cache.clear()
+                self._thumbnail_cache[key] = value
+                self.library_page.set_thumbnail(name, QPixmap.fromImage(value))
+
+            def failed(_message: str, name: str = name) -> None:
+                self._thumbnail_requests.discard(name)
+
+            self._run_worker(
+                lambda path=path: _read_thumbnail(path),
+                loaded,
+                failed,
+                operation="library.thumbnail",
+            )
+
+    def _set_auto_project_name(self, name: str) -> None:
+        self._auto_project_name = name
+        self.project_name_edit.setText(name)
+
+    def _suggest_project_name(self, fallback: str = "") -> None:
+        """Fill the name from character + style, unless the user typed their own."""
+        current = self.project_name_edit.text().strip()
+        if current and current != self._auto_project_name:
+            return
+        character = self.character_field.value()
+        artstyle = self.artstyle_field.value()
+        if (
+            character
+            and artstyle
+            and tag_error(character) is None
+            and tag_error(artstyle) is None
+        ):
+            suggestion = next_version_name(self.library, character, artstyle)
+        elif fallback:
+            suggestion = fallback
+        else:
+            return
+        if suggestion != current:
+            self._set_auto_project_name(suggestion)
+
+    def _tags_changed(self, *_args: object) -> None:
+        self.project_form_error.setVisible(False)
+        self._invalidate_readiness()
+        self._suggest_project_name()
+
+    def _clear_photo_folder(self) -> None:
+        self.photo_drop.clear()
+        self.source_folder = None
+        self.source_summary = None
+        self.review_photos_button.setEnabled(False)
+        self.photo_summary.setText("No folder selected.")
+        self._update_training_hints()
+
+    def _checkpoint_path_for(self, checkpoint: str) -> Path | None:
+        if not checkpoint.strip():
+            return None
+        return self.service.resolve_checkpoint_path(self.discovery, checkpoint)
+
+    def _decorate_checkpoint_items(self) -> None:
+        """Name each model's purpose in its tooltip: MODEL :: Anime · profile."""
+        for position in range(self.checkpoint_combo.count()):
+            name = self.checkpoint_combo.itemText(position)
+            style = checkpoint_style(
+                name, self.library_index, path=self._checkpoint_path_for(name)
+            )
+            self.checkpoint_combo.setItemData(
+                position,
+                f"MODEL :: {style_label(style)} · "
+                f"{profile_label(profile_for_checkpoint(name))}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
+
+    def _update_model_style(self) -> None:
+        name = self.checkpoint_combo.currentText().strip()
+        if not name:
+            self.model_style_label.setText("")
+            self.checkpoint_style_edit.setVisible(False)
+            return
+        style = checkpoint_style(
+            name, self.library_index, path=self._checkpoint_path_for(name)
+        )
+        profile = profile_label(str(self.model_profile_combo.currentData()))
+        self.model_style_label.setText(
+            f"MODEL :: {style_label(style)} · profile {profile}"
+        )
+        self.checkpoint_style_edit.setVisible(not style)
+
+    def _refresh_checkpoint_style_completer(self, styles: Sequence[str]) -> None:
+        completer = self.checkpoint_style_edit.completer()
+        if completer is not None:
+            model = completer.model()
+            if isinstance(model, QStringListModel):
+                model.setStringList(list(styles))
+
+    def _label_checkpoint_style(self) -> None:
+        name = self.checkpoint_combo.currentText().strip()
+        tag = normalize_tag(self.checkpoint_style_edit.text())
+        if not name or not tag:
+            return
+        issue = tag_error(tag)
+        if issue is not None:
+            self.model_style_label.setText(f"MODEL :: {issue}")
+            return
+        self.library_index = self.library_index.with_checkpoint_style(name, tag)
+        self._save_library_index()
+        self.checkpoint_style_edit.clear()
+        self._decorate_checkpoint_items()
+        self._update_model_style()
+        vocabulary = self._tag_vocabulary()
+        self.artstyle_field.set_vocabulary(vocabulary.styles)
+        self._refresh_checkpoint_style_completer(vocabulary.styles)
 
     # --------------------------------------------------------------- setup UI
     def _build_setup_page(self) -> QWidget:
@@ -728,6 +1092,25 @@ class MainWindow(QMainWindow):
         self.model_profile_hint = _body("")
         model_layout.addWidget(self.model_profile_hint)
         self._update_model_profile_hint()
+        self.model_style_label = QLabel("")
+        self.model_style_label.setObjectName("modelStyleLabel")
+        self.model_style_label.setAccessibleName("Selected model purpose and profile")
+        model_layout.addWidget(self.model_style_label)
+        self.checkpoint_style_edit = QLineEdit()
+        self.checkpoint_style_edit.setObjectName("checkpointStyleEdit")
+        self.checkpoint_style_edit.setPlaceholderText(
+            "Label this model's style in one word, such as anime or photo"
+        )
+        self.checkpoint_style_edit.setAccessibleName(
+            "Style label for the selected model"
+        )
+        style_completer = QCompleter(QStringListModel([]), self.checkpoint_style_edit)
+        style_completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        style_completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.checkpoint_style_edit.setCompleter(style_completer)
+        self.checkpoint_style_edit.editingFinished.connect(self._label_checkpoint_style)
+        self.checkpoint_style_edit.setVisible(False)
+        model_layout.addWidget(self.checkpoint_style_edit)
         self.sdxl_confirm_checkbox = QCheckBox(
             "This is an SDXL base checkpoint (not a refiner)"
         )
@@ -939,6 +1322,33 @@ class MainWindow(QMainWindow):
         photo_summary_row.addWidget(self.review_photos_button)
         page.addLayout(photo_summary_row)
 
+        tags_card = _card()
+        tags_grid = QGridLayout(tags_card)
+        tags_grid.setContentsMargins(18, 18, 18, 18)
+        tags_grid.setHorizontalSpacing(16)
+        tags_grid.setVerticalSpacing(9)
+        self.character_field = TagField("character", "Character", "ruth")
+        self.character_field.edit.setObjectName("characterEdit")
+        self.artstyle_field = TagField("style", "Art style", "anime")
+        self.artstyle_field.edit.setObjectName("artstyleEdit")
+        tags_grid.addWidget(self.character_field, 0, 0)
+        tags_grid.addWidget(self.artstyle_field, 0, 1)
+        tags_grid.addWidget(
+            _hint(
+                "The library files every run under these two words and names the "
+                "next version for you."
+            ),
+            1,
+            0,
+            1,
+            2,
+        )
+        tags_grid.setColumnStretch(0, 1)
+        tags_grid.setColumnStretch(1, 1)
+        page.addWidget(tags_card)
+        self.character_field.changed.connect(self._tags_changed)
+        self.artstyle_field.changed.connect(self._tags_changed)
+
         project_card = _card()
         grid = QGridLayout(project_card)
         grid.setContentsMargins(18, 18, 18, 18)
@@ -1047,6 +1457,11 @@ class MainWindow(QMainWindow):
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
         page.addWidget(project_card)
+        self.project_form_error = QLabel("")
+        self.project_form_error.setObjectName("formError")
+        self.project_form_error.setWordWrap(True)
+        self.project_form_error.setVisible(False)
+        page.addWidget(self.project_form_error)
 
         actions = QHBoxLayout()
         back = _button("←  Connection")
@@ -1055,7 +1470,9 @@ class MainWindow(QMainWindow):
         actions.addStretch(1)
         self.review_button = _button("Review setup  →", "primaryButton")
         self.review_button.setObjectName("reviewSetupButton")
-        self.review_button.clicked.connect(self.review_project)
+        self.review_button.clicked.connect(
+            lambda: self.review_project(require_tags=True)
+        )
         actions.addWidget(self.review_button)
         page.addLayout(actions)
         page.addStretch(1)
@@ -1727,6 +2144,8 @@ class MainWindow(QMainWindow):
                 self.checkpoint_combo.addItem(previous)
             if previous:
                 self.checkpoint_combo.setCurrentText(previous)
+            self._decorate_checkpoint_items()
+        self._update_model_style()
         with QSignalBlocker(self.sdxl_confirm_checkbox):
             detected_sdxl = is_sdxl_base_checkpoint(self.settings.training_base_model)
             self.sdxl_confirm_checkbox.setChecked(
@@ -1765,6 +2184,8 @@ class MainWindow(QMainWindow):
 
     def _populate_last_project(self) -> None:
         last = self.settings.last_project
+        self.character_field.set_value(last.character)
+        self.artstyle_field.set_value(last.artstyle)
         self.project_name_edit.setText(last.project_name)
         self.trigger_edit.setText(last.trigger)
         index = self.preset_combo.findData(last.preset.value)
@@ -1820,11 +2241,14 @@ class MainWindow(QMainWindow):
         source_dir = (
             last.source_dir if last.project_name == recovery.project_name else None
         )
+        same_project = last.project_name == recovery.project_name
         return ProjectDraft(
             project_name=recovery.project_name,
             source_dir=source_dir,
             trigger=recovery.trigger,
             preset=recovery.preset,
+            character=last.character if same_project else "",
+            artstyle=last.artstyle if same_project else "",
         )
 
     def _restore_validation_recovery(self) -> None:
@@ -2614,6 +3038,8 @@ class MainWindow(QMainWindow):
 
     def _model_profile_changed(self, *_args: object) -> None:
         self._update_model_profile_hint()
+        if hasattr(self, "model_style_label"):
+            self._update_model_style()
         self._invalidate_readiness()
         self._update_training_hints()
         if self.source_folder is not None:
@@ -2657,6 +3083,14 @@ class MainWindow(QMainWindow):
             self.base_model_edit.setText(str(resolved))
         elif current and Path(current).name.casefold() != selected_name:
             self.base_model_edit.clear()
+        if checkpoint.strip():
+            # The filename decides the profile; the profile list stays for override.
+            wanted = self.model_profile_combo.findData(
+                profile_for_checkpoint(checkpoint)
+            )
+            if wanted >= 0 and self.model_profile_combo.currentIndex() != wanted:
+                self.model_profile_combo.setCurrentIndex(wanted)
+        self._update_model_style()
         self._invalidate_readiness()
         if self._return_to_readiness_after_checkpoint and checkpoint.strip():
             self._return_to_readiness_after_checkpoint = False
@@ -2685,13 +3119,11 @@ class MainWindow(QMainWindow):
         self._update_training_hints()
         self.review_photos_button.setEnabled(False)
         self._invalidate_readiness()
-        if not self.project_name_edit.text().strip():
-            safe = "".join(
-                char if char.isalnum() or char in "._-" else "_"
-                for char in folder.name.strip()
-            ).strip("._-")
-            if safe:
-                self.project_name_edit.setText(f"{safe}_v1")
+        safe = "".join(
+            char if char.isalnum() or char in "._-" else "_"
+            for char in folder.name.strip()
+        ).strip("._-")
+        self._suggest_project_name(fallback=f"{safe}_v1" if safe else "")
         self.photo_summary.setText("Inspecting the selected photos…")
         self.studio_log.info(
             "photos.check.started",
@@ -2857,7 +3289,7 @@ class MainWindow(QMainWindow):
         )
 
     def _build_draft(self) -> ProjectDraft:
-        missing = self.service.root / ".no-photo-folder-selected"
+        missing = self.service.root / MISSING_SOURCE_NAME
         source = self.source_folder or missing
         preset = TrainingPreset(self.preset_combo.currentData())
         return ProjectDraft(
@@ -2869,9 +3301,46 @@ class MainWindow(QMainWindow):
             overwrite_existing=self.overwrite_checkbox.isChecked(),
             training_steps=self.training_steps_spin.value() or None,
             use_anime_tags=self.anime_tags_checkbox.isChecked(),
+            character=self.character_field.value(),
+            artstyle=self.artstyle_field.value(),
         )
 
-    def review_project(self) -> None:
+    def _project_tags_issue(self) -> str:
+        problems = []
+        for field, label in (
+            (self.character_field, "character"),
+            (self.artstyle_field, "art style"),
+        ):
+            issue = field.error()
+            if issue is not None:
+                problems.append(f"{label} ({issue.rstrip('.').lower()})")
+        if not problems:
+            return ""
+        return (
+            "Choose a character and an art style before reviewing, one word each. "
+            "Fix: " + "; ".join(problems) + "."
+        )
+
+    def _show_project_tags_issue(self, issue: str) -> None:
+        self.project_form_error.setText(issue)
+        self.project_form_error.setVisible(True)
+        self.pages.setCurrentIndex(NAV_PROJECT)
+        for position, button in enumerate(self.nav_buttons):
+            button.setChecked(position == NAV_PROJECT)
+
+    def review_project(self, *, require_tags: bool = False) -> None:
+        """Move to the Review page.
+
+        Repairs and recoveries re-enter review on the user's behalf, so the
+        character and art-style words are only demanded when the user asks
+        for the review themselves; starting a run always demands them.
+        """
+        issue = self._project_tags_issue()
+        self.project_form_error.setText(issue)
+        self.project_form_error.setVisible(bool(issue))
+        if issue and require_tags:
+            self._show_project_tags_issue(issue)
+            return
         self.settings = self._collect_settings()
         self.draft = self._build_draft()
         self._invalidate_readiness()
@@ -3240,6 +3709,10 @@ class MainWindow(QMainWindow):
                 "Review the highlighted setup items and check again.",
             )
             return
+        tags_issue = self._project_tags_issue()
+        if tags_issue:
+            self._show_project_tags_issue(tags_issue)
+            return
         try:
             command = self.service.build_command(
                 validated_settings,
@@ -3249,6 +3722,7 @@ class MainWindow(QMainWindow):
         except (FileNotFoundError, TypeError, ValueError) as exc:
             self._show_error("The run could not start", str(exc))
             return
+        self._remember_tags(validated_draft)
         if mode == "full":
             self._installed_lora_name = None
         self._launch_pipeline_command(
@@ -3973,6 +4447,7 @@ class MainWindow(QMainWindow):
         self._single_shot(450, lambda: self.show_page(NAV_RESULTS))
 
     def _restore_navigation(self) -> None:
+        self.nav_buttons[NAV_LIBRARY].setEnabled(True)
         self.nav_buttons[NAV_SETUP].setEnabled(True)
         self.nav_buttons[NAV_PROJECT].setEnabled(True)
         self.nav_buttons[NAV_RUN].setEnabled(True)
@@ -4366,6 +4841,15 @@ class MainWindow(QMainWindow):
             checkpoint_path=outcome.checkpoint_path,
             checkpoint_fingerprint=outcome.checkpoint_fingerprint,
             starting_strength=outcome.starting_strength,
+            character=outcome.character or draft.character,
+            artstyle=outcome.artstyle or draft.artstyle,
+            source_dir=outcome.source_dir
+            or (
+                draft.source_dir
+                if draft.source_dir is not None
+                and draft.source_dir.name != MISSING_SOURCE_NAME
+                else None
+            ),
         )
         if persist:
             self._persist_run_result(record)
@@ -4382,6 +4866,7 @@ class MainWindow(QMainWindow):
             self.run_log.appendPlainText(
                 f"\n[studio] The verified result could not be added to history: {exc}"
             )
+        self.refresh_library()
 
     def _show_result(self, result: Path, record: RunResult | None = None) -> None:
         self._latest_result = result
@@ -5288,8 +5773,10 @@ class MainWindow(QMainWindow):
         self.run_stack.setCurrentIndex(0)
         self.run_log.clear()
         self._show_recovery_actions(False)
+        self.project_form_error.setVisible(False)
         if previous_name:
-            self.project_name_edit.setText(self._increment_project_name(previous_name))
+            self._set_auto_project_name(self._increment_project_name(previous_name))
+        self._suggest_project_name()
         self.nav_buttons[NAV_RUN].setEnabled(False)
         self.nav_buttons[NAV_RESULTS].setEnabled(False)
         self.show_page(NAV_PROJECT)
@@ -5392,7 +5879,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--screenshot-page",
-        choices=("connect", "project", "run", "result"),
+        choices=("library", "connect", "project", "run", "result"),
         default="connect",
         help="Page to capture with --screenshot (default: connect).",
     )
@@ -5427,6 +5914,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.screenshot is not None:
         destination = args.screenshot.resolve()
         page = {
+            "library": NAV_LIBRARY,
             "connect": NAV_SETUP,
             "project": NAV_PROJECT,
             "run": NAV_RUN,

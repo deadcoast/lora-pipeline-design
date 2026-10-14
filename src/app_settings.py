@@ -134,6 +134,8 @@ def _project_from_json(value: object, default: ProjectDraft) -> ProjectDraft:
             value.get("overwrite_existing"),
             default.overwrite_existing,
         ),
+        character=_text(value.get("character"), default.character, allow_empty=True),
+        artstyle=_text(value.get("artstyle"), default.artstyle, allow_empty=True),
     )
 
 
@@ -234,6 +236,9 @@ def _run_result_from_json(value: object) -> RunResult | None:
             "",
             allow_empty=True,
         ),
+        character=_text(value.get("character"), "", allow_empty=True),
+        artstyle=_text(value.get("artstyle"), "", allow_empty=True),
+        source_dir=_path(value.get("source_dir"), None),
     )
 
 
@@ -339,6 +344,8 @@ def _project_to_json(project: ProjectDraft) -> dict[str, object]:
         "use_anime_tags": project.use_anime_tags,
         "use_vision_captions": project.use_vision_captions,
         "overwrite_existing": project.overwrite_existing,
+        "character": project.character,
+        "artstyle": project.artstyle,
     }
 
 
@@ -371,6 +378,9 @@ def _run_result_to_json(result: RunResult | None) -> dict[str, object] | None:
         "published_workflow_fingerprint": result.published_workflow_fingerprint,
         "workflow_user_id": result.workflow_user_id,
         "workflow_user_name": result.workflow_user_name,
+        "character": result.character,
+        "artstyle": result.artstyle,
+        "source_dir": _path_for_json(result.source_dir),
     }
 
 

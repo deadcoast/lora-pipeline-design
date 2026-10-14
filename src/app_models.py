@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import config
+from .tags import normalize_tag, tag_error
 
 
 class TrainingPreset(StrEnum):
@@ -67,6 +68,8 @@ class ProjectDraft:
     overwrite_existing: bool = False
     training_steps: int | None = None
     use_anime_tags: bool = True
+    character: str = ""
+    artstyle: str = ""
 
     def caption_mode(self, model_profile: str = "sdxl") -> str:
         if model_profile != "sdxl" and self.use_anime_tags:
@@ -88,6 +91,8 @@ class ProjectDraft:
             overwrite_existing=self.overwrite_existing,
             training_steps=self.training_steps,
             use_anime_tags=self.use_anime_tags,
+            character=normalize_tag(self.character),
+            artstyle=normalize_tag(self.artstyle),
         )
 
     def validation_errors(self, *, require_source: bool = True) -> tuple[str, ...]:
@@ -101,6 +106,13 @@ class ProjectDraft:
 
         if not draft.trigger:
             errors.append("Choose a trigger phrase, such as 'ohwx person'.")
+        for label, tag in (
+            ("Character", draft.character),
+            ("Art style", draft.artstyle),
+        ):
+            issue = tag_error(tag) if tag else None
+            if issue:
+                errors.append(f"{label}: {issue}")
         if draft.training_steps is not None and draft.training_steps <= 0:
             errors.append("Training steps must be greater than zero.")
 
@@ -148,6 +160,9 @@ class RunResult:
     workflow_user_name: str = ""
     training_project_name: str = ""
     model_profile: str = "sdxl"
+    character: str = ""
+    artstyle: str = ""
+    source_dir: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)

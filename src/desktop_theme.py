@@ -267,4 +267,61 @@ QToolTip {
     color: #ffffff;
     padding: 6px;
 }
+QFrame#libraryGroup {
+    background: #141e33;
+    border: 1px solid #293550;
+    border-radius: 14px;
+}
+QLabel#libraryGroupTitle {
+    color: #f8fafc;
+    font-size: 18px;
+    font-weight: 700;
+}
+QFrame#libraryRow {
+    background: #0e1729;
+    border: 1px solid #25304a;
+    border-radius: 10px;
+}
+QLabel#libraryThumbnail {
+    background: #090f1c;
+    border: 1px solid #25304a;
+    border-radius: 8px;
+    color: #68748d;
+}
+QLabel#styleChip {
+    background: #1d2b4d;
+    border: 1px solid #315282;
+    border-radius: 9px;
+    color: #9ed0ff;
+    font-size: 12px;
+    font-weight: 650;
+    padding: 4px 9px;
+}
+QLabel#untaggedChip {
+    background: #232a3b;
+    border: 1px solid #3c4457;
+    border-radius: 9px;
+    color: #9aa3b8;
+    font-size: 12px;
+    padding: 4px 9px;
+}
+QPushButton#filterChip {
+    border-radius: 12px;
+    font-size: 12px;
+    padding: 5px 12px;
+}
+QPushButton#filterChip:checked {
+    background: #223254;
+    border: 1px solid #315282;
+    color: #ffffff;
+}
+QLabel#formError {
+    color: #ffb4c0;
+    font-size: 13px;
+}
+QLabel#modelStyleLabel {
+    color: #9ed0ff;
+    font-size: 13px;
+    font-weight: 650;
+}
 """

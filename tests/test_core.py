@@ -1339,3 +1339,89 @@ def test_comfy_lora_replacement_keeps_a_recoverable_previous_copy(
     assert name == source.name
     assert destination.read_bytes() == b"new-model"
     assert (lora_dir / f"{source.name}.previous").read_bytes() == b"old-model"
+
+
+def test_pipeline_records_tags_and_source_in_the_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_prepare(**_kwargs: object) -> Path:
+        prepared = tmp_path / "datasets" / "subject_v1"
+        prepared.mkdir(parents=True)
+        (prepared / "001.txt").write_text("ohwx person\n", encoding="utf-8")
+        return prepared
+
+    monkeypatch.setattr(pipeline_module.prep, "prepare", fake_prepare)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    monkeypatch.setattr(config, "RUN_CONFIGS_DIR", tmp_path / "configs")
+
+    pipeline_module.run(
+        _pipeline_args(
+            src=str(tmp_path / "photos"),
+            skip_prep=False,
+            skip_train=True,
+            skip_validate=True,
+            character="Ruth",
+            artstyle="anime",
+        )
+    )
+
+    record = json.loads(
+        (tmp_path / "configs" / "subject_v1-result.json").read_text(encoding="utf-8")
+    )
+    assert record["schema_version"] == 5
+    assert record["character"] == "ruth"
+    assert record["artstyle"] == "anime"
+    assert record["source_dir"] == str((tmp_path / "photos").resolve())
+
+
+def test_pipeline_rejects_a_tag_that_is_not_one_word(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    monkeypatch.setattr(config, "RUN_CONFIGS_DIR", tmp_path / "configs")
+
+    with pytest.raises(ValueError, match="One word"):
+        pipeline_module.run(
+            _pipeline_args(
+                src=str(tmp_path / "photos"),
+                skip_prep=False,
+                skip_train=True,
+                skip_validate=True,
+                artstyle="water color",
+            )
+        )
+
+
+def test_pipeline_records_the_source_folder_without_preparing_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checkpoints = tmp_path / "checkpoints"
+    checkpoints.mkdir()
+    (tmp_path / "datasets" / "subject_v1").mkdir(parents=True)
+    monkeypatch.setattr(config, "CHECKPOINTS_DIR", checkpoints)
+    monkeypatch.setattr(config, "DATASETS_DIR", tmp_path / "datasets")
+    monkeypatch.setattr(config, "RUN_CONFIGS_DIR", tmp_path / "configs")
+
+    def prepared_again(**_kwargs: object) -> Path:
+        raise AssertionError("prepared again")
+
+    monkeypatch.setattr(pipeline_module.prep, "prepare", prepared_again)
+    monkeypatch.setattr(pipeline_module.trainer, "train", lambda *_a, **_k: 0)
+
+    pipeline_module.run(
+        _pipeline_args(
+            src=str(tmp_path / "photos-moved"),
+            skip_prep=True,
+            skip_train=False,
+            skip_validate=True,
+        )
+    )
+
+    record = json.loads(
+        (tmp_path / "configs" / "subject_v1-result.json").read_text(encoding="utf-8")
+    )
+    assert record["source_dir"] == str((tmp_path / "photos-moved").resolve())
+    assert record["character"] == ""

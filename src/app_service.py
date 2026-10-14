@@ -353,6 +353,24 @@ class PipelineOutcome:
     starting_strength: float = 0.8
     training_project_name: str = ""
     model_profile: str = "sdxl"
+    character: str = ""
+    artstyle: str = ""
+    source_dir: Path | None = None
+
+
+MISSING_SOURCE_NAME = ".no-photo-folder-selected"
+
+
+def _source_and_tag_arguments(draft: ProjectDraft) -> list[str]:
+    """Record the photo folder and library tags; the pipeline validates the words."""
+    arguments: list[str] = []
+    source = draft.source_dir
+    if source is not None and source.name != MISSING_SOURCE_NAME:
+        arguments.extend(("--src", str(source)))
+    for flag, tag in (("--character", draft.character), ("--artstyle", draft.artstyle)):
+        if tag.strip():
+            arguments.extend((flag, tag.strip().lower()))
+    return arguments
 
 
 def _normalise_host(host: str) -> str:
@@ -1055,12 +1073,27 @@ class ApplicationService:
             2,
             3,
             4,
+            5,
         }:
             return None
         if value.get("model_profile", "sdxl") not in MODEL_PROFILE_IDS:
             return None
-        if value.get("schema_version") == 4 and "model_profile" not in value:
+        if value.get("schema_version") in {4, 5} and "model_profile" not in value:
             return None
+        character = artstyle = ""
+        source_dir: Path | None = None
+        if value.get("schema_version") == 5:
+            raw_character = value.get("character", "")
+            raw_artstyle = value.get("artstyle", "")
+            raw_source = value.get("source_dir", "")
+            if not all(
+                isinstance(raw, str)
+                for raw in (raw_character, raw_artstyle, raw_source)
+            ):
+                return None
+            character = cast(str, raw_character)
+            artstyle = cast(str, raw_artstyle)
+            source_dir = Path(cast(str, raw_source)) if raw_source else None
         mode = value.get("mode")
         fields = {
             key: value.get(key)
@@ -1093,7 +1126,7 @@ class ApplicationService:
         checkpoint_path: Path | None = None
         checkpoint_fingerprint = ""
         starting_strength = 0.8
-        if value.get("schema_version") in {3, 4}:
+        if value.get("schema_version") in {3, 4, 5}:
             path_fields = {
                 key: value.get(key)
                 for key in (
@@ -1195,6 +1228,9 @@ class ApplicationService:
             checkpoint_path=checkpoint_path,
             checkpoint_fingerprint=checkpoint_fingerprint,
             starting_strength=starting_strength,
+            character=character,
+            artstyle=artstyle,
+            source_dir=source_dir,
         )
 
     def recovery_path(self, settings: AppSettings, project_name: str) -> Path:
@@ -2718,8 +2754,7 @@ class ApplicationService:
         ]
         if reuse_prepared:
             args.append("--skip-prep")
-        else:
-            args.extend(("--src", str(draft.source_dir)))
+        args.extend(_source_and_tag_arguments(draft))
         args.extend(("--caption-mode", draft.caption_mode(settings.model_profile)))
         if draft.caption_mode(settings.model_profile) == "blip":
             args.append("--vision")
@@ -2799,7 +2834,12 @@ class ApplicationService:
         suffix = f"_step{choice.step}_{uuid.uuid4().hex[:12]}"
         name = project[: config.MAX_PROJECT_NAME_LENGTH - len(suffix)] + suffix
         draft = ProjectDraft(
-            project_name=name, trigger=result.trigger, preset=result.preset
+            project_name=name,
+            trigger=result.trigger,
+            preset=result.preset,
+            character=result.character,
+            artstyle=result.artstyle,
+            source_dir=result.source_dir,
         )
         command = self.build_validation_command(settings, draft, f"{name}.safetensors")
         args = list(command.arguments)
@@ -2882,6 +2922,7 @@ class ApplicationService:
             "--skip-train",
             "--lora",
             cleaned_lora,
+            *_source_and_tag_arguments(draft),
         ]
         if settings.training_base_model is not None:
             arguments.extend(("--base-model", str(settings.training_base_model)))

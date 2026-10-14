@@ -851,7 +851,8 @@ def test_prepared_dataset_is_reused_without_reprocessing_or_source_folder(
         "ready"
     )
     assert "--skip-prep" in command.arguments
-    assert "--src" not in command.arguments
+    # The moved folder is recorded for the library, never read during reuse.
+    assert command.arguments[command.arguments.index("--src") + 1] == str(photos)
 
 
 def test_prepared_dataset_reuse_rejects_a_new_unique_source_photo(
@@ -1066,7 +1067,8 @@ def test_prepare_result_record_is_resume_metadata_not_an_output_collision(
 
     assert collision.state == "ready"
     assert "--skip-prep" in command.arguments
-    assert "--src" not in command.arguments
+    # The moved folder is recorded for the library, never read during reuse.
+    assert command.arguments[command.arguments.index("--src") + 1] == str(photos)
 
 
 def test_validation_recovery_requires_the_exact_installed_lora_and_grid(
@@ -1745,3 +1747,133 @@ def test_setup_rebinds_lora_folder_for_one_selected_instance(
     )
 
     assert settings.comfy_lora_dir == selected_loras
+
+
+def _write_result_record(
+    configs: Path, name: str, schema_version: int, **extra: object
+) -> None:
+    configs.mkdir(parents=True, exist_ok=True)
+    fingerprint = "sha256:" + "0" * 64
+    record: dict[str, object] = {
+        "schema_version": schema_version,
+        "model_profile": "noobai-xl-epsilon",
+        "project_name": name,
+        "training_project_name": "",
+        "attempt_id": "attempt",
+        "mode": "full",
+        "result_path": str(configs.parent / "grids" / f"{name}_grid.png"),
+        "result_fingerprint": fingerprint,
+        "trigger": name,
+        "preset": "balanced",
+        "checkpoint": "NoobAI-XL-v1.1.safetensors",
+        "lora_name": f"{name}.safetensors",
+        "workflow_path": "",
+        "workflow_fingerprint": "",
+        "comfy_installation_id": "",
+        "comfy_host": "",
+        "installed_lora_path": "",
+        "lora_fingerprint": "",
+        "checkpoint_path": "",
+        "checkpoint_fingerprint": "",
+        "starting_strength": 0.8,
+        "completed_at": "2026-10-13T21:00:00+00:00",
+    }
+    record.update(extra)
+    (configs / f"{name}-result.json").write_text(json.dumps(record), encoding="utf-8")
+
+
+def test_outcome_reader_accepts_tags_and_source_from_schema_5(tmp_path: Path) -> None:
+    configs = tmp_path / "configs"
+    _write_result_record(
+        configs,
+        "ruth-anime-mk03",
+        5,
+        character="ruth",
+        artstyle="anime",
+        source_dir=str(tmp_path / "photos"),
+    )
+
+    outcome = ApplicationService(root=tmp_path).read_pipeline_outcome(
+        AppSettings(run_configs_dir=configs), "ruth-anime-mk03"
+    )
+
+    assert outcome is not None
+    assert (outcome.character, outcome.artstyle) == ("ruth", "anime")
+    assert outcome.source_dir == tmp_path / "photos"
+
+
+def test_outcome_reader_defaults_tags_for_schema_4_records(tmp_path: Path) -> None:
+    configs = tmp_path / "configs"
+    _write_result_record(configs, "ruth-mk02", 4)
+
+    outcome = ApplicationService(root=tmp_path).read_pipeline_outcome(
+        AppSettings(run_configs_dir=configs), "ruth-mk02"
+    )
+
+    assert outcome is not None
+    assert (outcome.character, outcome.artstyle, outcome.source_dir) == ("", "", None)
+
+
+def test_outcome_reader_rejects_malformed_tags(tmp_path: Path) -> None:
+    configs = tmp_path / "configs"
+    _write_result_record(configs, "bad-tags", 5, character=5, artstyle="anime")
+
+    assert (
+        ApplicationService(root=tmp_path).read_pipeline_outcome(
+            AppSettings(run_configs_dir=configs), "bad-tags"
+        )
+        is None
+    )
+
+
+def test_desktop_command_passes_tags_and_source_to_the_pipeline(
+    tmp_path: Path,
+) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 1)
+    settings = AppSettings(
+        comfy_lora_dir=tmp_path / "loras",
+        datasets_dir=Path("user-data/datasets"),
+        checkpoints_dir=Path("user-data/checkpoints"),
+        grids_dir=Path("user-data/grids"),
+        run_configs_dir=Path("user-data/configs"),
+    )
+    draft = ProjectDraft(
+        project_name="ruth-anime-mk03",
+        source_dir=photos,
+        trigger="ruth-anime-mk03",
+        character="ruth",
+        artstyle="anime",
+    )
+
+    arguments = (
+        ApplicationService(root=tmp_path)
+        .build_command(settings, draft, mode="prepare")
+        .arguments
+    )
+
+    assert arguments[arguments.index("--character") + 1] == "ruth"
+    assert arguments[arguments.index("--artstyle") + 1] == "anime"
+    assert arguments[arguments.index("--src") + 1] == str(photos)
+
+
+def test_desktop_command_omits_empty_tags(tmp_path: Path) -> None:
+    photos = tmp_path / "photos"
+    _write_images(photos, 1)
+    settings = AppSettings(
+        comfy_lora_dir=tmp_path / "loras",
+        datasets_dir=Path("user-data/datasets"),
+        checkpoints_dir=Path("user-data/checkpoints"),
+        grids_dir=Path("user-data/grids"),
+        run_configs_dir=Path("user-data/configs"),
+    )
+    draft = ProjectDraft(project_name="plain_v1", source_dir=photos, trigger="x person")
+
+    arguments = (
+        ApplicationService(root=tmp_path)
+        .build_command(settings, draft, mode="prepare")
+        .arguments
+    )
+
+    assert "--character" not in arguments
+    assert "--artstyle" not in arguments

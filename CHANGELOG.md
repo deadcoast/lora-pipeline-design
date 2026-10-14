@@ -5,8 +5,24 @@ versions of this file cited under `dist/` were removed on 2026-10-13; only
 `dist/release` (the current package) and `dist/milestone-20260916` (the
 September 16 GPU acceptance evidence) remain.
 
-## Unreleased
+## 0.9.0 — 2026-10-13
 
+- **Library page**, the home page once a run exists: every run grouped by
+  character with an art-style chip, base model and profile, trigger, steps,
+  date, grid thumbnail, and whether the LoRA is still installed. Open any
+  result, train the next version with the same setup, or tag older runs that
+  wait under Unsorted. Built from the result records on disk; nothing is hashed.
+- **Character** and **Art style** fields on New project: one word each, with
+  autocomplete from every word used before and a hint that says whether the
+  word is new. Both are required to review or start a run. The project name
+  fills as `<character>-<style>-mk<NN>` until you type your own.
+- Connect names each checkpoint's purpose (**MODEL :: Anime · NoobAI-XL ·
+  Epsilon-pred**) in its tooltip and under the selected model, labels unknown
+  models in one word, and selects the profile the filename calls for.
+- Result records (schema 5) carry `character`, `artstyle`, and `source_dir`;
+  `src.pipeline` accepts `--character` and `--artstyle`. `library.json` in the
+  workspace holds the vocabulary, a style per checkpoint, and tag overrides.
+- Fix the Review & run nav label, which rendered without its ampersand.
 - Stop tracking the `ruth_db` training images and remove them from history.
   The folder stays on disk and is ignored.
 - Replace the development-state narrative with this changelog.

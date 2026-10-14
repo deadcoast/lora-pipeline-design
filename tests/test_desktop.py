@@ -51,8 +51,22 @@ from src.comfy_desktop import (
     ComfyRuntimeHint,
 )
 from src.dataset_review import PreparedDatasetDialog
-from src.desktop import NAV_RESULTS, NAV_RUN, MainWindow, _build_parser
+from src.desktop import (
+    NAV_LIBRARY,
+    NAV_PROJECT,
+    NAV_RESULTS,
+    NAV_RUN,
+    NAV_SETUP,
+    MainWindow,
+    _build_parser,
+)
 from src.io_utils import artifact_fingerprint
+from src.library import (
+    LibraryIndex,
+    RunTags,
+    load_library_index,
+    save_library_index,
+)
 from src.photo_review import PhotoIssueDialog
 from src.training_checkpoints import TrainingCheckpoint
 
@@ -368,6 +382,8 @@ def test_user_can_prepare_photos_through_the_actual_desktop_pipeline(
     project_name = window.findChild(QLineEdit, "projectNameEdit")
     assert project_name is not None
     project_name.setText("gui_prepare_v1")
+    window.character_field.edit.setText("gui")
+    window.artstyle_field.edit.setText("photo")
     qtbot.mouseClick(
         window.findChild(QPushButton, "reviewSetupButton"),
         Qt.MouseButton.LeftButton,
@@ -404,6 +420,16 @@ def test_user_can_prepare_photos_through_the_actual_desktop_pipeline(
     assert {path.name: path.read_bytes() for path in photos.iterdir()} == source_before
     assert (dataset / ".source-manifest.json").is_file()
     assert (tmp_path / "configs" / "gui_prepare_v1-result.json").is_file()
+    record = json.loads(
+        (tmp_path / "configs" / "gui_prepare_v1-result.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert (record["character"], record["artstyle"]) == ("gui", "photo")
+    assert record["source_dir"] == str(photos.resolve())
+    index = load_library_index(tmp_path / "library.json")
+    assert index.characters == ("gui",)
+    assert index.styles == ("photo",)
     assert window.settings.last_result is not None
     assert window.settings.last_result.mode == "prepare"
     assert window.settings.last_result.result_path == dataset
@@ -451,7 +477,7 @@ def test_user_can_prepare_photos_through_the_actual_desktop_pipeline(
         mode="full",
     )
     assert "--skip-prep" in resumed.arguments
-    assert "--src" not in resumed.arguments
+    assert resumed.arguments[resumed.arguments.index("--src") + 1] == str(photos)
 
 
 def test_editing_a_reviewed_project_invalidates_and_rechecks_readiness(
@@ -481,6 +507,8 @@ def test_editing_a_reviewed_project_invalidates_and_rechecks_readiness(
     window.show()
     window.photo_drop.set_folder(photos)
     window.project_name_edit.setText("reviewed_v1")
+    window.character_field.edit.setText("test")
+    window.artstyle_field.edit.setText("photo")
     window.review_project()
     qtbot.waitUntil(lambda: window.prepare_button.isEnabled(), timeout=10_000)
 
@@ -642,6 +670,8 @@ def test_unrecorded_prepared_photo_blocks_reuse_and_offers_a_new_version(
     window.photo_drop.set_folder(photos)
     window.project_name_edit.setText("added_photo_v1")
     window.trigger_edit.setText("ohwx person")
+    window.character_field.edit.setText("test")
+    window.artstyle_field.edit.setText("photo")
     qtbot.mouseClick(
         window.findChild(QPushButton, "reviewSetupButton"),
         Qt.MouseButton.LeftButton,
@@ -728,6 +758,8 @@ def test_invalid_prepared_pairs_disable_start_before_qprocess(
     window.show()
     window.photo_drop.set_folder(photos)
     window.project_name_edit.setText("pair_guard_v1")
+    window.character_field.edit.setText("test")
+    window.artstyle_field.edit.setText("photo")
     window.review_project()
 
     qtbot.waitUntil(lambda: window.readiness_report is not None, timeout=10_000)
@@ -963,7 +995,7 @@ def test_typed_external_and_trainer_repairs_keep_their_action_contracts(
     )
     assert opened_desktop == [True]
     assert window._return_to_readiness_when_connected
-    assert window.pages.currentIndex() == 0
+    assert window.pages.currentIndex() == NAV_SETUP
 
     _click_diagnostic_action(
         qtbot,
@@ -974,7 +1006,7 @@ def test_typed_external_and_trainer_repairs_keep_their_action_contracts(
         ),
     )
     assert window._return_to_readiness_after_installation
-    assert window.pages.currentIndex() == 0
+    assert window.pages.currentIndex() == NAV_SETUP
 
     _click_diagnostic_action(
         qtbot,
@@ -985,7 +1017,7 @@ def test_typed_external_and_trainer_repairs_keep_their_action_contracts(
         ),
     )
     assert window._return_to_readiness_after_checkpoint
-    assert window.pages.currentIndex() == 0
+    assert window.pages.currentIndex() == NAV_SETUP
 
     opened_comfyui: list[bool] = []
 
@@ -1007,7 +1039,7 @@ def test_typed_external_and_trainer_repairs_keep_their_action_contracts(
         ),
     )
     assert opened_comfyui == [True]
-    assert window.pages.currentIndex() == 0
+    assert window.pages.currentIndex() == NAV_SETUP
 
     opened_urls: list[QUrl] = []
 
@@ -1502,6 +1534,8 @@ def test_failed_pipeline_start_has_visible_recovery_actions(
     window.show()
     window.photo_drop.set_folder(photos)
     window.project_name_edit.setText("broken_start_v1")
+    window.character_field.edit.setText("test")
+    window.artstyle_field.edit.setText("photo")
     window.review_project()
     qtbot.waitUntil(lambda: window.prepare_button.isEnabled(), timeout=10_000)
 
@@ -3164,7 +3198,7 @@ def test_result_block_explains_missing_original_and_opens_connect(
         window.publish_workflow_button,
         Qt.MouseButton.LeftButton,
     )
-    assert window.pages.currentIndex() == 0
+    assert window.pages.currentIndex() == NAV_SETUP
     assert profile_requests == []
 
 
@@ -3687,3 +3721,302 @@ def test_results_checkpoint_action_launches_selected_validation_and_saves_recove
         load_settings(window.settings_path).last_project.project_name
         == draft.project_name
     )
+
+
+# ------------------------------------------------------------------ library
+
+
+def _library_workspace(tmp_path: Path, **overrides: object) -> AppSettings:
+    workspace = tmp_path / "workspace"
+    values: dict[str, object] = {
+        "comfy_checkpoint": "",
+        "comfy_lora_dir": tmp_path / "loras",
+        "datasets_dir": workspace / "datasets",
+        "checkpoints_dir": workspace / "checkpoints",
+        "grids_dir": workspace / "grids",
+        "run_configs_dir": workspace / "configs",
+    }
+    values.update(overrides)
+    return AppSettings(**values)  # type: ignore[arg-type]
+
+
+def _write_library_run(
+    settings: AppSettings,
+    name: str,
+    *,
+    character: str = "",
+    artstyle: str = "",
+    completed_at: str = "2026-10-13T21:00:00+00:00",
+    checkpoint: str = "NoobAI-XL-v1.1.safetensors",
+    model_profile: str = "noobai-xl-epsilon",
+    source_dir: Path | None = None,
+    schema_version: int = 5,
+) -> Path:
+    grids = settings.grids_dir
+    grids.mkdir(parents=True, exist_ok=True)
+    grid = grids / f"{name}_grid.png"
+    Image.new("RGB", (48, 32), "blue").save(grid)
+    workflow = grids / f"{name}_use_in_comfyui.json"
+    workflow.write_text('{"version": 0.4, "nodes": []}\n', encoding="utf-8")
+    assert settings.comfy_lora_dir is not None
+    lora = settings.comfy_lora_dir / f"{name}.safetensors"
+    lora.parent.mkdir(parents=True, exist_ok=True)
+    lora.write_bytes(b"lora")
+    checkpoint_path = settings.comfy_lora_dir.parent / "checkpoints" / checkpoint
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.write_bytes(b"checkpoint")
+    record: dict[str, object] = {
+        "schema_version": schema_version,
+        "model_profile": model_profile,
+        "project_name": name,
+        "training_project_name": "",
+        "attempt_id": "attempt",
+        "mode": "full",
+        "result_path": str(grid),
+        "result_fingerprint": artifact_fingerprint(grid),
+        "trigger": name,
+        "preset": "balanced",
+        "checkpoint": checkpoint,
+        "lora_name": lora.name,
+        "workflow_path": str(workflow),
+        "workflow_fingerprint": artifact_fingerprint(workflow),
+        "comfy_installation_id": "",
+        "comfy_host": "127.0.0.1:8188",
+        "installed_lora_path": str(lora),
+        "lora_fingerprint": artifact_fingerprint(lora),
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_fingerprint": artifact_fingerprint(checkpoint_path),
+        "starting_strength": 0.8,
+        "completed_at": completed_at,
+    }
+    if schema_version >= 5:
+        record["character"] = character
+        record["artstyle"] = artstyle
+        record["source_dir"] = str(source_dir) if source_dir is not None else ""
+    configs = settings.run_configs_dir
+    configs.mkdir(parents=True, exist_ok=True)
+    (configs / f"{name}-result.json").write_text(json.dumps(record), encoding="utf-8")
+    return grid
+
+
+def _library_window(qtbot, tmp_path: Path, settings: AppSettings) -> MainWindow:
+    window = MainWindow(
+        settings=settings,
+        settings_path=tmp_path / "settings.json",
+        service=_OfflineLocalService(root=tmp_path),
+    )
+    qtbot.addWidget(window)
+    window.show()
+    return window
+
+
+def test_library_is_home_and_groups_runs_by_character(qtbot, tmp_path: Path) -> None:
+    settings = _library_workspace(tmp_path)
+    grid = _write_library_run(
+        settings, "ruth-anime-mk03", character="ruth", artstyle="anime"
+    )
+    _write_library_run(
+        settings,
+        "ruth-mk02",
+        schema_version=4,
+        completed_at="2026-10-13T20:00:00+00:00",
+    )
+
+    window = _library_window(qtbot, tmp_path, settings)
+
+    assert window.pages.currentIndex() == NAV_LIBRARY
+    assert window.nav_buttons[NAV_LIBRARY].isChecked()
+    assert window.library_page.groups() == [("ruth", ["ruth-anime-mk03"])]
+    assert window.library_page.unsorted_names() == ["ruth-mk02"]
+    row = window.library_page.rows["ruth-anime-mk03"]
+    assert row.style_chip.text() == "anime"
+    assert "NoobAI-XL-v1.1" in row.model_label.text()
+    assert "Epsilon" in row.model_label.text()
+    assert row.status_chip.text() == "Ready in ComfyUI"
+
+    qtbot.mouseClick(row.open_button, Qt.MouseButton.LeftButton)
+
+    assert window.pages.currentIndex() == NAV_RESULTS
+    assert window._latest_result == grid
+    assert window._displayed_result_record is not None
+    assert window._displayed_result_record.project_name == "ruth-anime-mk03"
+
+
+def test_connect_stays_home_until_the_first_run_exists(qtbot, tmp_path: Path) -> None:
+    window = _library_window(qtbot, tmp_path, _library_workspace(tmp_path))
+
+    assert window.pages.currentIndex() == NAV_SETUP
+    assert window.nav_buttons[NAV_LIBRARY].isEnabled()
+    assert window.library_page.groups() == []
+
+
+def test_untagged_run_can_be_tagged_from_the_library(qtbot, tmp_path: Path) -> None:
+    settings = _library_workspace(tmp_path)
+    _write_library_run(settings, "ruth-mk02", schema_version=4)
+    window = _library_window(qtbot, tmp_path, settings)
+    (entry,) = window.library.entries
+
+    window.tag_library_entry(entry, RunTags("Ruth", "anime"))
+
+    index = load_library_index(tmp_path / "workspace" / "library.json")
+    assert index.run_tags["ruth-mk02"] == RunTags("ruth", "anime")
+    assert index.characters == ("ruth",)
+    assert index.styles == ("anime",)
+    assert window.library_page.groups() == [("ruth", ["ruth-mk02"])]
+    assert window.library_page.unsorted_names() == []
+
+
+def test_train_next_version_prefills_setup_and_project_from_the_run(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = _library_workspace(tmp_path)
+    photos = tmp_path / "photos"
+    _write_training_photos(photos)
+    _write_library_run(
+        settings,
+        "ruth-anime-mk03",
+        character="ruth",
+        artstyle="anime",
+        source_dir=photos,
+    )
+    window = _library_window(qtbot, tmp_path, settings)
+    row = window.library_page.rows["ruth-anime-mk03"]
+
+    qtbot.mouseClick(row.next_button, Qt.MouseButton.LeftButton)
+
+    assert window.pages.currentIndex() == NAV_PROJECT
+    assert window.character_field.value() == "ruth"
+    assert window.artstyle_field.value() == "anime"
+    assert window.project_name_edit.text() == "ruth-anime-mk04"
+    assert window.trigger_edit.text() == "ruth-anime-mk03"
+    assert window.source_folder == photos
+    assert window.checkpoint_combo.currentText() == "NoobAI-XL-v1.1.safetensors"
+    assert window.model_profile_combo.currentData() == "noobai-xl-epsilon"
+    saved = load_settings(tmp_path / "settings.json")
+    assert saved.comfy_checkpoint == "NoobAI-XL-v1.1.safetensors"
+    assert saved.model_profile == "noobai-xl-epsilon"
+    assert saved.training_base_model == (
+        tmp_path / "checkpoints" / "NoobAI-XL-v1.1.safetensors"
+    )
+
+
+def test_project_tags_autocomplete_hint_and_block_review_until_valid(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = _library_workspace(tmp_path)
+    photos = tmp_path / "photos"
+    _write_training_photos(photos)
+    save_library_index(
+        tmp_path / "workspace" / "library.json",
+        LibraryIndex().with_style("anime").with_character("ruth"),
+    )
+    window = _library_window(qtbot, tmp_path, settings)
+    window.show_page(NAV_PROJECT)
+    window.photo_drop.set_folder(photos)
+    completer = window.artstyle_field.edit.completer()
+    assert completer is not None
+    model = completer.model()
+    assert [model.index(i, 0).data() for i in range(model.rowCount())] == ["anime"]
+
+    qtbot.keyClicks(window.artstyle_field.edit, "Water color")
+    assert window.artstyle_field.edit.text() == "water color"
+    assert window.artstyle_field.hint.text() == (
+        "One word: lowercase letters, numbers, hyphens."
+    )
+    window.project_name_edit.setText("x_v1")
+    window.review_project(require_tags=True)
+    assert window.pages.currentIndex() == NAV_PROJECT
+    assert window.project_form_error.isVisible()
+    assert "character" in window.project_form_error.text().lower()
+
+    window.artstyle_field.edit.setText("anime")
+    assert window.artstyle_field.hint.text() == "Existing style: anime"
+    window.artstyle_field.edit.setText("watercolor")
+    assert window.artstyle_field.hint.text() == "New style: watercolor will be added"
+    window.character_field.edit.setText("ruth")
+    assert window.character_field.hint.text() == "Existing character: ruth"
+
+    window.review_project(require_tags=True)
+    assert window.pages.currentIndex() == NAV_RUN
+    assert window.draft is not None
+    assert (window.draft.character, window.draft.artstyle) == ("ruth", "watercolor")
+
+
+def test_project_name_follows_tags_until_the_user_types_one(
+    qtbot, tmp_path: Path
+) -> None:
+    window = _library_window(qtbot, tmp_path, _library_workspace(tmp_path))
+    window.show_page(NAV_PROJECT)
+
+    window.character_field.edit.setText("ruth")
+    window.artstyle_field.edit.setText("anime")
+    assert window.project_name_edit.text() == "ruth-anime-mk01"
+    window.artstyle_field.edit.setText("photo")
+    assert window.project_name_edit.text() == "ruth-photo-mk01"
+
+    qtbot.keyClicks(window.project_name_edit, "x")
+    window.artstyle_field.edit.setText("anime")
+    assert window.project_name_edit.text() == "ruth-photo-mk01x"
+
+
+def test_connect_names_each_models_purpose_and_sets_its_profile(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = _library_workspace(
+        tmp_path,
+        comfy_checkpoint="NoobAI-XL-v1.1.safetensors",
+        model_profile="noobai-xl-epsilon",
+    )
+    window = _library_window(qtbot, tmp_path, settings)
+    _wait_for_initial_setup(qtbot, window)
+    window.comfy_status = ComfyApiStatus(
+        True,
+        "127.0.0.1:8188",
+        ("NoobAI-XL-v1.1.safetensors", "mystery.safetensors"),
+        (),
+        None,
+    )
+    window._populate_settings()
+    combo = window.checkpoint_combo
+
+    assert (
+        combo.itemData(
+            combo.findText("NoobAI-XL-v1.1.safetensors"), Qt.ItemDataRole.ToolTipRole
+        )
+        == "MODEL :: Anime · NoobAI-XL · Epsilon-pred"
+    )
+    assert window.model_style_label.text() == (
+        "MODEL :: Anime · profile NoobAI-XL · Epsilon-pred"
+    )
+    assert window.checkpoint_style_edit.isHidden()
+
+    combo.setCurrentText("mystery.safetensors")
+    assert window.model_profile_combo.currentData() == "sdxl"
+    assert window.model_style_label.text().startswith("MODEL :: Unlabelled")
+    assert window.checkpoint_style_edit.isVisible()
+    window.checkpoint_style_edit.setText("painterly")
+    window.checkpoint_style_edit.editingFinished.emit()
+    assert load_library_index(
+        tmp_path / "workspace" / "library.json"
+    ).checkpoint_styles == {"mystery.safetensors": "painterly"}
+    assert window.model_style_label.text() == (
+        "MODEL :: Painterly · profile SDXL · Standard"
+    )
+
+    combo.setCurrentText("NoobAI-XL-v1.1.safetensors")
+    assert window.model_profile_combo.currentData() == "noobai-xl-epsilon"
+
+
+def test_corrupt_library_index_warns_and_still_lists_runs(
+    qtbot, tmp_path: Path
+) -> None:
+    settings = _library_workspace(tmp_path)
+    _write_library_run(settings, "ruth-anime-mk03", character="ruth", artstyle="anime")
+    broken = tmp_path / "workspace" / "library.json"
+    broken.write_text("{bad", encoding="utf-8")
+
+    window = _library_window(qtbot, tmp_path, settings)
+
+    assert window.library_page.groups() == [("ruth", ["ruth-anime-mk03"])]
+    assert "library.json" in window.library_page.warning_label.text()
+    assert broken.read_text(encoding="utf-8") == "{bad"

@@ -55,6 +55,23 @@ From 0.8.1, the training worker encodes long SDXL captions in complete sections
 instead of silently discarding the trailing tags. No retagging or extra setup
 is needed; automatic tagging only fills missing captions.
 
+### Library
+
+- Opens as the home page once at least one run exists. Every run is read from
+  the result and recovery records already on disk, paired with its grid,
+  checkpoint folder, and installed LoRA. Nothing is hashed on this page.
+- Groups runs by **character**, shows each run's **art style** chip, base
+  checkpoint and profile, trigger, step count, finish date, and a status:
+  Ready in ComfyUI, LoRA missing, Result missing, Validation pending,
+  Prepared only, or Incomplete. A style filter and a search box narrow the list.
+- **Open result** shows any run on the Result page, not only the last one.
+  **Train next version** carries that run's checkpoint, profile, trigger, plan,
+  tags, and photo folder into New project with the next version name.
+  **Tag** files runs that predate the tag fields; they wait under **Unsorted**.
+- Stores the tag vocabulary, a style label per checkpoint, and tag overrides in
+  `library.json` beside the workspace folders. An unreadable file is left
+  untouched and reported on the page.
+
 ### Connect
 
 - Detects current Comfy Desktop 2 and legacy Desktop installations.
@@ -79,7 +96,13 @@ is needed; automatic tagging only fills missing captions.
   the user explicitly chooses another. Duplicate Desktop display names are
   blocked because current runtime locks cannot distinguish them safely.
 - Probes only explicit loopback addresses; it never scans the network.
-- Lists the checkpoints and LoRAs reported by the running ComfyUI API.
+- Lists the checkpoints and LoRAs reported by the running ComfyUI API. Each
+  checkpoint carries a purpose tooltip such as **MODEL :: Anime · NoobAI-XL ·
+  Epsilon-pred**; the same line appears under the selected model. NoobAI files
+  are labelled anime and a detected SDXL base is labelled photo; anything else
+  shows **Unlabelled** with a one-word field to label it. Picking a checkpoint
+  selects the profile its filename calls for, and the profile list stays
+  available for override.
 - Resolves the selected checkpoint back to its local Desktop model file so
   training and validation use the same SDXL base.
 - Recognizes SDXL base architecture from the local checkpoint's tensor header;
@@ -130,6 +153,15 @@ releases and acceptance limits.
 - Disables photographic blur heuristics for anime profiles so flat shading is
   not treated as a blurry photograph. Aspect ratio is preserved during preparation.
 - Native folder picker and drag-and-drop photo selection.
+- **Character** and **Art style** fields above the project name. One word
+  each, lowercased as you type, with autocomplete from every word used before
+  so a misspelling never creates a second style. The hint under each field says
+  **Existing style: anime** or **New style: watercolor will be added**. Both are
+  required to review or start a run; a new word joins the vocabulary when the
+  run starts.
+- Fills the project name as `<character>-<style>-mk<NN>` with the next free
+  number in that group until you type your own name. After tagging
+  `ruth-mk02` as ruth / anime, the next run is offered as `ruth-anime-mk03`.
 - Plain-language project name and identity phrase.
 - Checks unreadable files, exact duplicates, image count, and undersized photos
   before a long run.
@@ -422,6 +454,9 @@ Important source files:
 | File                     | Responsibility                                          |
 |--------------------------|---------------------------------------------------------|
 | `src/desktop.py`         | Guided UI, background process, cancellation, results    |
+| `src/library.py`         | Library scan, tag vocabulary, `library.json`, next name |
+| `src/library_view.py`    | Library page, tag fields with autocomplete, tag dialog  |
+| `src/tags.py`            | One-word character and art-style tag rule               |
 | `src/dataset_review.py`  | Prepared-photo preview and atomic caption editing       |
 | `src/photo_review.py`    | Filename-level source quality review                    |
 | `src/app_service.py`     | Readiness, source review, command construction          |

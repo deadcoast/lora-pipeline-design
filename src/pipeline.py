@@ -41,6 +41,7 @@ from .model_profiles import (
 )
 from .process_control import arm_desktop_owner_guard
 from .run_guardian import pipeline_run_guard
+from .tags import normalize_tag, tag_error
 
 RECOVERY_SCHEMA_VERSION = 3
 
@@ -287,6 +288,14 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
             "--lora selects an existing checkpoint and requires --skip-train."
         )
     trigger = args.trigger
+    character = normalize_tag(getattr(args, "character", "") or "")
+    artstyle = normalize_tag(getattr(args, "artstyle", "") or "")
+    for label, tag in (("character", character), ("artstyle", artstyle)):
+        issue = tag_error(tag) if tag else None
+        if issue:
+            raise ValueError(f"The {label} tag is invalid. {issue}")
+    # Recorded for the library even when preparation is skipped; never read here.
+    source_dir = str(Path(args.src).resolve()) if getattr(args, "src", None) else ""
     dataset_dir = config.DATASETS_DIR / name
     before_training: dict[Path, tuple[int, int]] | None = None
     installed_lora_name = ""
@@ -470,10 +479,13 @@ def _run_with_guard(args: argparse.Namespace) -> Path | None:
         workflow_fingerprint = ""
         starting_strength = 0.8
     outcome = {
-        "schema_version": 4,
+        "schema_version": 5,
         "model_profile": config.MODEL_PROFILE,
         "project_name": name,
         "training_project_name": training_project,
+        "character": character,
+        "artstyle": artstyle,
+        "source_dir": source_dir,
         "attempt_id": attempt_id,
         "mode": outcome_mode,
         "result_path": str(result_path.resolve()),
@@ -543,6 +555,16 @@ def main(argv: Sequence[str] | None = None) -> None:
     ap.add_argument("--src", help="Raw photos folder (required unless --skip-prep).")
     ap.add_argument("--config", default="configs/person_sdxl.yaml")
     ap.add_argument("--trigger", default=config.DEFAULT_TRIGGER)
+    ap.add_argument(
+        "--character",
+        default="",
+        help="One-word character tag recorded for the Studio library.",
+    )
+    ap.add_argument(
+        "--artstyle",
+        default="",
+        help="One-word art style tag recorded for the Studio library.",
+    )
     ap.add_argument(
         "--size",
         type=int,

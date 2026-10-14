@@ -274,3 +274,65 @@ def test_project_draft_reuses_pipeline_validation(tmp_path: Path) -> None:
     ).validation_errors() == (
         f"Source photo folder was not found: {tmp_path / 'missing'}",
     )
+
+
+def test_settings_round_trip_character_and_style_tags(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    settings = AppSettings(
+        last_project=ProjectDraft(
+            project_name="ruth-anime-mk03",
+            character="ruth",
+            artstyle="anime",
+        ),
+        last_result=RunResult(
+            project_name="ruth-anime-mk03",
+            mode="full",
+            result_path=tmp_path / "grid.png",
+            completed_at="2026-10-13T21:00:00+00:00",
+            trigger="ruth-anime-mk03",
+            preset=TrainingPreset.BALANCED,
+            character="ruth",
+            artstyle="anime",
+            source_dir=tmp_path / "photos",
+        ),
+    )
+
+    save_settings(settings, path)
+    loaded = load_settings(path)
+
+    assert loaded.last_project.character == "ruth"
+    assert loaded.last_project.artstyle == "anime"
+    assert loaded.last_result is not None
+    assert loaded.last_result.character == "ruth"
+    assert loaded.last_result.artstyle == "anime"
+    assert loaded.last_result.source_dir == tmp_path / "photos"
+
+
+def test_settings_without_tags_load_with_empty_tags(tmp_path: Path) -> None:
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": SETTINGS_SCHEMA_VERSION,
+                "last_project": {"project_name": "ruth-mk02", "trigger": "ruth-mk02"},
+                "last_result": {
+                    "project_name": "ruth-mk02",
+                    "mode": "full",
+                    "result_path": str(tmp_path / "grid.png"),
+                    "completed_at": "2026-10-13T21:00:00+00:00",
+                    "trigger": "ruth-mk02",
+                    "preset": "balanced",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded = load_settings(path)
+
+    assert loaded.last_project.character == ""
+    assert loaded.last_project.artstyle == ""
+    assert loaded.last_result is not None
+    assert loaded.last_result.character == ""
+    assert loaded.last_result.artstyle == ""
+    assert loaded.last_result.source_dir is None

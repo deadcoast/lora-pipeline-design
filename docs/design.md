@@ -17,6 +17,8 @@ domain implementation, but casual users are not expected to invoke them.
 
 The default journey is:
 
+0. Browse the Library of earlier runs by character and art style, and start
+   the next version of one from there.
 1. Detect and connect a local Comfy Desktop instance.
 2. Choose and review source photos.
 3. Select a plain-language training plan.
